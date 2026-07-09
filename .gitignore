@@ -1,0 +1,32 @@
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv
+.venv/
+venv/
+env/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Editor and OS clutter
+.DS_Store
+.idea/
+.vscode/
+
+# Local or external data folders
+/1050_data/
+/920_data/
+
+# Regenerated analysis outputs
+/analysis/
+/outputs/
+/results/
+/figures/

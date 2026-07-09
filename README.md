@@ -2,6 +2,11 @@
 
 Small repository for ROI and molecular-tracking analysis code with a clean split between reusable logic, plotting scripts, matching utilities, tests, and intentionally kept notebooks.
 
+## Packages
+- antspy
+- cellpose
+
+
 ## Repository layout
 
 ```text

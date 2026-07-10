@@ -246,6 +246,7 @@ def extract_registered_dataset_roi_intensity_table(
     start_date: str,
     channels: tuple[str, ...] = ("red", "green"),
     exclude_zero_pixels: bool = True,
+    day0_mode: str = "raw",
 ) -> pd.DataFrame:
     """Extract a long ROI-intensity table from registered per-day image stacks.
 
@@ -266,6 +267,9 @@ def extract_registered_dataset_roi_intensity_table(
     exclude_zero_pixels : bool, default=True
         Whether to drop any ROI that touches a zero-valued pixel in a given
         image stack, matching the current registered-image QC rule.
+    day0_mode : {"raw", "syn"}, default="raw"
+        Which day-0 image variant to select when both raw and registered files
+        exist.
 
     Returns
     -------
@@ -284,6 +288,7 @@ def extract_registered_dataset_roi_intensity_table(
         image_dir=image_dir,
         channels=channels,
         start_date=start_date,
+        day0_mode=day0_mode,
     )
 
     rows: list[dict[str, float | int | str]] = []
@@ -1379,22 +1384,71 @@ def project_roi_stack_view(
     return image_projection, roi_projection, bounds
 
 
+def _parse_dated_channel_tiff_name(
+    image_name: str,
+) -> tuple[str, str, bool] | None:
+    """Parse a dated TIFF filename into ``(date_key, channel, is_syn)``.
+
+    Parameters
+    ----------
+    image_name : str
+        TIFF filename such as ``20260511_R.tif`` or
+        ``20260511_G_crop_256_SyN.tif``.
+
+    Returns
+    -------
+    tuple[str, str, bool] or None
+        Parsed ``(YYYYMMDD, channel, is_syn)`` triple, or ``None`` when the
+        filename does not describe a day/channel image stack.
+    """
+
+    path = Path(image_name)
+    if path.suffix.lower() != ".tif":
+        return None
+
+    parts = path.stem.split("_")
+    if len(parts) < 2 or len(parts[0]) != 8 or not parts[0].isdigit():
+        return None
+
+    channel_token = parts[1]
+    if channel_token not in {"R", "G"}:
+        return None
+
+    trailing_tokens = parts[2:]
+    trailing_lower = [token.lower() for token in trailing_tokens]
+    if "syn" in trailing_lower and trailing_lower[-1] != "syn":
+        return None
+    if any("mask" in token for token in trailing_lower) or "roi" in trailing_lower:
+        return None
+
+    channel = "red" if channel_token == "R" else "green"
+    is_syn = bool(trailing_lower) and trailing_lower[-1] == "syn"
+    return parts[0], channel, is_syn
+
+
 def build_registered_image_lookup(
     image_dir: str | Path,
     channels: tuple[str, ...] = ("red", "green"),
     start_date: str = "20260511",
+    day0_mode: str = "raw",
 ) -> dict[tuple[int, str], Path]:
     """Map each day and channel to the corresponding registered TIFF file.
 
     Parameters
     ----------
     image_dir : str or pathlib.Path
-        Directory that contains day-0 raw images and later ``*_SyN.tif`` images.
+        Directory that contains day-0 raw images plus registered ``*_SyN.tif``
+        images, optionally with extra tokens between the channel and ``SyN``
+        such as ``20260511_R_crop_256_SyN.tif``.
     channels : tuple[str, ...], default=("red", "green")
         Channel names to include. Supported names are ``"red"`` and ``"green"``.
     start_date : str, default="20260511"
         Reference date in ``YYYYMMDD`` format that defines day 0 for this
         dataset.
+    day0_mode : {"raw", "syn"}, default="raw"
+        Which day-0 image variant to select. The default preserves the
+        original pipeline behavior of using the raw day-0 image, while
+        ``"syn"`` selects the registered day-0 image when available.
 
     Returns
     -------
@@ -1403,26 +1457,33 @@ def build_registered_image_lookup(
     """
 
     image_dir = Path(image_dir)
-    channel_suffix = {"red": "_R", "green": "_G"}
+    if day0_mode not in {"raw", "syn"}:
+        raise ValueError("day0_mode must be 'raw' or 'syn'.")
 
     lookup: dict[tuple[int, str], Path] = {}
     for channel in channels:
-        if channel not in channel_suffix:
+        if channel not in {"red", "green"}:
             raise ValueError(f"Unsupported channel: {channel}")
 
-        suffix = channel_suffix[channel]
-        raw_name_suffix = f"{suffix}.tif"
-        syn_name_suffix = f"{suffix}_SyN.tif"
-        for path in sorted(image_dir.glob("*.tif")):
-            if path.name.startswith("mean_image"):
-                continue
-            if len(path.name) < 8 or not path.name[:8].isdigit():
-                continue
-            day = extract_day_from_image_name(path.name, start_date=start_date)
-            if day == 0 and path.name.endswith(raw_name_suffix):
+    for path in sorted(image_dir.glob("*.tif")):
+        parsed = _parse_dated_channel_tiff_name(path.name)
+        if parsed is None:
+            continue
+
+        _date_key, channel, is_syn = parsed
+        if channel not in channels:
+            continue
+
+        day = extract_day_from_image_name(path.name, start_date=start_date)
+        if day < 0:
+            continue
+        if day == 0:
+            if day0_mode == "raw" and not is_syn:
                 lookup[(day, channel)] = path
-            elif day > 0 and path.name.endswith(syn_name_suffix):
+            elif day0_mode == "syn" and is_syn:
                 lookup[(day, channel)] = path
+        elif is_syn:
+            lookup[(day, channel)] = path
 
     return lookup
 
@@ -1452,19 +1513,24 @@ def build_raw_image_lookup(
     """
 
     image_dir = Path(image_dir)
-    channel_suffix = {"red": "_R", "green": "_G"}
-
-    lookup: dict[tuple[int, str], Path] = {}
     for channel in channels:
-        if channel not in channel_suffix:
+        if channel not in {"red", "green"}:
             raise ValueError(f"Unsupported channel: {channel}")
 
-        suffix = channel_suffix[channel]
-        for path in sorted(image_dir.glob(f"*{suffix}.tif")):
-            if path.name.startswith("mean_image") or "SyN" in path.name:
-                continue
-            day = extract_day_from_image_name(path.name, start_date=start_date)
-            lookup[(day, channel)] = path
+    lookup: dict[tuple[int, str], Path] = {}
+    for path in sorted(image_dir.glob("*.tif")):
+        parsed = _parse_dated_channel_tiff_name(path.name)
+        if parsed is None:
+            continue
+
+        _date_key, channel, is_syn = parsed
+        if channel not in channels or is_syn:
+            continue
+
+        day = extract_day_from_image_name(path.name, start_date=start_date)
+        if day < 0:
+            continue
+        lookup[(day, channel)] = path
 
     return lookup
 

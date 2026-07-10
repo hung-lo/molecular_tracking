@@ -302,13 +302,19 @@ def infer_start_date_from_dataset_dir(image_dir: str | Path) -> str:
             continue
         if path.suffix.lower() != ".tif":
             continue
-        name = path.name
-        if len(name) < 11:
+
+        parts = path.stem.split("_")
+        if len(parts) < 2 or len(parts[0]) != 8 or not parts[0].isdigit():
             continue
-        if not name[:8].isdigit():
+        if parts[1] not in {"R", "G"}:
             continue
-        if name.endswith("_R.tif") or name.endswith("_G.tif"):
-            candidate_dates.append(name[:8])
+
+        trailing_lower = [token.lower() for token in parts[2:]]
+        if "syn" in trailing_lower:
+            continue
+        if any("mask" in token for token in trailing_lower) or "roi" in trailing_lower:
+            continue
+        candidate_dates.append(parts[0])
 
     if not candidate_dates:
         raise FileNotFoundError(

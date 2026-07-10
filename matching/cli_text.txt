@@ -1,0 +1,26 @@
+### just a quick cli commands here for me to copy and paste
+
+
+uv run python ./matching/roi_matcher.py \
+  --masks \
+    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_256/week1_average_cp_masks_SyN.tif" \
+    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_256/week2_average_cp_masks_SyN.tif" \
+    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_256/week3_average_cp_masks_SyN.tif" \
+    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_256/week4_average_cp_masks_SyN.tif" \
+  --days week1 week2 week3 week4 \
+  --output-prefix /mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_256/roi_match_runs/20260710_test 
+
+
+## this works now, still need to check the output, but the roi_matcher.py script is working now.
+
+
+
+uv run python ./matching/roi_matcher_qc_plots.py \
+  --masks \
+    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_256/week1_average_cp_masks_SyN.tif" \
+    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_256/week2_average_cp_masks_SyN.tif" \
+    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_256/week3_average_cp_masks_SyN.tif" \
+    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_256/week4_average_cp_masks_SyN.tif" \
+  --days week1 week2 week3 week4 \
+  --output-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_256/roi_match_runs/20260710_test/plotting \
+  --examples-per-group 4

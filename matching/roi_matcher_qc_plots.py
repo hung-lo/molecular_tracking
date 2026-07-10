@@ -828,7 +828,7 @@ def main(argv: list[str] | None = None) -> None:
         min_crop_size=args.min_crop_size,
     )
     print(json.dumps(result["summary"], indent=2))
-
+    print('QC example plots and summary files written to:', result["output_dir"])
 
 if __name__ == "__main__":
     main()

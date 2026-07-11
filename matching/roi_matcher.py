@@ -18,6 +18,10 @@ import pandas as pd
 from scipy.signal import fftconvolve
 import tifffile
 
+DEFAULT_XY_UM_PER_PX = 710.0 / 1024.0
+DEFAULT_Z_UM_PER_PLANE = 5.0
+DEFAULT_TRACK_LENGTH_THRESHOLDS = (4, 5, 6, 7)
+
 
 @dataclass(frozen=True)
 class MatchParams:
@@ -59,14 +63,14 @@ class MatchParams:
     patch_radius: int = 12
     patch_size: int = 64
     overlap: int = 16
-    max_dist_xy: float = 8.0
-    max_dist_z: float = 3.0
+    max_dist_xy: float = 15.0
+    max_dist_z: float = 5.0
     min_score: float = 0.45
     min_gap_support: float = 0.80
     edge_margin: int = 20
     edge_relax_xy: float = 3.0
     edge_score_bonus: float = 0.02
-    translation_max_shift: int = 20
+    translation_max_shift: int = 32
     use_translation: bool = True
     low_confidence_threshold: float = 0.55
 
@@ -692,7 +696,7 @@ def extract_roi_records(
     return records
 
 
-def estimate_pair_shift(mask_a: np.ndarray, mask_b: np.ndarray, max_shift: int = 20) -> tuple[float, float]:
+def estimate_pair_shift(mask_a: np.ndarray, mask_b: np.ndarray, max_shift: int = 32) -> tuple[float, float]:
     """Estimate the global XY shift that aligns ``mask_b`` to ``mask_a``.
 
     Parameters
@@ -701,7 +705,7 @@ def estimate_pair_shift(mask_a: np.ndarray, mask_b: np.ndarray, max_shift: int =
         Reference label stack with shape ``(z, y, x)``.
     mask_b : numpy.ndarray
         Moving label stack with shape ``(z, y, x)``.
-    max_shift : int, default=20
+    max_shift : int, default=32
         Maximum searched absolute shift in pixels.
 
     Returns
@@ -915,6 +919,8 @@ def solve_pairwise_assignment(candidate_table: pd.DataFrame) -> pd.DataFrame:
         used_a.add(index_a)
         used_b.add(index_b)
         accepted_rows.append(row.to_dict())
+    if not accepted_rows:
+        return table.iloc[0:0].copy()
     return pd.DataFrame(accepted_rows)
 
 
@@ -1177,9 +1183,18 @@ def match_roi_masks(
                 shift_yx=shift_yx,
                 params=params,
             )
+            pair_metadata = {
+                "week_a": str(day_a),
+                "week_b": str(day_b),
+                "shift_y": float(shift_yx[0]),
+                "shift_x": float(shift_yx[1]),
+                "candidate_count": int(len(candidate_table)),
+            }
             assigned_table = solve_pairwise_assignment(candidate_table)
             if len(assigned_table) > 0:
                 assigned_table = assigned_table.sort_values(["score", "confidence"], ascending=[False, False]).reset_index(drop=True)
+            assigned_table.attrs.update(pair_metadata)
+            assigned_table.attrs["accepted_match_count"] = int(len(assigned_table))
             pair_tables[(day_a, day_b)] = assigned_table
 
     tracks_table = build_tracks_from_pairwise_matches(
@@ -1238,11 +1253,129 @@ def match_roi_masks(
     return tracks_table, pair_tables, qc_table
 
 
+def _quantile_or_nan(values: pd.Series, quantile: float) -> float:
+    """Return one quantile from a numeric series or ``nan`` when empty."""
+
+    numeric_values = pd.to_numeric(values, errors="coerce").dropna()
+    if numeric_values.empty:
+        return math.nan
+    return float(numeric_values.quantile(quantile))
+
+
+def build_pairwise_match_diagnostics_table(
+    pair_tables: dict[tuple[str, str], pd.DataFrame],
+    xy_um_per_px: float = DEFAULT_XY_UM_PER_PX,
+    z_um_per_plane: float = DEFAULT_Z_UM_PER_PLANE,
+) -> pd.DataFrame:
+    """Build one long accepted-match diagnostic table across all session pairs."""
+
+    columns = [
+        "week_a",
+        "week_b",
+        "roi_a",
+        "roi_b",
+        "distance_xy_px",
+        "distance_xy_um",
+        "distance_z_planes",
+        "distance_z_um",
+        "match_score",
+        "confidence",
+    ]
+    rows: list[dict[str, float | int | str]] = []
+    for (day_a, day_b), pair_table in pair_tables.items():
+        if pair_table is None or len(pair_table) == 0:
+            continue
+        for _, row in pair_table.iterrows():
+            distance_xy_px = float(row["dxy"]) if "dxy" in row else math.nan
+            distance_z_planes = float(row["dz"]) if "dz" in row else math.nan
+            rows.append(
+                {
+                    "week_a": str(day_a),
+                    "week_b": str(day_b),
+                    "roi_a": int(row["label_a"]),
+                    "roi_b": int(row["label_b"]),
+                    "distance_xy_px": distance_xy_px,
+                    "distance_xy_um": distance_xy_px * float(xy_um_per_px) if math.isfinite(distance_xy_px) else math.nan,
+                    "distance_z_planes": distance_z_planes,
+                    "distance_z_um": distance_z_planes * float(z_um_per_plane) if math.isfinite(distance_z_planes) else math.nan,
+                    "match_score": float(row["score"]),
+                    "confidence": float(row["confidence"]) if "confidence" in row else math.nan,
+                }
+            )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_pairwise_match_summary_table(
+    pair_tables: dict[tuple[str, str], pd.DataFrame],
+    xy_um_per_px: float = DEFAULT_XY_UM_PER_PX,
+    z_um_per_plane: float = DEFAULT_Z_UM_PER_PLANE,
+) -> pd.DataFrame:
+    """Summarize candidate and accepted-match diagnostics for each session pair."""
+
+    rows: list[dict[str, float | int | str]] = []
+    for (day_a, day_b), pair_table in pair_tables.items():
+        pair_table = pair_table if pair_table is not None else pd.DataFrame()
+        dxy_values = pair_table["dxy"] if "dxy" in pair_table.columns else pd.Series(dtype=float)
+        dz_values = pair_table["dz"] if "dz" in pair_table.columns else pd.Series(dtype=float)
+        score_values = pair_table["score"] if "score" in pair_table.columns else pd.Series(dtype=float)
+        confidence_values = pair_table["confidence"] if "confidence" in pair_table.columns else pd.Series(dtype=float)
+
+        median_xy_px = _quantile_or_nan(dxy_values, 0.5)
+        max_xy_px = float(pd.to_numeric(dxy_values, errors="coerce").max()) if not dxy_values.empty else math.nan
+        median_z_planes = _quantile_or_nan(dz_values, 0.5)
+        max_z_planes = float(pd.to_numeric(dz_values, errors="coerce").max()) if not dz_values.empty else math.nan
+        rows.append(
+            {
+                "week_a": str(day_a),
+                "week_b": str(day_b),
+                "candidate_pairs": int(pair_table.attrs.get("candidate_count", len(pair_table))),
+                "accepted_reciprocal_matches": int(pair_table.attrs.get("accepted_match_count", len(pair_table))),
+                "shift_y_px": float(pair_table.attrs.get("shift_y", math.nan)),
+                "shift_x_px": float(pair_table.attrs.get("shift_x", math.nan)),
+                "median_accepted_xy_px": median_xy_px,
+                "median_accepted_xy_um": median_xy_px * float(xy_um_per_px) if math.isfinite(median_xy_px) else math.nan,
+                "max_accepted_xy_px": max_xy_px,
+                "max_accepted_xy_um": max_xy_px * float(xy_um_per_px) if math.isfinite(max_xy_px) else math.nan,
+                "median_accepted_z_planes": median_z_planes,
+                "median_accepted_z_um": median_z_planes * float(z_um_per_plane) if math.isfinite(median_z_planes) else math.nan,
+                "max_accepted_z_planes": max_z_planes,
+                "max_accepted_z_um": max_z_planes * float(z_um_per_plane) if math.isfinite(max_z_planes) else math.nan,
+                "score_p10": _quantile_or_nan(score_values, 0.10),
+                "score_median": _quantile_or_nan(score_values, 0.50),
+                "score_p90": _quantile_or_nan(score_values, 0.90),
+                "confidence_p10": _quantile_or_nan(confidence_values, 0.10),
+                "confidence_median": _quantile_or_nan(confidence_values, 0.50),
+                "confidence_p90": _quantile_or_nan(confidence_values, 0.90),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_track_length_summary_table(
+    tracks_table: pd.DataFrame,
+    thresholds: tuple[int, ...] = DEFAULT_TRACK_LENGTH_THRESHOLDS,
+) -> pd.DataFrame:
+    """Count how many tracks last at least the requested number of sessions."""
+
+    n_days_present = pd.to_numeric(tracks_table.get("n_days_present", pd.Series(dtype=float)), errors="coerce").fillna(0).astype(int)
+    rows = [
+        {
+            "minimum_weeks_present": int(threshold),
+            "n_tracks": int((n_days_present >= int(threshold)).sum()),
+        }
+        for threshold in thresholds
+    ]
+    return pd.DataFrame(rows)
+
+
 def export_match_tables(
     output_prefix: Path | str,
     tracks_table: pd.DataFrame,
     pair_tables: dict[tuple[str, str], pd.DataFrame],
     qc_table: pd.DataFrame,
+    *,
+    xy_um_per_px: float = DEFAULT_XY_UM_PER_PX,
+    z_um_per_plane: float = DEFAULT_Z_UM_PER_PLANE,
 ) -> dict[str, object]:
     """Write track, pairwise, and QC tables to CSV files.
 
@@ -1262,8 +1395,9 @@ def export_match_tables(
     Returns
     -------
     dict[str, object]
-        Dictionary containing output paths under ``tracks``, ``qc``, and
-        ``pair_tables`` keys.
+        Dictionary containing output paths under ``tracks``, ``qc``,
+        ``pair_tables``, ``pair_diagnostics``, ``pair_summary``, and
+        ``track_length_summary`` keys.
     """
 
     prefix_path = Path(output_prefix)
@@ -1277,7 +1411,35 @@ def export_match_tables(
         pair_path = prefix_path.with_name(f"{prefix_path.name}_{day_a}_vs_{day_b}.csv")
         pair_table.to_csv(pair_path, index=False)
         pair_paths.append(pair_path)
-    return {"tracks": tracks_path, "qc": qc_path, "pair_tables": pair_paths}
+
+    pair_diagnostics_table = build_pairwise_match_diagnostics_table(
+        pair_tables=pair_tables,
+        xy_um_per_px=xy_um_per_px,
+        z_um_per_plane=z_um_per_plane,
+    )
+    pair_diagnostics_path = prefix_path.with_name(f"{prefix_path.name}_pairwise_match_diagnostics.csv")
+    pair_diagnostics_table.to_csv(pair_diagnostics_path, index=False)
+
+    pair_summary_table = build_pairwise_match_summary_table(
+        pair_tables=pair_tables,
+        xy_um_per_px=xy_um_per_px,
+        z_um_per_plane=z_um_per_plane,
+    )
+    pair_summary_path = prefix_path.with_name(f"{prefix_path.name}_pairwise_match_summary.csv")
+    pair_summary_table.to_csv(pair_summary_path, index=False)
+
+    track_length_summary_table = build_track_length_summary_table(tracks_table)
+    track_length_summary_path = prefix_path.with_name(f"{prefix_path.name}_track_length_summary.csv")
+    track_length_summary_table.to_csv(track_length_summary_path, index=False)
+
+    return {
+        "tracks": tracks_path,
+        "qc": qc_path,
+        "pair_tables": pair_paths,
+        "pair_diagnostics": pair_diagnostics_path,
+        "pair_summary": pair_summary_path,
+        "track_length_summary": track_length_summary_path,
+    }
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1302,14 +1464,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--patch-radius", type=int, default=12)
     parser.add_argument("--patch-size", type=int, default=64)
     parser.add_argument("--overlap", type=int, default=16)
-    parser.add_argument("--max-dist-xy", type=float, default=8.0)
-    parser.add_argument("--max-dist-z", type=float, default=3.0)
+    parser.add_argument("--max-dist-xy", type=float, default=15.0)
+    parser.add_argument("--max-dist-z", type=float, default=5.0)
     parser.add_argument("--min-score", type=float, default=0.45)
     parser.add_argument("--min-gap-support", type=float, default=0.80)
     parser.add_argument("--edge-margin", type=int, default=20)
     parser.add_argument("--edge-relax-xy", type=float, default=3.0)
     parser.add_argument("--edge-score-bonus", type=float, default=0.02)
-    parser.add_argument("--translation-max-shift", type=int, default=20)
+    parser.add_argument("--translation-max-shift", type=int, default=32)
     parser.add_argument("--disable-translation", action="store_true")
     parser.add_argument("--low-confidence-threshold", type=float, default=0.55)
     return parser.parse_args(argv)
@@ -1360,6 +1522,9 @@ def main(argv: list[str] | None = None) -> None:
     print(tracks_table.head(20).to_string())
     print(f"saved tracks to {output_paths['tracks']}")
     print(f"saved qc to {output_paths['qc']}")
+    print(f"saved pair diagnostics to {output_paths['pair_diagnostics']}")
+    print(f"saved pair summary to {output_paths['pair_summary']}")
+    print(f"saved track-length summary to {output_paths['track_length_summary']}")
 
 
 if __name__ == "__main__":

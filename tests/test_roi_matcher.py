@@ -13,6 +13,7 @@ from roi_matcher import (
     extract_roi_records,
     generate_candidate_pairs,
     match_roi_masks,
+    parse_args,
     score_candidate_pair,
     solve_pairwise_assignment,
 )
@@ -167,6 +168,20 @@ def test_pair_shift_estimator_recovers_known_small_xy_shift() -> None:
 
     assert abs(shift_y + 3.0) <= 1.0
     assert abs(shift_x - 2.0) <= 1.0
+
+
+
+
+def test_match_params_and_cli_defaults_reflect_relaxed_threshold_revision() -> None:
+    params = MatchParams()
+    args = parse_args(["--masks", "week1.tif", "week2.tif", "--output-prefix", "roi_match_test"])
+
+    assert params.max_dist_xy == 15.0
+    assert params.max_dist_z == 5.0
+    assert params.translation_max_shift == 32
+    assert args.max_dist_xy == 15.0
+    assert args.max_dist_z == 5.0
+    assert args.translation_max_shift == 32
 
 
 def test_candidate_generation_excludes_far_rois_after_shift_correction() -> None:
@@ -372,8 +387,37 @@ def test_export_match_tables_writes_track_pair_and_qc_csvs(tmp_path: Path) -> No
     assert output_paths["tracks"].exists()
     assert output_paths["qc"].exists()
     assert output_paths["pair_tables"]
+    assert output_paths["pair_diagnostics"].exists()
+    assert output_paths["pair_summary"].exists()
+    assert output_paths["track_length_summary"].exists()
     exported_qc = pd.read_csv(output_paths["qc"])
+    exported_pair_diagnostics = pd.read_csv(output_paths["pair_diagnostics"])
+    exported_pair_summary = pd.read_csv(output_paths["pair_summary"])
+    exported_track_length_summary = pd.read_csv(output_paths["track_length_summary"])
     assert "needs_review" in exported_qc.columns
+    assert {
+        "week_a",
+        "week_b",
+        "roi_a",
+        "roi_b",
+        "distance_xy_px",
+        "distance_xy_um",
+        "distance_z_planes",
+        "distance_z_um",
+        "match_score",
+        "confidence",
+    }.issubset(exported_pair_diagnostics.columns)
+    assert {
+        "candidate_pairs",
+        "accepted_reciprocal_matches",
+        "median_accepted_xy_px",
+        "max_accepted_xy_px",
+        "median_accepted_z_planes",
+        "max_accepted_z_planes",
+        "score_median",
+        "confidence_median",
+    }.issubset(exported_pair_summary.columns)
+    assert exported_track_length_summary["minimum_weeks_present"].tolist() == [4, 5, 6, 7]
 
 
 def test_cropped_syn_masks_produce_nonempty_pairwise_matches_and_track_summary() -> None:

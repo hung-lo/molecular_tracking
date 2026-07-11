@@ -9,6 +9,7 @@ residual XY shifts remain after image registration.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -1118,10 +1119,20 @@ def add_qc_flags(tracks_table: pd.DataFrame, low_confidence_threshold: float = 0
     return table
 
 
+
+
+def _emit_log(log_fn: Callable[[str], None] | None, message: str) -> None:
+    """Send one progress message to an optional logging callback."""
+
+    if log_fn is not None:
+        log_fn(message)
+
+
 def match_roi_masks(
     mask_stacks: list[np.ndarray],
     day_names: list[str],
     params: MatchParams | None = None,
+    log_fn: Callable[[str], None] | None = None,
 ) -> tuple[pd.DataFrame, dict[tuple[str, str], pd.DataFrame], pd.DataFrame]:
     """Run end-to-end ROI matching on multiple labeled mask stacks.
 
@@ -1135,6 +1146,8 @@ def match_roi_masks(
     params : MatchParams or None, default=None
         Matcher parameters. When ``None``, :class:`MatchParams` defaults are
         used.
+    log_fn : collections.abc.Callable[[str], None] or None, default=None
+        Optional callback used for lightweight console-style progress logging.
 
     Returns
     -------
@@ -1155,21 +1168,34 @@ def match_roi_masks(
         if tuple(mask_stack.shape) != expected_shape:
             raise ValueError("All mask stacks must share the same (z, y, x) shape")
 
-    all_records = {
-        day_name: extract_roi_records(
+    _emit_log(
+        log_fn,
+        f"[roi_matcher] Starting match run for {len(day_names)} sessions with shared shape {expected_shape}.",
+    )
+    all_records: dict[str, list[ROIRecord]] = {}
+    for day_name, mask_stack in zip(day_names, mask_stacks):
+        _emit_log(log_fn, f"[roi_matcher] Extracting ROI records for {day_name}...")
+        records = extract_roi_records(
             mask_zyx=mask_stack,
             day_name=day_name,
             patch_radius=params.patch_radius,
             edge_margin=params.edge_margin,
         )
-        for day_name, mask_stack in zip(day_names, mask_stacks)
-    }
+        all_records[day_name] = records
+        _emit_log(log_fn, f"[roi_matcher]   {day_name}: extracted {len(records)} ROIs")
 
     pair_tables: dict[tuple[str, str], pd.DataFrame] = {}
     max_pair_span = 2
+    total_pairs = sum(
+        min(len(day_names), index_a + max_pair_span + 1) - (index_a + 1)
+        for index_a in range(len(day_names))
+    )
+    pair_counter = 0
     for index_a, day_a in enumerate(day_names):
         for index_b in range(index_a + 1, min(len(day_names), index_a + max_pair_span + 1)):
             day_b = day_names[index_b]
+            pair_counter += 1
+            _emit_log(log_fn, f"[roi_matcher] Pair {pair_counter}/{total_pairs}: {day_a} vs {day_b}")
             shift_yx = _select_pair_shift(
                 records_a=all_records[day_a],
                 records_b=all_records[day_b],
@@ -1196,7 +1222,13 @@ def match_roi_masks(
             assigned_table.attrs.update(pair_metadata)
             assigned_table.attrs["accepted_match_count"] = int(len(assigned_table))
             pair_tables[(day_a, day_b)] = assigned_table
+            _emit_log(
+                log_fn,
+                f"[roi_matcher]   shift=(dy={shift_yx[0]:.2f}, dx={shift_yx[1]:.2f}) | "
+                f"candidates={len(candidate_table)} | accepted={len(assigned_table)}",
+            )
 
+    _emit_log(log_fn, "[roi_matcher] Building multi-week tracks from pairwise matches...")
     tracks_table = build_tracks_from_pairwise_matches(
         day_names=day_names,
         pair_tables=pair_tables,
@@ -1229,6 +1261,7 @@ def match_roi_masks(
             singleton_rows.append(row)
     if singleton_rows:
         tracks_table = pd.concat([tracks_table, pd.DataFrame(singleton_rows)], ignore_index=True)
+    _emit_log(log_fn, f"[roi_matcher] Added {len(singleton_rows)} singleton tracks.")
 
     edge_flags = []
     edge_distances = []
@@ -1250,6 +1283,11 @@ def match_roi_masks(
     tracks_table["cluster_id"] = np.arange(1, len(tracks_table) + 1)
 
     qc_table = add_qc_flags(tracks_table, low_confidence_threshold=params.low_confidence_threshold)
+    n_review = int(qc_table["needs_review"].sum()) if "needs_review" in qc_table.columns else 0
+    _emit_log(
+        log_fn,
+        f"[roi_matcher] Finished matching: {len(tracks_table)} total tracks, {n_review} flagged for review.",
+    )
     return tracks_table, pair_tables, qc_table
 
 
@@ -1474,6 +1512,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--translation-max-shift", type=int, default=32)
     parser.add_argument("--disable-translation", action="store_true")
     parser.add_argument("--low-confidence-threshold", type=float, default=0.55)
+    parser.add_argument("--quiet", action="store_true", help="Suppress progress logging during matching.")
     return parser.parse_args(argv)
 
 
@@ -1511,8 +1550,19 @@ def main(argv: list[str] | None = None) -> None:
         use_translation=(not args.disable_translation),
         low_confidence_threshold=args.low_confidence_threshold,
     )
-    mask_stacks = [tifffile.imread(Path(mask_path)) for mask_path in args.masks]
-    tracks_table, pair_tables, qc_table = match_roi_masks(mask_stacks=mask_stacks, day_names=day_names, params=params)
+    log_fn = None if args.quiet else print
+    _emit_log(log_fn, f"[roi_matcher] Loading {len(args.masks)} mask stacks...")
+    mask_stacks = []
+    for day_name, mask_path in zip(day_names, args.masks):
+        _emit_log(log_fn, f"[roi_matcher]   reading {day_name}: {mask_path}")
+        mask_stacks.append(tifffile.imread(Path(mask_path)))
+    tracks_table, pair_tables, qc_table = match_roi_masks(
+        mask_stacks=mask_stacks,
+        day_names=day_names,
+        params=params,
+        log_fn=log_fn,
+    )
+    _emit_log(log_fn, f"[roi_matcher] Writing outputs with prefix {Path(args.output_prefix)}")
     output_paths = export_match_tables(
         output_prefix=Path(args.output_prefix),
         tracks_table=tracks_table,

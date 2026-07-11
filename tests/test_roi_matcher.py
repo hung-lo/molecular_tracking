@@ -184,6 +184,31 @@ def test_match_params_and_cli_defaults_reflect_relaxed_threshold_revision() -> N
     assert args.translation_max_shift == 32
 
 
+def test_match_roi_masks_emits_progress_logs_when_log_fn_provided() -> None:
+    masks = make_four_week_masks()
+    params = MatchParams(
+        patch_radius=5,
+        patch_size=24,
+        overlap=8,
+        max_dist_xy=5.0,
+        max_dist_z=2.5,
+        min_score=0.45,
+        min_gap_support=0.80,
+    )
+    messages: list[str] = []
+
+    match_roi_masks(
+        mask_stacks=masks,
+        day_names=["week1", "week2", "week3", "week4"],
+        params=params,
+        log_fn=messages.append,
+    )
+
+    assert any("Extracting ROI records for week1" in message for message in messages)
+    assert any("Pair 1/" in message and "week1 vs week2" in message for message in messages)
+    assert any("Finished matching:" in message for message in messages)
+
+
 def test_candidate_generation_excludes_far_rois_after_shift_correction() -> None:
     week1 = make_three_roi_mask()
     week2 = make_translated_mask(week1, shift_yx=(2, -1))

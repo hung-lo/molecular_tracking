@@ -14,6 +14,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 import argparse
+import sys
 import json
 import shutil
 import time
@@ -24,6 +25,17 @@ from matplotlib.gridspec import GridSpec
 import numpy as np
 import pandas as pd
 import tifffile
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _import_dir in (
+    _REPO_ROOT / "core",
+    _REPO_ROOT / "plotting",
+    _REPO_ROOT / "matching",
+):
+    _import_dir_str = str(_import_dir)
+    if _import_dir_str not in sys.path:
+        sys.path.append(_import_dir_str)
+
 
 from analysis_paths import get_dataset_analysis_dir, resolve_dataset_dir
 from roi_log_ratio_analysis import (

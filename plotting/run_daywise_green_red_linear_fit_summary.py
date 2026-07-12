@@ -12,11 +12,23 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 import argparse
+import sys
 import time
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _import_dir in (
+    _REPO_ROOT / "core",
+    _REPO_ROOT / "plotting",
+    _REPO_ROOT / "matching",
+):
+    _import_dir_str = str(_import_dir)
+    if _import_dir_str not in sys.path:
+        sys.path.append(_import_dir_str)
+
 
 from analysis_paths import get_shape_qc_analysis_dir, resolve_dataset_dir
 from roi_log_ratio_analysis import summarize_daily_green_red_linear_fits

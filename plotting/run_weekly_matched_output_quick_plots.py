@@ -5,9 +5,21 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import argparse
+import sys
 import time
 
 import pandas as pd
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _import_dir in (
+    _REPO_ROOT / "core",
+    _REPO_ROOT / "plotting",
+    _REPO_ROOT / "matching",
+):
+    _import_dir_str = str(_import_dir)
+    if _import_dir_str not in sys.path:
+        sys.path.append(_import_dir_str)
+
 
 from roi_log_ratio_analysis import (
     select_ranked_roi_days,

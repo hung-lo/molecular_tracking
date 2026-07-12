@@ -34,3 +34,14 @@ uv run python ./matching/roi_matcher_qc_plots.py \
   --days week1 week2 week3 week4 week5 week6 week7 week8 week9\
   --output-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/roi_match_runs/20260710_9wks/plotting \
   --examples-per-group 4
+
+
+
+## run matched roi pipeline to get intensity out from the masks 
+
+
+## run the plotting after extracing 
+  uv run python plotting/run_weekly_matched_output_quick_plots.py \
+  --analysis-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/analysis/weekly_matched_roi_pipeline_20260710_9wks_20260712_131009 \
+  --start-date 20260511 \
+  --top-n 30

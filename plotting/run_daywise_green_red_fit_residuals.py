@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 import argparse
+import time
 
 from matplotlib import pyplot as plt
 from matplotlib.lines import Line2D
@@ -18,6 +19,23 @@ import numpy as np
 import pandas as pd
 
 from analysis_paths import get_shape_qc_analysis_dir, resolve_dataset_dir
+
+
+def format_duration_seconds(duration_seconds: float) -> str:
+    """Format elapsed wall-clock time as ``HH:MM:SS``."""
+
+    total_seconds = max(0, int(duration_seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def log_message(run_start_seconds: float, message: str) -> None:
+    """Print one elapsed-time progress message."""
+
+    elapsed_seconds = time.perf_counter() - run_start_seconds
+    print(f"[{format_duration_seconds(elapsed_seconds)}] {message}", flush=True)
+
 from roi_log_ratio_analysis import (
     compute_green_red_fit_residuals,
     select_ranked_roi_days,
@@ -367,6 +385,7 @@ def write_run_log(
     average_intercept: float,
     top30_roi_ids: list[int],
     direction_label: str,
+    total_duration_seconds: float,
 ) -> None:
     """Write a short run log for reproducibility.
 
@@ -383,6 +402,8 @@ def write_run_log(
     direction_label : str
         Human-readable direction label such as ``"decreasing"`` or
         ``"increasing"`` used in the log metadata key.
+    total_duration_seconds : float
+        Total wall-clock duration for the current run in seconds.
     """
 
     log_lines = [
@@ -390,6 +411,8 @@ def write_run_log(
         f"average_slope={average_slope}",
         f"average_intercept={average_intercept}",
         f"top30_{direction_label}_roi_ids={','.join(str(roi_id) for roi_id in top30_roi_ids)}",
+        f"total_duration_seconds={float(total_duration_seconds):.3f}",
+        f"total_duration_hms={format_duration_seconds(total_duration_seconds)}",
     ]
     (output_dir / "run_log.txt").write_text("\n".join(log_lines), encoding="utf-8")
 
@@ -417,6 +440,8 @@ def run_directional_residual_analysis(
     pathlib.Path
         Path to the created dated output directory.
     """
+    run_start_seconds = time.perf_counter()
+    log_message(run_start_seconds, f"Starting {direction_label} green-fit residual analysis | dataset={dataset}")
     base_dir = resolve_dataset_dir(dataset)
     shape_qc_dir = get_shape_qc_analysis_dir(dataset)
     metrics_path = (
@@ -431,8 +456,11 @@ def run_directional_residual_analysis(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = output_root / f"{output_dir_prefix}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=False)
+    log_message(run_start_seconds, f"Output directory: {output_dir}")
 
+    log_message(run_start_seconds, f"Loading ROI metrics from {metrics_path}")
     roi_metrics = pd.read_csv(metrics_path)
+    log_message(run_start_seconds, f"Loaded {len(roi_metrics)} ROI/day rows; computing day-wise fits and residuals")
     fit_summary = summarize_daily_green_red_linear_fits(roi_metrics)
     residual_table = compute_green_red_fit_residuals(
         roi_metrics=roi_metrics,
@@ -457,6 +485,7 @@ def run_directional_residual_analysis(
     )
     top30_table_path = output_dir / f"top30_{direction_label}_green_red_fit_residuals.csv"
     top30_table.to_csv(top30_table_path, index=False)
+    log_message(run_start_seconds, f"Selected {len(top30_table['roi_id'].unique())} ranked {direction_label} ROIs; rendering plots")
 
     scatter_plot_path = output_dir / f"top30_{direction_label}_green_red_trajectory_scatter_average_fit.png"
     plot_directional_roi_trajectories_scatter(
@@ -483,19 +512,23 @@ def run_directional_residual_analysis(
         residual_plot_path=residual_plot_path,
         direction_label=direction_label,
     )
+    total_duration_seconds = time.perf_counter() - run_start_seconds
     write_run_log(
         output_dir=output_dir,
         average_slope=float(fit_summary["slope"].mean()),
         average_intercept=float(fit_summary["intercept"].mean()),
         top30_roi_ids=top30_roi_ids,
         direction_label=direction_label,
+        total_duration_seconds=total_duration_seconds,
     )
 
+    print(f"[{format_duration_seconds(total_duration_seconds)}] Completed {direction_label} green-fit residual analysis", flush=True)
     print(f"output_dir={output_dir}")
     print(f"residual_table_path={residual_table_path}")
     print(f"top30_table_path={top30_table_path}")
     print(f"scatter_plot_path={scatter_plot_path}")
     print(f"residual_plot_path={residual_plot_path}")
+    print(f"total_duration={format_duration_seconds(total_duration_seconds)}")
     return output_dir
 
 

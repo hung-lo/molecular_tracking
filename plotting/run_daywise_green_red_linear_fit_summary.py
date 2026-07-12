@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 import argparse
+import time
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,6 +20,23 @@ import pandas as pd
 
 from analysis_paths import get_shape_qc_analysis_dir, resolve_dataset_dir
 from roi_log_ratio_analysis import summarize_daily_green_red_linear_fits
+
+
+def format_duration_seconds(duration_seconds: float) -> str:
+    """Format elapsed wall-clock time as ``HH:MM:SS``."""
+
+    total_seconds = max(0, int(duration_seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def log_message(run_start_seconds: float, message: str) -> None:
+    """Print one elapsed-time progress message."""
+
+    elapsed_seconds = time.perf_counter() - run_start_seconds
+    print(f"[{format_duration_seconds(elapsed_seconds)}] {message}", flush=True)
+
 
 
 def make_day_date_labels(
@@ -356,6 +374,7 @@ def write_run_log(
     output_dir: Path,
     input_metrics_path: Path,
     fit_summary: pd.DataFrame,
+    total_duration_seconds: float,
 ) -> None:
     """Write a plain-text run log for reproducibility.
 
@@ -368,6 +387,8 @@ def write_run_log(
     fit_summary : pandas.DataFrame
         Day-wise fit summary table returned by
         :func:`summarize_daily_green_red_linear_fits`.
+    total_duration_seconds : float
+        Total wall-clock duration for the current run in seconds.
     """
 
     log_lines = [
@@ -376,6 +397,8 @@ def write_run_log(
         f"n_days={len(fit_summary)}",
         f"days={','.join(str(day) for day in fit_summary['day'].tolist())}",
         f"roi_counts={','.join(str(int(count)) for count in fit_summary['n_rois'].tolist())}",
+        f"total_duration_seconds={float(total_duration_seconds):.3f}",
+        f"total_duration_hms={format_duration_seconds(total_duration_seconds)}",
     ]
     (output_dir / "run_log.txt").write_text("\n".join(log_lines), encoding="utf-8")
 
@@ -401,7 +424,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Run the day-wise corrected red-vs-green fit summary analysis."""
 
+    run_start_seconds = time.perf_counter()
     args = parse_args()
+    log_message(run_start_seconds, f"Starting day-wise green-vs-red linear fit summary | dataset={args.dataset}")
     base_dir = resolve_dataset_dir(args.dataset)
     shape_qc_dir = get_shape_qc_analysis_dir(args.dataset)
     input_metrics_path = (
@@ -412,8 +437,11 @@ def main() -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = output_root / f"daywise_green_red_linear_fit_summary_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=False)
+    log_message(run_start_seconds, f"Output directory: {output_dir}")
 
+    log_message(run_start_seconds, f"Loading filtered ROI metrics from {input_metrics_path}")
     roi_metrics = pd.read_csv(input_metrics_path)
+    log_message(run_start_seconds, f"Loaded {len(roi_metrics)} ROI/day rows; fitting day-wise green-vs-red models")
     fit_summary = summarize_daily_green_red_linear_fits(roi_metrics)
 
     fit_summary_path = output_dir / "daywise_green_red_linear_fit_summary.csv"
@@ -421,6 +449,7 @@ def main() -> None:
 
     scatter_plot_path = output_dir / "daywise_green_red_linear_fit_scatters.png"
     parameter_plot_path = output_dir / "daywise_green_red_linear_fit_parameters.png"
+    log_message(run_start_seconds, "Rendering day-wise scatter and fit-parameter summary plots")
     plot_daywise_scatter_summary(
         roi_metrics=roi_metrics,
         fit_summary=fit_summary,
@@ -439,16 +468,20 @@ def main() -> None:
         scatter_plot_path=scatter_plot_path,
         parameter_plot_path=parameter_plot_path,
     )
+    total_duration_seconds = time.perf_counter() - run_start_seconds
     write_run_log(
         output_dir=output_dir,
         input_metrics_path=input_metrics_path,
         fit_summary=fit_summary,
+        total_duration_seconds=total_duration_seconds,
     )
 
+    print(f"[{format_duration_seconds(total_duration_seconds)}] Completed day-wise green-vs-red linear fit summary", flush=True)
     print(f"output_dir={output_dir}")
     print(f"fit_summary_path={fit_summary_path}")
     print(f"scatter_plot_path={scatter_plot_path}")
     print(f"parameter_plot_path={parameter_plot_path}")
+    print(f"total_duration={format_duration_seconds(total_duration_seconds)}")
 
 
 if __name__ == "__main__":

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 import argparse
+import time
 
 import pandas as pd
 
@@ -21,6 +23,42 @@ from run_daywise_green_red_linear_fit_summary import (
     plot_daywise_scatter_summary,
     plot_fit_parameter_summary,
 )
+
+
+def format_duration_seconds(duration_seconds: float) -> str:
+    """Format elapsed wall-clock time as ``HH:MM:SS``."""
+
+    total_seconds = max(0, int(duration_seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def log_message(run_start_seconds: float, message: str) -> None:
+    """Print one elapsed-time progress message."""
+
+    elapsed_seconds = time.perf_counter() - run_start_seconds
+    print(f"[{format_duration_seconds(elapsed_seconds)}] {message}", flush=True)
+
+
+def write_run_log(
+    output_dir: Path,
+    analysis_dir: Path,
+    start_date: str,
+    top_n: int,
+    total_duration_seconds: float,
+) -> None:
+    """Write a compact text run log for the quick-plot export."""
+
+    log_lines = [
+        f"run_timestamp={datetime.now().isoformat()}",
+        f"analysis_dir={analysis_dir}",
+        f"start_date={start_date}",
+        f"top_n={int(top_n)}",
+        f"total_duration_seconds={float(total_duration_seconds):.3f}",
+        f"total_duration_hms={format_duration_seconds(total_duration_seconds)}",
+    ]
+    (output_dir / 'run_log.txt').write_text("\n".join(log_lines), encoding='utf-8')
 
 
 def _load_metrics_table(path: Path) -> pd.DataFrame:
@@ -49,17 +87,22 @@ def build_quick_plots(
 ) -> Path:
     """Render a small set of no-rerun QC plots from saved weekly output tables."""
 
+    run_start_seconds = time.perf_counter()
     analysis_dir = Path(analysis_dir)
+    log_message(run_start_seconds, f"Starting weekly matched quick plots | analysis_dir={analysis_dir}")
     metrics_path = analysis_dir / "weekly_matched_roi_log_ratio_metrics_complete.csv"
     residuals_path = analysis_dir / "weekly_matched_roi_metrics_with_green_red_fit_residuals.csv"
     fit_summary_path = analysis_dir / "weekly_matched_daywise_green_red_linear_fit_summary.csv"
 
+    log_message(run_start_seconds, f"Loading saved weekly matched tables from {analysis_dir}")
     metrics_table = _load_metrics_table(metrics_path)
     residuals_table = _load_metrics_table(residuals_path)
     fit_summary = _load_fit_summary(fit_summary_path)
 
     output_dir = analysis_dir / "quick_plots"
     output_dir.mkdir(parents=True, exist_ok=True)
+    log_message(run_start_seconds, f"Output directory: {output_dir}")
+    log_message(run_start_seconds, "Rendering population and day-wise fit summary plots")
 
     plot_population_summary(
         roi_metrics=metrics_table,
@@ -102,8 +145,13 @@ def build_quick_plots(
             direction=direction_label,
         )
         if top_rois.empty:
+            log_message(run_start_seconds, f"No ranked {direction_label} clusters found; skipping directional plots")
             continue
 
+        log_message(
+            run_start_seconds,
+            f"Rendering {direction_label} directional plots for {len(top_rois)} ranked clusters",
+        )
         ranked_roi_days = select_ranked_roi_days(
             roi_day_table=residuals_table,
             ranking_table=top_rois,
@@ -160,6 +208,17 @@ def build_quick_plots(
         "Directional plots are written when ranked clusters are available.",
     ]
     (output_dir / "README.txt").write_text("\n".join(summary_lines), encoding="utf-8")
+
+    total_duration_seconds = time.perf_counter() - run_start_seconds
+    write_run_log(
+        output_dir=output_dir,
+        analysis_dir=analysis_dir,
+        start_date=start_date,
+        top_n=top_n,
+        total_duration_seconds=total_duration_seconds,
+    )
+    print(f"[{format_duration_seconds(total_duration_seconds)}] Completed weekly matched quick plots", flush=True)
+    print(f"total_duration={format_duration_seconds(total_duration_seconds)}")
     return output_dir
 
 

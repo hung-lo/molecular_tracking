@@ -1477,6 +1477,7 @@ def write_run_log(
     filter_counts: pd.DataFrame,
     raw_space_status: dict[str, object],
     stage_durations_seconds: dict[str, float],
+    total_duration_seconds: float,
 ) -> None:
     """Write a JSON run log for reproducibility.
 
@@ -1493,6 +1494,8 @@ def write_run_log(
         run.
     stage_durations_seconds : dict[str, float]
         Mapping from pipeline stage names to wall-clock durations in seconds.
+    total_duration_seconds : float
+        Total wall-clock duration for the full pipeline run in seconds.
     """
 
     log_payload = {
@@ -1502,6 +1505,8 @@ def write_run_log(
         'filter_counts': filter_counts.to_dict(orient='records'),
         'raw_space_status': raw_space_status,
         'stage_durations_seconds': stage_durations_seconds,
+        'total_duration_seconds': float(total_duration_seconds),
+        'total_duration_hms': format_duration_seconds(total_duration_seconds),
     }
     (output_dir / 'run_log.json').write_text(
         json.dumps(log_payload, indent=2),
@@ -1893,6 +1898,7 @@ def run_registered_roi_pipeline(config: RegisteredPipelineConfig) -> Path:
         filter_counts=filter_counts,
         raw_space_status=raw_space_status,
         stage_durations_seconds=stage_durations_seconds,
+        total_duration_seconds=total_duration_seconds,
     )
     print(f"[{format_duration_seconds(total_duration_seconds)}] Pipeline completed")
     print(f'output_dir={output_dir}')

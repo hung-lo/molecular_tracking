@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime
+import json
 import math
 from pathlib import Path
+import time
 
 import numpy as np
 import pandas as pd
@@ -22,6 +25,29 @@ import tifffile
 DEFAULT_XY_UM_PER_PX = 710.0 / 1024.0
 DEFAULT_Z_UM_PER_PLANE = 5.0
 DEFAULT_TRACK_LENGTH_THRESHOLDS = (4, 5, 6, 7)
+
+
+def format_duration_seconds(duration_seconds: float) -> str:
+    """Format elapsed wall-clock time as ``HH:MM:SS``."""
+
+    total_seconds = max(0, int(duration_seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _serialize_output_paths(output_paths: dict[str, object]) -> dict[str, object]:
+    """Convert output paths into JSON-serializable strings."""
+
+    serialized: dict[str, object] = {}
+    for key, value in output_paths.items():
+        if isinstance(value, (str, Path)):
+            serialized[key] = str(value)
+        elif isinstance(value, list):
+            serialized[key] = [str(item) for item in value]
+        else:
+            serialized[key] = value
+    return serialized
 
 
 @dataclass(frozen=True)
@@ -1480,6 +1506,30 @@ def export_match_tables(
     }
 
 
+def write_run_log(
+    output_prefix: Path,
+    day_names: list[str],
+    mask_paths: list[str],
+    params: MatchParams,
+    output_paths: dict[str, object],
+    total_duration_seconds: float,
+) -> Path:
+    """Write a JSON run log for one matcher CLI execution."""
+
+    run_log_path = output_prefix.with_name(f"{output_prefix.name}_run_log.json")
+    payload = {
+        "run_timestamp": datetime.now().isoformat(),
+        "day_names": day_names,
+        "mask_paths": mask_paths,
+        "params": asdict(params),
+        "output_paths": _serialize_output_paths(output_paths),
+        "total_duration_seconds": float(total_duration_seconds),
+        "total_duration_hms": format_duration_seconds(total_duration_seconds),
+    }
+    run_log_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return run_log_path
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments for the ROI matcher script.
 
@@ -1531,10 +1581,12 @@ def main(argv: list[str] | None = None) -> None:
         Results are written to CSV files on disk.
     """
 
+    run_start_seconds = time.perf_counter()
     args = parse_args(argv)
     day_names = args.days if args.days else [f"day{index + 1}" for index in range(len(args.masks))]
     if len(day_names) != len(args.masks):
         raise ValueError("The number of --days entries must match the number of --masks entries.")
+    output_prefix = Path(args.output_prefix)
     params = MatchParams(
         patch_radius=args.patch_radius,
         patch_size=args.patch_size,
@@ -1551,23 +1603,35 @@ def main(argv: list[str] | None = None) -> None:
         low_confidence_threshold=args.low_confidence_threshold,
     )
     log_fn = None if args.quiet else print
+    _emit_log(log_fn, f"[roi_matcher] Starting ROI matching for {len(day_names)} sessions")
     _emit_log(log_fn, f"[roi_matcher] Loading {len(args.masks)} mask stacks...")
     mask_stacks = []
     for day_name, mask_path in zip(day_names, args.masks):
         _emit_log(log_fn, f"[roi_matcher]   reading {day_name}: {mask_path}")
         mask_stacks.append(tifffile.imread(Path(mask_path)))
+    _emit_log(log_fn, "[roi_matcher] Running pairwise and gap-aware matching")
     tracks_table, pair_tables, qc_table = match_roi_masks(
         mask_stacks=mask_stacks,
         day_names=day_names,
         params=params,
         log_fn=log_fn,
     )
-    _emit_log(log_fn, f"[roi_matcher] Writing outputs with prefix {Path(args.output_prefix)}")
+    _emit_log(log_fn, f"[roi_matcher] Matching produced {len(tracks_table)} tracks")
+    _emit_log(log_fn, f"[roi_matcher] Writing outputs with prefix {output_prefix}")
     output_paths = export_match_tables(
-        output_prefix=Path(args.output_prefix),
+        output_prefix=output_prefix,
         tracks_table=tracks_table,
         pair_tables=pair_tables,
         qc_table=qc_table,
+    )
+    total_duration_seconds = time.perf_counter() - run_start_seconds
+    run_log_path = write_run_log(
+        output_prefix=output_prefix,
+        day_names=day_names,
+        mask_paths=[str(Path(mask_path)) for mask_path in args.masks],
+        params=params,
+        output_paths=output_paths,
+        total_duration_seconds=total_duration_seconds,
     )
     print(tracks_table.head(20).to_string())
     print(f"saved tracks to {output_paths['tracks']}")
@@ -1575,6 +1639,9 @@ def main(argv: list[str] | None = None) -> None:
     print(f"saved pair diagnostics to {output_paths['pair_diagnostics']}")
     print(f"saved pair summary to {output_paths['pair_summary']}")
     print(f"saved track-length summary to {output_paths['track_length_summary']}")
+    print(f"saved run log to {run_log_path}")
+    print(f"[roi_matcher] Total duration: {format_duration_seconds(total_duration_seconds)}")
+    print(f"total_duration={format_duration_seconds(total_duration_seconds)}")
 
 
 if __name__ == "__main__":

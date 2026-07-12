@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 from pathlib import Path
+import time
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
@@ -54,6 +55,22 @@ class PlotStyle:
     matched_fill_color: str = "#ff2d2d"
     matched_contour_color: str = "#ffffff"
     centroid_marker_color: str = "#000000"
+
+
+def format_duration_seconds(duration_seconds: float) -> str:
+    """Format elapsed wall-clock time as ``HH:MM:SS``."""
+
+    total_seconds = max(0, int(duration_seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def log_message(run_start_seconds: float, message: str) -> None:
+    """Print one elapsed-time progress message."""
+
+    elapsed_seconds = time.perf_counter() - run_start_seconds
+    print(f"[{format_duration_seconds(elapsed_seconds)}] {message}", flush=True)
 
 
 def merge_track_and_qc_tables(tracks_table: pd.DataFrame, qc_table: pd.DataFrame) -> pd.DataFrame:
@@ -681,26 +698,52 @@ def generate_qc_example_plots(
         selection tables used to build the plots.
     """
 
+    run_start_seconds = time.perf_counter()
     if params is None:
         params = MatchParams()
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    log_message(
+        run_start_seconds,
+        f"Starting ROI matcher QC example plots | masks={len(mask_paths)} | output_dir={output_path}",
+    )
 
+    log_message(run_start_seconds, "Loading registered mask stacks")
     mask_stacks = [tifffile.imread(Path(mask_path)) for mask_path in mask_paths]
-    tracks_table, pair_tables, qc_table = match_roi_masks(mask_stacks=mask_stacks, day_names=day_names, params=params)
+
+    log_message(run_start_seconds, "Running ROI matcher to build track and QC tables")
+
+    def matcher_log(message: str) -> None:
+        log_message(run_start_seconds, message)
+
+    tracks_table, pair_tables, qc_table = match_roi_masks(
+        mask_stacks=mask_stacks,
+        day_names=day_names,
+        params=params,
+        log_fn=matcher_log,
+    )
     merged_table = merge_track_and_qc_tables(tracks_table, qc_table)
 
+    log_message(run_start_seconds, "Extracting ROI records for visualization")
     records_by_day_label = {}
     for day_name, mask_stack in zip(day_names, mask_stacks):
         for record in extract_roi_records(mask_stack, day_name=day_name, patch_radius=params.patch_radius, edge_margin=params.edge_margin):
             records_by_day_label[(day_name, record.label)] = record
 
+    log_message(run_start_seconds, "Selecting representative example tracks")
     selections = select_example_tracks(tracks_table, qc_table, examples_per_group=examples_per_group)
     style = PlotStyle()
     figure_paths: dict[str, str] = {}
     selected_rows = []
     for group_name, selection_table in selections.items():
         merged_selection = merge_track_and_qc_tables(selection_table, qc_table)
+        if len(merged_selection) == 0:
+            log_message(run_start_seconds, f"No {group_name} confidence examples selected; skipping figure")
+        else:
+            log_message(
+                run_start_seconds,
+                f"Rendering {group_name} confidence examples for {len(merged_selection)} tracks",
+            )
         figure_path = render_example_group(
             selected_tracks=merged_selection,
             day_names=day_names,
@@ -728,6 +771,7 @@ def generate_qc_example_plots(
     tracks_table.to_csv(tracks_path, index=False)
     qc_table.to_csv(qc_path, index=False)
     pair_counts = {f"{day_a}_vs_{day_b}": len(table) for (day_a, day_b), table in pair_tables.items()}
+    total_duration_seconds = time.perf_counter() - run_start_seconds
 
     summary = {
         "mask_paths": [str(Path(mask_path)) for mask_path in mask_paths],
@@ -739,6 +783,8 @@ def generate_qc_example_plots(
         "pair_counts": pair_counts,
         "figure_paths": figure_paths,
         "examples_per_group": int(examples_per_group),
+        "total_duration_seconds": float(total_duration_seconds),
+        "total_duration_hms": format_duration_seconds(total_duration_seconds),
     }
 
     summary_path = output_path / "summary.md"
@@ -753,6 +799,7 @@ def generate_qc_example_plots(
                 f"- Full {len(day_names)}-week tracks: {summary['n_full_tracks']} ({summary['full_track_fraction']:.3f})",
                 f"- Fraction flagged for review: {summary['needs_review_fraction']:.3f}",
                 f"- Pair counts: {json.dumps(pair_counts, sort_keys=True)}",
+                f"- Total duration: {summary['total_duration_hms']}",
                 "",
                 "These figures are QC examples, not calibrated proof that the confidence score is correct.",
             ]
@@ -761,6 +808,9 @@ def generate_qc_example_plots(
     )
     log_path = output_path / "run_log.json"
     log_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    print(f"[{format_duration_seconds(total_duration_seconds)}] Completed ROI matcher QC example plots", flush=True)
+    print(f"total_duration={format_duration_seconds(total_duration_seconds)}")
 
     return {
         "output_dir": output_path,
@@ -776,7 +826,6 @@ def generate_qc_example_plots(
         "log_path": log_path,
         "figure_paths": figure_paths,
     }
-
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments for QC example plot generation.

@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 import argparse
+import time
 
 import matplotlib.colors as colors
 from matplotlib import pyplot as plt
@@ -66,6 +67,22 @@ class RoiDayGeometry:
     height_px: int
     z_minus1: int
     z_plus1: int
+
+
+def format_duration_seconds(duration_seconds: float) -> str:
+    """Format elapsed wall-clock time as ``HH:MM:SS``."""
+
+    total_seconds = max(0, int(duration_seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def log_message(run_start_seconds: float, message: str) -> None:
+    """Print one elapsed-time progress message."""
+
+    elapsed_seconds = time.perf_counter() - run_start_seconds
+    print(f"[{format_duration_seconds(elapsed_seconds)}] {message}", flush=True)
 
 
 def build_magenta_green_colormaps() -> tuple[colors.Colormap, colors.Colormap]:
@@ -489,6 +506,26 @@ def write_summary_markdown(
     summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
 
 
+def write_run_log(
+    output_dir: Path,
+    selection_table_path: Path,
+    metadata_path: Path,
+    n_panels: int,
+    total_duration_seconds: float,
+) -> None:
+    """Write a compact text run log for the raw-space validation export."""
+
+    log_lines = [
+        f"run_timestamp={datetime.now().isoformat()}",
+        f"selection_table_path={selection_table_path}",
+        f"metadata_path={metadata_path}",
+        f"n_panels={int(n_panels)}",
+        f"total_duration_seconds={float(total_duration_seconds):.3f}",
+        f"total_duration_hms={format_duration_seconds(total_duration_seconds)}",
+    ]
+    (output_dir / "run_log.txt").write_text("\n".join(log_lines), encoding="utf-8")
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for the raw-space validation script.
 
@@ -515,7 +552,9 @@ def main() -> None:
     results into a timestamped analysis-run directory.
     """
 
+    run_start_seconds = time.perf_counter()
     args = parse_args()
+    log_message(run_start_seconds, f"Starting raw-space inverse-mask validation | dataset={args.dataset}")
     base_dir = resolve_dataset_dir(args.dataset)
     shape_qc_dir = get_shape_qc_analysis_dir(args.dataset)
     selection_table_path = (
@@ -529,13 +568,20 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=False)
     panel_dir.mkdir(parents=True, exist_ok=False)
+    log_message(run_start_seconds, f"Output directory: {output_dir}")
 
+    log_message(run_start_seconds, f"Loading ranked ROI selection table from {selection_table_path}")
     roi_table = pd.read_csv(selection_table_path).sort_values("selection_rank").reset_index(drop=True)
     raw_lookup = build_raw_image_lookup(base_dir)
     mask_lookup = build_inverse_warped_mask_lookup(base_dir)
+    log_message(run_start_seconds, f"Loaded {len(roi_table)} ranked ROIs; rendering raw-space validation panels")
 
     all_metadata_rows: list[dict[str, object]] = []
-    for _, roi_row in roi_table.iterrows():
+    for roi_index, (_, roi_row) in enumerate(roi_table.iterrows(), start=1):
+        log_message(
+            run_start_seconds,
+            f"Rendering ROI {roi_index}/{len(roi_table)} | roi_id={int(roi_row['roi_id'])} | rank={int(roi_row['selection_rank']):02d}",
+        )
         output_path = panel_dir / (
             f"rank_{int(roi_row['selection_rank']):02d}_roi_{int(roi_row['roi_id'])}.png"
         )
@@ -561,10 +607,20 @@ def main() -> None:
         n_rois=len(roi_table),
     )
 
+    total_duration_seconds = time.perf_counter() - run_start_seconds
+    write_run_log(
+        output_dir=output_dir,
+        selection_table_path=selection_table_path,
+        metadata_path=metadata_path,
+        n_panels=len(roi_table),
+        total_duration_seconds=total_duration_seconds,
+    )
+    print(f"[{format_duration_seconds(total_duration_seconds)}] Completed raw-space inverse-mask validation", flush=True)
     print(f"output_dir={output_dir}")
     print(f"panel_dir={panel_dir}")
     print(f"metadata_path={metadata_path}")
     print(f"n_panels={len(roi_table)}")
+    print(f"total_duration={format_duration_seconds(total_duration_seconds)}")
 
 
 if __name__ == "__main__":

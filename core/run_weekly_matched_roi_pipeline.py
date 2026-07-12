@@ -355,6 +355,7 @@ def write_run_log(
     filter_counts: pd.DataFrame,
     week_assignment_table: pd.DataFrame,
     stage_durations_seconds: dict[str, float],
+    total_duration_seconds: float,
 ) -> None:
     """Write a JSON run log for reproducibility."""
 
@@ -365,6 +366,8 @@ def write_run_log(
         "filter_counts": filter_counts.to_dict(orient="records"),
         "week_assignments": week_assignment_table.to_dict(orient="records"),
         "stage_durations_seconds": stage_durations_seconds,
+        "total_duration_seconds": float(total_duration_seconds),
+        "total_duration_hms": format_duration_seconds(total_duration_seconds),
     }
     (output_dir / "run_log.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -511,15 +514,17 @@ def run_weekly_matched_roi_pipeline(config: WeeklyMatchedPipelineConfig) -> Path
         fit_summary=fit_summary,
         week_assignment_table=week_assignment_table,
     )
+
+    total_duration_seconds = time.perf_counter() - pipeline_start_seconds
+    stage_durations_seconds["total"] = float(total_duration_seconds)
     write_run_log(
         output_dir=output_dir,
         config=config,
         filter_counts=filter_counts,
         week_assignment_table=week_assignment_table,
         stage_durations_seconds=stage_durations_seconds,
+        total_duration_seconds=total_duration_seconds,
     )
-
-    total_duration_seconds = time.perf_counter() - pipeline_start_seconds
     print(f"[{format_duration_seconds(total_duration_seconds)}] Pipeline completed", flush=True)
     print(f"output_dir={output_dir}", flush=True)
     print(f"n_matcher_clusters={int(filter_counts.loc[0, 'count'])}", flush=True)

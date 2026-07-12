@@ -76,4 +76,29 @@ python plotting/run_daywise_green_red_linear_fit_summary.py
 pytest tests/
 ```
 
+Weekly matched ROI pipeline example:
+
+Use WSL-style paths when running from the bash terminal in this repo. In other words, use `/mnt/d/...` instead of `D:\...`.
+
+```bash
+uv run python core/run_weekly_matched_roi_pipeline.py \
+  --dataset /mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512 \
+  --match-csv /mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/roi_match_runs/20260710_9wks.csv \
+  --start-date 20260511
+```
+
+Reusable template:
+
+```bash
+uv run python core/run_weekly_matched_roi_pipeline.py \
+  --dataset /mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512 \
+  --match-csv /mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/roi_match_runs/YOUR_MATCH_FILE.csv \
+  --start-date 20260511
+```
+
+Notes:
+- `--dataset` should point to the folder that contains the weekly masks plus the daywise `*_SyN.tif` images.
+- `--start-date` can be omitted if the earliest non-SyN raw TIFF in that folder is your true day 0, but keeping it explicit is safer.
+- The weekly mask name usually does not need to be passed because the script already tries both `{week_name}_average_cp_masks.tif` and `{week_name}_average_cp_mask.tif`.
+
 If dataset paths need to change, update `core/analysis_paths.py` or pass dataset-specific paths through script arguments where supported.

@@ -170,7 +170,7 @@ Notes:
 - This script uses the matched ROI CSV from step 2, the non-SyN weekly average masks, and the daywise registered `*_SyN.tif` images.
 - At the end it prints `output_dir=...`. Copy that path for step 5.
 
-### Step 5: Quick plots from the weekly matched output
+### Step 5: Quick plots from the matched output
 
 Replace `PASTE_OUTPUT_DIR_FROM_STEP_4` with the exact `output_dir=...` path printed by step 4.
 
@@ -182,6 +182,8 @@ uv run python plotting/run_weekly_matched_output_quick_plots.py \
 ```
 
 If you only want to re-run from an existing matcher CSV later, skip steps 1 to 3 and start directly from step 4.
+
+This quick-plot script accepts either the weekly `weekly_matched_*` exports or the daywise `matched_*` exports, so it works for both workflows.
 
 Reusable re-run template:
 
@@ -286,6 +288,17 @@ The daywise analysis output directory contains tables such as:
 - `primary_high_complete_matching.csv`
 - `sensitivity_balanced_complete.csv`
 - `review_flagged_tracks.csv`
+
+You can also run the quick-plot step on this directory directly:
+
+```bash
+uv run python plotting/run_weekly_matched_output_quick_plots.py \
+  --analysis-dir /path/to/daywise_matched_roi_pipeline_output \
+  --start-date 20260511 \
+  --top-n 30
+```
+
+The script looks for the daywise `matched_*` tables as well as the older `weekly_matched_*` names.
 
 ### How it fits the current workflow
 

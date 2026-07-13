@@ -1,4 +1,4 @@
-"""Render quick QC plots from a completed weekly matched ROI analysis output."""
+"""Render quick QC plots from a completed matched ROI analysis output."""
 
 from __future__ import annotations
 
@@ -92,21 +92,42 @@ def _load_fit_summary(path: Path) -> pd.DataFrame:
     return table
 
 
+def _first_existing_path(analysis_dir: Path, *names: str) -> Path:
+    for name in names:
+        candidate = analysis_dir / name
+        if candidate.exists():
+            return candidate
+    expected = ", ".join(names)
+    raise FileNotFoundError(f"None of the expected input tables were found in {analysis_dir}: {expected}")
+
+
 def build_quick_plots(
     analysis_dir: str | Path,
     start_date: str = "20260511",
     top_n: int = 30,
 ) -> Path:
-    """Render a small set of no-rerun QC plots from saved weekly output tables."""
+    """Render a small set of no-rerun QC plots from saved matched output tables."""
 
     run_start_seconds = time.perf_counter()
     analysis_dir = Path(analysis_dir)
-    log_message(run_start_seconds, f"Starting weekly matched quick plots | analysis_dir={analysis_dir}")
-    metrics_path = analysis_dir / "weekly_matched_roi_log_ratio_metrics_complete.csv"
-    residuals_path = analysis_dir / "weekly_matched_roi_metrics_with_green_red_fit_residuals.csv"
-    fit_summary_path = analysis_dir / "weekly_matched_daywise_green_red_linear_fit_summary.csv"
+    log_message(run_start_seconds, f"Starting matched ROI quick plots | analysis_dir={analysis_dir}")
+    metrics_path = _first_existing_path(
+        analysis_dir,
+        "weekly_matched_roi_log_ratio_metrics_complete.csv",
+        "matched_roi_log_ratio_metrics_complete.csv",
+    )
+    residuals_path = _first_existing_path(
+        analysis_dir,
+        "weekly_matched_roi_metrics_with_green_red_fit_residuals.csv",
+        "matched_roi_metrics_with_green_red_fit_residuals.csv",
+    )
+    fit_summary_path = _first_existing_path(
+        analysis_dir,
+        "weekly_matched_daywise_green_red_linear_fit_summary.csv",
+        "matched_daywise_green_red_linear_fit_summary.csv",
+    )
 
-    log_message(run_start_seconds, f"Loading saved weekly matched tables from {analysis_dir}")
+    log_message(run_start_seconds, f"Loading saved matched tables from {analysis_dir}")
     metrics_table = _load_metrics_table(metrics_path)
     residuals_table = _load_metrics_table(residuals_path)
     fit_summary = _load_fit_summary(fit_summary_path)
@@ -206,7 +227,7 @@ def build_quick_plots(
         )
 
     summary_lines = [
-        "Quick plots generated from saved weekly matched ROI outputs.",
+        "Quick plots generated from saved matched ROI outputs.",
         f"Analysis directory: {analysis_dir}",
         f"Start date: {start_date}",
         f"Top-N directional plots: {top_n}",
@@ -229,7 +250,7 @@ def build_quick_plots(
         top_n=top_n,
         total_duration_seconds=total_duration_seconds,
     )
-    print(f"[{format_duration_seconds(total_duration_seconds)}] Completed weekly matched quick plots", flush=True)
+    print(f"[{format_duration_seconds(total_duration_seconds)}] Completed matched ROI quick plots", flush=True)
     print(f"total_duration={format_duration_seconds(total_duration_seconds)}")
     return output_dir
 

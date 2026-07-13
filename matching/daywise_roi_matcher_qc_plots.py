@@ -33,7 +33,7 @@ def _load_csv(match_dir: Path, name: str) -> pd.DataFrame:
     if not path.exists() or path.stat().st_size == 0:
         return pd.DataFrame()
     try:
-        return pd.read_csv(path)
+        return pd.read_csv(path, low_memory=False)
     except pd.errors.EmptyDataError:
         return pd.DataFrame()
 
@@ -122,20 +122,54 @@ def _plot_track_summaries(output_dir: Path, tracks: pd.DataFrame, policy: str) -
     if tracks.empty:
         return saved
 
-    fig, axes = _figure_for_table(f"{policy} track summaries")
-    axes[0, 0].hist(tracks["n_days_present"].dropna().astype(float), bins=np.arange(0.5, tracks["n_days_present"].max() + 1.5), color="#2d6cdf", alpha=0.85)
-    axes[0, 0].set_title("Track length")
+    panels: list[tuple[str, pd.Series, np.ndarray | int, str]] = [
+        (
+            "Track length",
+            tracks["n_days_present"].dropna().astype(float),
+            np.arange(0.5, tracks["n_days_present"].max() + 1.5) if not tracks["n_days_present"].dropna().empty else 20,
+            "#2d6cdf",
+        ),
+    ]
     if "missing_internal_days" in tracks.columns:
-        axes[0, 1].hist(tracks["missing_internal_days"].dropna().astype(float), bins=20, color="#31a354", alpha=0.85)
-        axes[0, 1].set_title("Missing internal days")
+        panels.append(
+            (
+                "Missing internal days",
+                tracks["missing_internal_days"].dropna().astype(float),
+                20,
+                "#31a354",
+            )
+        )
     if "max_volume_fold_change" in tracks.columns:
-        axes[1, 0].hist(tracks["max_volume_fold_change"].dropna().astype(float), bins=20, color="#f28e2b", alpha=0.85)
-        axes[1, 0].set_title("Track volume fold-change")
+        panels.append(
+            (
+                "Track volume fold-change",
+                tracks["max_volume_fold_change"].dropna().astype(float),
+                20,
+                "#f28e2b",
+            )
+        )
     if "n_edge_sessions" in tracks.columns:
-        axes[1, 1].hist(tracks["n_edge_sessions"].dropna().astype(float), bins=20, color="#8c6bb1", alpha=0.85)
-        axes[1, 1].set_title("Edge-touching sessions")
-    for ax in axes.flat:
+        panels.append(
+            (
+                "Edge-touching sessions",
+                tracks["n_edge_sessions"].dropna().astype(float),
+                20,
+                "#8c6bb1",
+            )
+        )
+
+    n_panels = len(panels)
+    ncols = 2 if n_panels > 1 else 1
+    nrows = int(np.ceil(n_panels / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 3.8 * nrows))
+    axes_arr = np.atleast_1d(axes).reshape(nrows, ncols)
+    for ax, (title, values, bins, color) in zip(axes_arr.flat, panels, strict=False):
+        if len(values):
+            ax.hist(values, bins=bins, color=color, alpha=0.85)
+        ax.set_title(title)
         ax.grid(alpha=0.2)
+    for ax in axes_arr.flat[len(panels):]:
+        ax.axis("off")
     saved.append(_save_figure(output_dir / f"track_summary_{policy}.png", fig))
 
     if "has_cycle_conflict" in tracks.columns:

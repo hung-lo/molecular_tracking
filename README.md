@@ -13,10 +13,13 @@ Small repository for ROI and molecular-tracking analysis code with a clean split
 molecular_tracking/
 ├── core/
 │   ├── analysis_paths.py
+│   ├── run_daywise_matched_roi_pipeline.py
 │   ├── roi_log_ratio_analysis.py
 │   ├── run_920_two_day_cp3nuclei_analysis.py
 │   └── run_registered_roi_pipeline.py
 ├── matching/
+│   ├── affine_overlap_matcher.py
+│   ├── daywise_roi_matcher_qc_plots.py
 │   ├── roi_matcher.py
 │   └── roi_matcher_qc_plots.py
 ├── notebooks/
@@ -32,6 +35,9 @@ molecular_tracking/
 │   ├── run_raw_space_inverse_mask_validation.py
 │   └── shared_raw_space_group_panel.py
 ├── tests/
+│   ├── test_affine_overlap_matcher.py
+│   ├── test_daywise_matched_roi_pipeline.py
+│   ├── test_daywise_roi_matcher_qc_plots.py
 │   ├── test_roi_log_ratio_analysis.py
 │   ├── test_roi_matcher.py
 │   ├── test_roi_matcher_qc_plot_contours.py
@@ -71,10 +77,18 @@ Examples:
 
 ```bash
 python core/run_registered_roi_pipeline.py
+python core/run_daywise_matched_roi_pipeline.py
 python core/run_920_two_day_cp3nuclei_analysis.py
+python matching/run_daywise_roi_matching.py
 python plotting/run_daywise_green_red_linear_fit_summary.py
 pytest tests/
 ```
+
+## Choosing a workflow
+
+- Use the legacy weekly workflow when you have weekly average masks plus the daywise registered `*_SyN.tif` images that came out of the `weeklyRegister` notebook.
+- Use the new daywise workflow when you segment each day separately, for example with Cellpose or SAM, and want matching to run directly on those daily masks.
+- The new daywise workflow does not replace the weekly workflow. It runs alongside it and reuses the same downstream dark-correction and green/red metric helpers.
 
 ## Weekly workflow example (`crop_512`)
 
@@ -179,3 +193,103 @@ uv run python core/run_weekly_matched_roi_pipeline.py \
 ```
 
 If dataset paths need to change, update `core/analysis_paths.py` or pass dataset-specific paths through script arguments where supported.
+
+## Daywise workflow example (`cellpose_or_sam_daily_masks`)
+
+Use this path when every day has its own segmentation mask and the mask, red image, and green image all share the same voxel space.
+
+Required manifest columns:
+
+- `session_index`
+- `session_id`
+- `acquisition_date`
+- `mask_path`
+- `red_image_path`
+- `green_image_path`
+- `required`
+
+Example manifest row:
+
+```csv
+session_index,session_id,acquisition_date,mask_path,red_image_path,green_image_path,required
+0,20260511,2026-05-11,masks/20260511_R_cp_masks.tif,images/20260511_R.tif,images/20260511_G.tif,true
+```
+
+### Step 1: run the daywise matcher
+
+```bash
+uv run python matching/run_daywise_roi_matching.py \
+  --manifest /path/to/daywise_session_manifest.csv \
+  --output-dir /path/to/roi_match_runs/20260713_affine_overlap_v1 \
+  --xy-um-per-px 0.693359375 \
+  --z-um-per-plane 5.0 \
+  --max-pair-gap 2
+```
+
+Common optional flags:
+
+- `--save-candidates` writes the full candidate table for audit/debugging.
+- `--overwrite` replaces an existing output directory.
+- `--resume` reuses an existing output directory only when the manifest, inputs, parameters, and algorithm version match exactly.
+
+The matcher writes:
+
+- `session_manifest_resolved.csv`
+- `roi_features.csv`
+- `pairwise_summary.csv`
+- `pairwise_transforms.csv`
+- `pairwise_matches_high.csv`
+- `pairwise_matches_balanced.csv`
+- `cycle_consistency_high.csv`
+- `cycle_consistency_balanced.csv`
+- `tracks_high.csv`
+- `tracks_balanced.csv`
+- `track_length_summary.csv`
+- `run_log.json`
+
+### Step 2: optional QC plots
+
+```bash
+uv run python matching/daywise_roi_matcher_qc_plots.py \
+  --match-dir /path/to/roi_match_runs/20260713_affine_overlap_v1 \
+  --output-dir /path/to/roi_match_runs/20260713_affine_overlap_v1/qc_plots
+```
+
+This creates review-sample CSVs and pair/track QC figures.
+
+### Step 3: run the daywise matched ROI pipeline
+
+```bash
+uv run python core/run_daywise_matched_roi_pipeline.py \
+  --dataset /path/to/dataset_root \
+  --manifest /path/to/daywise_session_manifest.csv \
+  --match-dir /path/to/roi_match_runs/20260713_affine_overlap_v1 \
+  --policies high balanced \
+  --green-dark 319 \
+  --red-dark 534
+```
+
+This step:
+
+- validates that the manifest matches the matcher output;
+- extracts ROI intensities from the original daily images using the matched daily masks;
+- applies the existing dark-correction and green/red metric helpers;
+- writes the daywise analysis tables and QC summaries.
+
+The daywise analysis output directory contains tables such as:
+
+- `matched_roi_intensity_results_raw.csv`
+- `matched_roi_intensity_results_dark_corrected.csv`
+- `matched_roi_day_table_complete.csv`
+- `matched_track_qc_summary.csv`
+- `matched_daywise_green_red_linear_fit_summary.csv`
+- `primary_high_complete_matching.csv`
+- `sensitivity_balanced_complete.csv`
+- `review_flagged_tracks.csv`
+
+### How it fits the current workflow
+
+- The weekly workflow stays exactly as it is today.
+- The daywise workflow is a parallel path for datasets where daily segmentation is the right starting point.
+- Both workflows share the same downstream intensity-analysis helpers, so the daywise tables should feel familiar if you already use the registered ROI pipeline.
+- If you are unsure which path to use, start with the weekly workflow for older datasets and use the daywise workflow when you already trust the daily masks.

@@ -178,12 +178,14 @@ Replace `PASTE_OUTPUT_DIR_FROM_STEP_4` with the exact `output_dir=...` path prin
 uv run python plotting/run_weekly_matched_output_quick_plots.py \
   --analysis-dir PASTE_OUTPUT_DIR_FROM_STEP_4 \
   --start-date 20260511 \
-  --top-n 30
+  --top-n 30 \
+  --policy high
 ```
 
 If you only want to re-run from an existing matcher CSV later, skip steps 1 to 3 and start directly from step 4.
 
-This quick-plot script accepts either the weekly `weekly_matched_*` exports or the daywise `matched_*` exports, so it works for both workflows.
+This quick-plot script accepts either the weekly `weekly_matched_*` exports or the daywise `matched_*` exports, so it works for both workflows. When a `match_policy` column is present, `high` is the default visualization policy; use `--policy balanced` or `--policy all` if you want the sensitivity branch or the combined comparison.
+
 
 Reusable re-run template:
 
@@ -295,10 +297,11 @@ You can also run the quick-plot step on this directory directly:
 uv run python plotting/run_weekly_matched_output_quick_plots.py \
   --analysis-dir /path/to/daywise_matched_roi_pipeline_output \
   --start-date 20260511 \
-  --top-n 30
+  --top-n 30 \
+  --policy high
 ```
 
-The script looks for the daywise `matched_*` tables as well as the older `weekly_matched_*` names.
+The script looks for the daywise `matched_*` tables as well as the older `weekly_matched_*` names. It also honors `match_policy` when that column exists, so `high` is the default for daywise outputs and weekly tables remain unchanged.
 
 ### How it fits the current workflow
 

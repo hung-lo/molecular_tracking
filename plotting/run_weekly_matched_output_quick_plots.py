@@ -58,6 +58,7 @@ def write_run_log(
     analysis_dir: Path,
     start_date: str,
     top_n: int,
+    policy: str,
     total_duration_seconds: float,
 ) -> None:
     """Write a compact text run log for the quick-plot export."""
@@ -67,11 +68,11 @@ def write_run_log(
         f"analysis_dir={analysis_dir}",
         f"start_date={start_date}",
         f"top_n={int(top_n)}",
+        f"policy={policy}",
         f"total_duration_seconds={float(total_duration_seconds):.3f}",
         f"total_duration_hms={format_duration_seconds(total_duration_seconds)}",
     ]
-    (output_dir / 'run_log.txt').write_text("\n".join(log_lines), encoding='utf-8')
-
+    (output_dir / "run_log.txt").write_text("\n".join(log_lines), encoding='utf-8')
 
 def _load_metrics_table(path: Path) -> pd.DataFrame:
     table = pd.read_csv(path)
@@ -101,10 +102,28 @@ def _first_existing_path(analysis_dir: Path, *names: str) -> Path:
     raise FileNotFoundError(f"None of the expected input tables were found in {analysis_dir}: {expected}")
 
 
+def _filter_table_by_policy(table: pd.DataFrame, policy: str) -> pd.DataFrame:
+    """Keep a single match policy when policy-specific data is available."""
+
+    policy_columns = [column for column in table.columns if column == "match_policy" or column.startswith("match_policy_")]
+    if table.empty or policy == "all" or not policy_columns:
+        return table
+    policy_mask = pd.Series(True, index=table.index)
+    for column in policy_columns:
+        policy_mask &= table[column].astype(str) == policy
+    filtered = table.loc[policy_mask].copy()
+    if filtered.empty:
+        available = ", ".join(sorted({str(value) for column in policy_columns for value in table[column].dropna().astype(str).unique()}))
+        raise ValueError(
+            f"Requested match policy {policy!r} was not found; available policies: {available or 'none'}"
+        )
+    return filtered.reset_index(drop=True)
+
 def build_quick_plots(
     analysis_dir: str | Path,
     start_date: str = "20260511",
     top_n: int = 30,
+    policy: str = "high",
 ) -> Path:
     """Render a small set of no-rerun QC plots from saved matched output tables."""
 
@@ -128,9 +147,15 @@ def build_quick_plots(
     )
 
     log_message(run_start_seconds, f"Loading saved matched tables from {analysis_dir}")
-    metrics_table = _load_metrics_table(metrics_path)
-    residuals_table = _load_metrics_table(residuals_path)
-    fit_summary = _load_fit_summary(fit_summary_path)
+    metrics_table = _filter_table_by_policy(_load_metrics_table(metrics_path), policy)
+    residuals_table = _filter_table_by_policy(_load_metrics_table(residuals_path), policy)
+    fit_summary = _filter_table_by_policy(_load_fit_summary(fit_summary_path), policy)
+    unique_days = int(fit_summary["day"].nunique()) if not fit_summary.empty and "day" in fit_summary.columns else 0
+    log_message(
+        run_start_seconds,
+        f"Policy filter: {policy} | metric_rows={len(metrics_table)} | fit_rows={len(fit_summary)} | unique_days={unique_days}",
+    )
+
 
     output_dir = analysis_dir / "quick_plots"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -231,6 +256,7 @@ def build_quick_plots(
         f"Analysis directory: {analysis_dir}",
         f"Start date: {start_date}",
         f"Top-N directional plots: {top_n}",
+        f"Policy filter: {policy}",
         "",
         "Core plots:",
         "- population_longitudinal_summary.png",
@@ -248,6 +274,7 @@ def build_quick_plots(
         analysis_dir=analysis_dir,
         start_date=start_date,
         top_n=top_n,
+        policy=policy,
         total_duration_seconds=total_duration_seconds,
     )
     print(f"[{format_duration_seconds(total_duration_seconds)}] Completed matched ROI quick plots", flush=True)
@@ -259,9 +286,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI args for the quick-plot renderer."""
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--analysis-dir", required=True, help="Completed weekly matched ROI analysis output directory.")
+    parser.add_argument("--analysis-dir", required=True, help="Completed matched ROI analysis output directory.")
     parser.add_argument("--start-date", default="20260511", help="Reference date in YYYYMMDD format.")
     parser.add_argument("--top-n", type=int, default=30, help="Number of top increasing/decreasing clusters to plot.")
+    parser.add_argument(
+        "--policy",
+        default="high",
+        choices=["high", "balanced", "all"],
+        help="When match_policy is present, choose which policy to plot. Use 'all' to keep both.",
+    )
     return parser.parse_args(argv)
 
 
@@ -273,6 +306,7 @@ def main() -> None:
         analysis_dir=args.analysis_dir,
         start_date=args.start_date,
         top_n=args.top_n,
+        policy=args.policy,
     )
     print(f"quick_plot_dir={output_dir}")
 

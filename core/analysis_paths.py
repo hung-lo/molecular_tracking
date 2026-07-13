@@ -10,7 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+_DEFAULT_PROJECT_ROOT = Path("/mnt/d/_data/_newAAV_2026/Fucci-Tri_avg_images")
+PROJECT_ROOT = _DEFAULT_PROJECT_ROOT if _DEFAULT_PROJECT_ROOT.exists() else Path(__file__).resolve().parent
 DATASET_ALIASES: dict[str, str] = {
     "1050": "1050_data",
     "920": "920_data",

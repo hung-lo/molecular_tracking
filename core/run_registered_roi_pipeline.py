@@ -1489,7 +1489,7 @@ def write_run_log(
     filter_counts: pd.DataFrame,
     raw_space_status: dict[str, object],
     stage_durations_seconds: dict[str, float],
-    total_duration_seconds: float,
+    total_duration_seconds: float | None = None,
 ) -> None:
     """Write a JSON run log for reproducibility.
 
@@ -1510,6 +1510,8 @@ def write_run_log(
         Total wall-clock duration for the full pipeline run in seconds.
     """
 
+    if total_duration_seconds is None:
+        total_duration_seconds = float(stage_durations_seconds.get('total', 0.0))
     log_payload = {
         'analysis_version': ANALYSIS_VERSION,
         'run_timestamp': datetime.now().isoformat(),

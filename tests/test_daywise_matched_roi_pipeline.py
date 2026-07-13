@@ -93,9 +93,10 @@ def test_run_daywise_matched_roi_pipeline_exports_expected_tables(tmp_path: Path
     run_log = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
 
     assert raw["channel"].isin(["red", "green"]).all()
-    assert complete.shape[0] == 6
-    assert float(complete.loc[(complete["roi_id"] == 1) & (complete["day"] == 0), "red"].iloc[0]) == 10.0
-    assert float(complete.loc[(complete["roi_id"] == 1) & (complete["day"] == 0), "green"].iloc[0]) == 40.0
+    assert complete.shape[0] == 12
+    assert set(complete["match_policy"].astype(str)) == {"high", "balanced"}
+    assert float(complete.loc[(complete["match_policy"] == "high") & (complete["roi_id"] == 1) & (complete["day"] == 0), "red"].iloc[0]) == 10.0
+    assert float(complete.loc[(complete["match_policy"] == "high") & (complete["roi_id"] == 1) & (complete["day"] == 0), "green"].iloc[0]) == 40.0
     assert tracks.shape[0] == 6
     assert set(primary["match_policy"].astype(str)) == {"high"}
     assert set(balanced["match_policy"].astype(str)) == {"balanced"}

@@ -236,8 +236,12 @@ Common optional flags:
 - `--save-candidates` writes the full candidate table for audit/debugging.
 - `--overwrite` replaces an existing output directory.
 - `--resume` reuses an existing output directory only when the manifest, inputs, parameters, and algorithm version match exactly.
+- `--skip-qc` skips the automatic QC stage if you only want the matcher tables.
+- `--qc-output-dir /path/to/qc` sends automatic QC to a custom folder instead of `<match-dir>/qc`.
 
-The matcher writes:
+The matcher writes the core tables and, by default, an automatic QC bundle under `<match-dir>/qc/`.
+
+Core outputs include:
 
 - `session_manifest_resolved.csv`
 - `roi_features.csv`
@@ -252,7 +256,9 @@ The matcher writes:
 - `track_length_summary.csv`
 - `run_log.json`
 
-### Step 2: optional QC plots
+### Step 2: review the QC bundle
+
+The matcher now generates QC automatically into `<match-dir>/qc/`. You can rerun or redirect it with the standalone QC script if you want a fresh bundle or a different output folder:
 
 ```bash
 uv run python matching/daywise_roi_matcher_qc_plots.py \
@@ -260,7 +266,7 @@ uv run python matching/daywise_roi_matcher_qc_plots.py \
   --output-dir /path/to/roi_match_runs/20260713_affine_overlap_v1/qc_plots
 ```
 
-This creates review-sample CSVs and pair/track QC figures.
+This recreates the review-sample CSVs and pair/track QC figures.
 
 ### Step 3: run the daywise matched ROI pipeline
 

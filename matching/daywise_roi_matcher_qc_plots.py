@@ -20,12 +20,23 @@ for _import_dir in (_REPO_ROOT / "core", _REPO_ROOT / "matching"):
 
 
 @dataclass(frozen=True)
-class DaywiseQCPlotConfig:
-    match_dir: str
-    output_dir: str | None = None
+class MatchingQCConfig:
+    """Configuration for generating QC artifacts from a completed match run."""
+
+    match_dir: str | Path
+    output_dir: str | Path | None = None
     sample_limit: int = 6
     review_seed: int = 7
     include_skip_pairs: bool = True
+    image_format: str = "png"
+    dpi: int = 150
+    max_examples_per_category: int = 20
+    max_total_examples: int = 100
+    generate_visual_examples: bool = True
+    random_seed: int = 0
+
+
+DaywiseQCPlotConfig = MatchingQCConfig
 
 
 def _load_csv(match_dir: Path, name: str) -> pd.DataFrame:
@@ -45,9 +56,9 @@ def _load_json(match_dir: Path, name: str) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _save_figure(path: Path, fig: plt.Figure) -> Path:
+def _save_figure(path: Path, fig: plt.Figure, *, dpi: int) -> Path:
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -58,7 +69,13 @@ def _figure_for_table(title: str, ncols: int = 2, nrows: int = 2) -> tuple[plt.F
     return fig, np.asarray(axes).reshape(nrows, ncols)
 
 
-def _plot_pairwise_distributions(output_dir: Path, pairwise_summary: pd.DataFrame, pairwise_matches: pd.DataFrame) -> list[Path]:
+def _plot_pairwise_distributions(
+    output_dir: Path,
+    pairwise_summary: pd.DataFrame,
+    pairwise_matches: pd.DataFrame,
+    *,
+    dpi: int,
+) -> list[Path]:
     saved: list[Path] = []
     if pairwise_summary.empty and pairwise_matches.empty:
         return saved
@@ -97,7 +114,7 @@ def _plot_pairwise_distributions(output_dir: Path, pairwise_summary: pd.DataFram
             axes[1, 1].axis("off")
         for ax in axes.flat:
             ax.grid(alpha=0.2)
-        saved.append(_save_figure(output_dir / f"pairwise_summary_{policy}.png", fig))
+        saved.append(_save_figure(output_dir / f"pairwise_summary_{policy}.png", fig, dpi=dpi))
 
         if not policy_matches.empty:
             fig, axes = _figure_for_table(f"Daywise {policy} candidate distributions")
@@ -112,12 +129,12 @@ def _plot_pairwise_distributions(output_dir: Path, pairwise_summary: pd.DataFram
                     ax.hist(pd.to_numeric(policy_matches[column], errors="coerce").dropna(), bins=30, color=color, alpha=0.85)
                 ax.set_title(label)
                 ax.grid(alpha=0.2)
-            saved.append(_save_figure(output_dir / f"candidate_distributions_{policy}.png", fig))
+            saved.append(_save_figure(output_dir / f"candidate_distributions_{policy}.png", fig, dpi=dpi))
 
     return saved
 
 
-def _plot_track_summaries(output_dir: Path, tracks: pd.DataFrame, policy: str) -> list[Path]:
+def _plot_track_summaries(output_dir: Path, tracks: pd.DataFrame, policy: str, *, dpi: int) -> list[Path]:
     saved: list[Path] = []
     if tracks.empty:
         return saved
@@ -170,7 +187,7 @@ def _plot_track_summaries(output_dir: Path, tracks: pd.DataFrame, policy: str) -
         ax.grid(alpha=0.2)
     for ax in axes_arr.flat[len(panels):]:
         ax.axis("off")
-    saved.append(_save_figure(output_dir / f"track_summary_{policy}.png", fig))
+    saved.append(_save_figure(output_dir / f"track_summary_{policy}.png", fig, dpi=dpi))
 
     if "has_cycle_conflict" in tracks.columns:
         fig, ax = plt.subplots(figsize=(6, 4))
@@ -178,7 +195,7 @@ def _plot_track_summaries(output_dir: Path, tracks: pd.DataFrame, policy: str) -
         ax.bar(["no", "yes"], [int(counts.get(False, 0)), int(counts.get(True, 0))], color=["#31a354", "#d62728"])
         ax.set_title(f"{policy} cycle conflicts")
         ax.grid(axis="y", alpha=0.2)
-        saved.append(_save_figure(output_dir / f"cycle_conflicts_{policy}.png", fig))
+        saved.append(_save_figure(output_dir / f"cycle_conflicts_{policy}.png", fig, dpi=dpi))
 
     return saved
 
@@ -229,11 +246,11 @@ def _build_review_sample(
     return sample.reset_index(drop=True)
 
 
-def generate_daywise_qc_plots(config: DaywiseQCPlotConfig) -> Path:
+def generate_matching_qc(config: MatchingQCConfig) -> dict[str, Path]:
     match_dir = Path(config.match_dir).resolve()
     if not match_dir.exists():
         raise FileNotFoundError(f"match_dir was not found: {match_dir}")
-    output_dir = Path(config.output_dir).resolve() if config.output_dir else match_dir / "qc_plots"
+    output_dir = Path(config.output_dir).resolve() if config.output_dir else match_dir / "qc"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     pairwise_summary = _load_csv(match_dir, "pairwise_summary.csv")
@@ -246,9 +263,19 @@ def generate_daywise_qc_plots(config: DaywiseQCPlotConfig) -> Path:
     track_length_summary = _load_csv(match_dir, "track_length_summary.csv")
 
     saved_paths: list[Path] = []
-    saved_paths.extend(_plot_pairwise_distributions(output_dir, pairwise_summary, pd.concat([pairwise_matches_high, pairwise_matches_balanced], ignore_index=True) if not pairwise_matches_high.empty or not pairwise_matches_balanced.empty else pd.DataFrame()))
-    saved_paths.extend(_plot_track_summaries(output_dir, tracks_high, "high"))
-    saved_paths.extend(_plot_track_summaries(output_dir, tracks_balanced, "balanced"))
+    if config.generate_visual_examples:
+        saved_paths.extend(
+            _plot_pairwise_distributions(
+                output_dir,
+                pairwise_summary,
+                pd.concat([pairwise_matches_high, pairwise_matches_balanced], ignore_index=True)
+                if not pairwise_matches_high.empty or not pairwise_matches_balanced.empty
+                else pd.DataFrame(),
+                dpi=int(config.dpi),
+            )
+        )
+        saved_paths.extend(_plot_track_summaries(output_dir, tracks_high, "high", dpi=int(config.dpi)))
+        saved_paths.extend(_plot_track_summaries(output_dir, tracks_balanced, "balanced", dpi=int(config.dpi)))
 
     fig, ax = plt.subplots(figsize=(8, 4))
     plotted = False
@@ -267,7 +294,7 @@ def generate_daywise_qc_plots(config: DaywiseQCPlotConfig) -> Path:
         ax.text(0.5, 0.5, "No cycle triplets available", ha="center", va="center", transform=ax.transAxes)
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
-    saved_paths.append(_save_figure(output_dir / "cycle_agreement.png", fig))
+    saved_paths.append(_save_figure(output_dir / "cycle_agreement.png", fig, dpi=int(config.dpi)))
 
     if not track_length_summary.empty:
         fig, ax = plt.subplots(figsize=(7, 4))
@@ -287,11 +314,29 @@ def generate_daywise_qc_plots(config: DaywiseQCPlotConfig) -> Path:
         ax.set_ylabel("Tracks")
         ax.grid(alpha=0.2)
         ax.legend()
-        saved_paths.append(_save_figure(output_dir / "track_length_summary.png", fig))
+        saved_paths.append(_save_figure(output_dir / "track_length_summary.png", fig, dpi=int(config.dpi)))
 
     review_sample = _build_review_sample(tracks_high, tracks_balanced, config.sample_limit, config.review_seed)
+    if len(review_sample) > int(config.max_total_examples):
+        review_sample = review_sample.head(int(config.max_total_examples)).copy()
     review_sample.to_csv(output_dir / "manual_review_sample.csv", index=False)
-    (output_dir / "run_log.json").write_text(
+    report_path = output_dir / "qc_report.md"
+    report_path.write_text(
+        "\n".join(
+            [
+                "# Daywise Matching QC",
+                "",
+                f"- Match directory: `{match_dir}`",
+                f"- Output directory: `{output_dir}`",
+                f"- Review sample rows: `{len(review_sample)}`",
+                f"- Visual examples enabled: `{bool(config.generate_visual_examples)}`",
+                f"- Saved plots: `{len(saved_paths)}`",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    run_log_path = output_dir / "run_log.json"
+    run_log_path.write_text(
         json.dumps(
             {
                 "match_dir": str(match_dir),
@@ -299,15 +344,34 @@ def generate_daywise_qc_plots(config: DaywiseQCPlotConfig) -> Path:
                 "sample_limit": int(config.sample_limit),
                 "review_seed": int(config.review_seed),
                 "include_skip_pairs": bool(config.include_skip_pairs),
+                "image_format": str(config.image_format),
+                "dpi": int(config.dpi),
+                "max_examples_per_category": int(config.max_examples_per_category),
+                "max_total_examples": int(config.max_total_examples),
+                "generate_visual_examples": bool(config.generate_visual_examples),
+                "random_seed": int(config.random_seed),
                 "saved_plots": [str(path) for path in saved_paths],
                 "review_sample_rows": int(len(review_sample)),
+                "qc_report": str(report_path),
             },
             indent=2,
             sort_keys=True,
         ),
         encoding="utf-8",
     )
-    return output_dir
+    artifact_paths: dict[str, Path] = {
+        "output_dir": output_dir,
+        "manual_review_sample": output_dir / "manual_review_sample.csv",
+        "run_log": run_log_path,
+        "qc_report": report_path,
+    }
+    for saved_path in saved_paths:
+        artifact_paths[saved_path.stem] = saved_path
+    return artifact_paths
+
+
+def generate_daywise_qc_plots(config: DaywiseQCPlotConfig) -> Path:
+    return generate_matching_qc(config)["output_dir"]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -317,6 +381,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sample-limit", type=int, default=6)
     parser.add_argument("--review-seed", type=int, default=7)
     parser.add_argument("--no-skip-pairs", action="store_true", help="Reserved for future skip-pair filtering.")
+    parser.add_argument("--image-format", default="png")
+    parser.add_argument("--dpi", type=int, default=150)
+    parser.add_argument("--max-examples-per-category", type=int, default=20)
+    parser.add_argument("--max-total-examples", type=int, default=100)
+    parser.add_argument("--no-visual-examples", action="store_true", help="Skip generating figure artifacts.")
+    parser.add_argument("--random-seed", type=int, default=0)
     return parser.parse_args(argv)
 
 
@@ -328,6 +398,12 @@ def main(argv: list[str] | None = None) -> Path:
         sample_limit=int(args.sample_limit),
         review_seed=int(args.review_seed),
         include_skip_pairs=not bool(args.no_skip_pairs),
+        image_format=str(args.image_format),
+        dpi=int(args.dpi),
+        max_examples_per_category=int(args.max_examples_per_category),
+        max_total_examples=int(args.max_total_examples),
+        generate_visual_examples=not bool(args.no_visual_examples),
+        random_seed=int(args.random_seed),
     )
     return generate_daywise_qc_plots(config)
 

@@ -37,6 +37,7 @@ from roi_log_ratio_analysis import (
     wide_table_from_long_table,
 )
 from session_manifest import SessionRecord, load_session_manifest, validate_manifest_for_intensity
+from match_policy_registry import DEFAULT_ANALYSIS_POLICIES, SUPPORTED_MATCH_POLICIES, resolve_requested_policies
 
 ANALYSIS_VERSION = "0.2.0"
 
@@ -200,13 +201,19 @@ def _load_match_dir(match_dir: Path) -> dict[str, Path]:
     required = {
         "session_manifest_resolved": match_dir / "session_manifest_resolved.csv",
         "roi_features": match_dir / "roi_features.csv",
+        "run_log": match_dir / "run_log.json",
+    }
+    optional = {
         "tracks_high": match_dir / "tracks_high.csv",
         "tracks_balanced": match_dir / "tracks_balanced.csv",
-        "run_log": match_dir / "run_log.json",
+        "tracks_graph": match_dir / "tracks_graph.csv",
     }
     for name, path in required.items():
         if not path.exists():
             raise FileNotFoundError(f"Missing matcher output file {name!r}: {path}")
+    for name, path in optional.items():
+        if path.exists():
+            required[name] = path
     return required
 
 
@@ -878,8 +885,13 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
     roi_features = pd.read_csv(match_paths["roi_features"])
     if "session_id" in roi_features.columns:
         roi_features["session_id"] = roi_features["session_id"].astype(str)
-    tracks_high = pd.read_csv(match_paths["tracks_high"])
-    tracks_balanced = pd.read_csv(match_paths["tracks_balanced"])
+    requested_policies = resolve_requested_policies(config.policies, match_dir)
+    policy_inputs: dict[str, pd.DataFrame] = {}
+    for policy in requested_policies:
+        tracks_path = match_paths.get(f"tracks_{policy}")
+        if tracks_path is None:
+            raise FileNotFoundError(f"Requested policy {policy!r} is not available in {match_dir}.")
+        policy_inputs[policy] = pd.read_csv(tracks_path)
 
     qc_config = SegmentationQCConfig(
         mode=config.segmentation_qc_mode,
@@ -893,9 +905,8 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         min_segmentation_pass_fraction=config.min_segmentation_pass_fraction,
     )
 
-    policy_inputs = {"high": tracks_high, "balanced": tracks_balanced}
     policy_results: dict[str, dict[str, Any]] = {}
-    for policy in ("high", "balanced"):
+    for policy in requested_policies:
         stage_start_seconds = log_stage_start(
             stage_label=f"Extract matched intensities for {policy}",
             pipeline_start_seconds=pipeline_start_seconds,
@@ -922,7 +933,7 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         )
 
     def _concat(policy_key: str) -> pd.DataFrame:
-        tables = [policy_results[policy][policy_key] for policy in ("high", "balanced") if policy in policy_results]
+        tables = [policy_results[policy][policy_key] for policy in requested_policies if policy in policy_results]
         if not tables:
             return pd.DataFrame()
         return pd.concat(tables, ignore_index=True)

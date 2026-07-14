@@ -66,11 +66,16 @@ def test_run_daywise_roi_matching_exports_required_tables(tmp_path: Path) -> Non
     assert (output_dir / "tracks_high.csv").exists()
     assert (output_dir / "tracks_balanced.csv").exists()
     assert (output_dir / "pairwise_candidates.csv").exists()
+    assert (output_dir / "qc").exists()
+    assert (output_dir / "qc" / "qc_report.md").exists()
 
     pairwise_summary = pd.read_csv(output_dir / "pairwise_summary.csv")
     run_log = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
 
     assert pairwise_summary["elapsed_sec"].iloc[0] > 0
+    assert run_log["matching_status"] == "completed"
+    assert run_log["qc_status"] == "completed"
     assert run_log["row_counts"]["tracks_high"] > 0
     assert run_log["row_counts"]["tracks_balanced"] > 0
     assert run_log["output_paths"]["tracks_high"].endswith("tracks_high.csv")
+    assert run_log["qc_output_dir"].endswith("qc")

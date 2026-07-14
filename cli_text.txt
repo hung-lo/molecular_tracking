@@ -67,6 +67,8 @@ uv run python matching/run_daywise_roi_matching.py \
   --max-pair-gap 2
 
 
+# automatic QC is written to <match-dir>/qc/; rerun or redirect it if you need a fresh bundle.
+
 ## then QC plots
 
 uv run python matching/daywise_roi_matcher_qc_plots.py \

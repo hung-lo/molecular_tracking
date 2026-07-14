@@ -33,6 +33,7 @@ from affine_overlap_matcher import (
     extract_roi_features,
     match_pair,
 )
+from daywise_roi_matcher_qc_plots import DaywiseQCPlotConfig, generate_matching_qc
 from roi_track_graph import (
     build_cycle_consistency_tables,
     build_track_length_summary_table,
@@ -214,6 +215,14 @@ def run_daywise_roi_matching(
     save_candidates: bool = False,
     overwrite: bool = False,
     resume: bool = False,
+    skip_qc: bool = False,
+    qc_output_dir: str | Path | None = None,
+    qc_image_format: str = "png",
+    qc_dpi: int = 150,
+    qc_max_examples: int = 20,
+    qc_max_total_examples: int = 100,
+    qc_random_seed: int = 0,
+    require_qc_success: bool = False,
 ) -> Path:
     """Run daywise ROI matching and export all canonical outputs."""
 
@@ -453,10 +462,13 @@ def run_daywise_roi_matching(
             }
         )
 
+    warnings: list[str] = []
+    qc_output_path = Path(qc_output_dir).resolve() if qc_output_dir is not None else qc_dir
+    qc_status = "not_requested" if skip_qc else "pending"
     run_log_payload = {
         "algorithm_version": MATCHER_ALGORITHM_VERSION,
         "run_started_utc": datetime.now(timezone.utc).isoformat(),
-        "run_finished_utc": datetime.now(timezone.utc).isoformat(),
+        "run_finished_utc": None,
         "manifest_path": str(manifest_path),
         "manifest_sha256": manifest_hash,
         "resolved_manifest_path": str(output_dir / "session_manifest_resolved.csv"),
@@ -470,6 +482,11 @@ def run_daywise_roi_matching(
         "package_versions": _package_versions(),
         "git_commit": _git_commit(),
         "input_hashes": input_hash_records,
+        "matching_status": "completed",
+        "qc_status": qc_status,
+        "qc_output_dir": str(qc_output_path),
+        "qc_error_type": None,
+        "qc_error": None,
         "row_counts": {
             "roi_features": int(len(roi_features)),
             "pairwise_summary": int(len(pairwise_summary)),
@@ -502,11 +519,47 @@ def run_daywise_roi_matching(
             "tracks_high": str(output_dir / "tracks_high.csv"),
             "tracks_balanced": str(output_dir / "tracks_balanced.csv"),
             "track_length_summary": str(output_dir / "track_length_summary.csv"),
-            "qc_dir": str(qc_dir),
+            "qc_dir": str(qc_output_path),
         },
-        "warnings": [],
+        "warnings": warnings,
     }
     _export_json(output_dir / "run_log.json", run_log_payload)
+
+    if not skip_qc:
+        try:
+            qc_artifacts = generate_matching_qc(
+                DaywiseQCPlotConfig(
+                    match_dir=output_dir,
+                    output_dir=qc_output_path,
+                    sample_limit=int(qc_max_examples),
+                    review_seed=int(qc_random_seed),
+                    include_skip_pairs=True,
+                    image_format=str(qc_image_format),
+                    dpi=int(qc_dpi),
+                    max_examples_per_category=int(qc_max_examples),
+                    max_total_examples=int(qc_max_total_examples),
+                    generate_visual_examples=True,
+                    random_seed=int(qc_random_seed),
+                )
+            )
+            run_log_payload["qc_status"] = "completed"
+            run_log_payload["qc_output_dir"] = str(qc_artifacts["output_dir"])
+            run_log_payload["qc_artifacts"] = {key: str(value) for key, value in qc_artifacts.items()}
+        except Exception as exc:
+            run_log_payload["qc_status"] = "failed"
+            run_log_payload["qc_error_type"] = type(exc).__name__
+            run_log_payload["qc_error"] = str(exc)
+            warnings.append("qc_failed")
+            if require_qc_success:
+                _export_json(output_dir / "run_log.json", run_log_payload)
+                raise
+        else:
+            if qc_output_path != Path(qc_artifacts["output_dir"]):
+                run_log_payload["qc_output_dir"] = str(qc_artifacts["output_dir"])
+    run_log_payload["run_finished_utc"] = datetime.now(timezone.utc).isoformat()
+    run_log_payload["warnings"] = warnings
+    _export_json(output_dir / "run_log.json", run_log_payload)
+
     summary_lines = [
         "# Daywise ROI Matching",
         "",
@@ -541,6 +594,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--save-candidates", action="store_true", help="Write the full candidate table.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing output directory.")
     parser.add_argument("--resume", action="store_true", help="Reuse a prior exact-matching output directory when possible.")
+    parser.add_argument("--skip-qc", action="store_true", help="Skip automatic QC generation after matching.")
+    parser.add_argument("--qc-output-dir", default=None, help="Directory for automatic QC outputs.")
+    parser.add_argument("--qc-image-format", default="png", help="Image format for QC figures.")
+    parser.add_argument("--qc-dpi", type=int, default=150, help="DPI for QC figures.")
+    parser.add_argument("--qc-max-examples", type=int, default=20, help="Maximum examples per QC category.")
+    parser.add_argument("--qc-max-total-examples", type=int, default=100, help="Maximum total QC review examples.")
+    parser.add_argument("--qc-random-seed", type=int, default=0, help="Random seed for QC sampling.")
+    parser.add_argument("--require-qc-success", action="store_true", help="Fail the run if QC generation fails.")
     return parser.parse_args(argv)
 
 
@@ -558,6 +619,14 @@ def main(argv: list[str] | None = None) -> Path:
         save_candidates=bool(args.save_candidates),
         overwrite=bool(args.overwrite),
         resume=bool(args.resume),
+        skip_qc=bool(args.skip_qc),
+        qc_output_dir=args.qc_output_dir,
+        qc_image_format=str(args.qc_image_format),
+        qc_dpi=int(args.qc_dpi),
+        qc_max_examples=int(args.qc_max_examples),
+        qc_max_total_examples=int(args.qc_max_total_examples),
+        qc_random_seed=int(args.qc_random_seed),
+        require_qc_success=bool(args.require_qc_success),
     )
     print(f"output_dir={output_dir}", flush=True)
     return output_dir

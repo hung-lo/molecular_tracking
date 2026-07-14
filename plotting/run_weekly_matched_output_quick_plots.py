@@ -74,6 +74,7 @@ def write_run_log(
     ]
     (output_dir / "run_log.txt").write_text("\n".join(log_lines), encoding='utf-8')
 
+
 def _load_metrics_table(path: Path) -> pd.DataFrame:
     table = pd.read_csv(path)
     if "roi_id" not in table.columns and "cluster_id" in table.columns:
@@ -119,11 +120,20 @@ def _filter_table_by_policy(table: pd.DataFrame, policy: str) -> pd.DataFrame:
         )
     return filtered.reset_index(drop=True)
 
+
+def _resolve_output_dir(analysis_dir: Path, output_dir: str | Path | None, policy: str) -> Path:
+    """Resolve a policy-specific output directory for quick plots."""
+
+    base_output_dir = Path(output_dir).resolve() if output_dir else (analysis_dir / "quick_plots")
+    return base_output_dir / policy
+
+
 def build_quick_plots(
     analysis_dir: str | Path,
     start_date: str = "20260511",
     top_n: int = 30,
     policy: str = "high",
+    output_dir: str | Path | None = None,
 ) -> Path:
     """Render a small set of no-rerun QC plots from saved matched output tables."""
 
@@ -156,8 +166,7 @@ def build_quick_plots(
         f"Policy filter: {policy} | metric_rows={len(metrics_table)} | fit_rows={len(fit_summary)} | unique_days={unique_days}",
     )
 
-
-    output_dir = analysis_dir / "quick_plots"
+    output_dir = _resolve_output_dir(analysis_dir, output_dir, policy)
     output_dir.mkdir(parents=True, exist_ok=True)
     log_message(run_start_seconds, f"Output directory: {output_dir}")
     log_message(run_start_seconds, "Rendering population and day-wise fit summary plots")
@@ -287,6 +296,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--analysis-dir", required=True, help="Completed matched ROI analysis output directory.")
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Optional root directory for the quick-plot exports; policy-specific subfolders are created beneath it.",
+    )
     parser.add_argument("--start-date", default="20260511", help="Reference date in YYYYMMDD format.")
     parser.add_argument("--top-n", type=int, default=30, help="Number of top increasing/decreasing clusters to plot.")
     parser.add_argument(
@@ -307,6 +321,7 @@ def main() -> None:
         start_date=args.start_date,
         top_n=args.top_n,
         policy=args.policy,
+        output_dir=args.output_dir,
     )
     print(f"quick_plot_dir={output_dir}")
 

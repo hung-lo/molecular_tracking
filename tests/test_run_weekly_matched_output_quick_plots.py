@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 
-from run_weekly_matched_output_quick_plots import _filter_table_by_policy
+from run_weekly_matched_output_quick_plots import _filter_table_by_policy, _resolve_output_dir
 
 
 def test_filter_table_by_policy_filters_suffixed_policy_columns() -> None:
@@ -28,3 +30,14 @@ def test_filter_table_by_policy_is_noop_without_policy_column() -> None:
     filtered = _filter_table_by_policy(table, "high")
 
     pd.testing.assert_frame_equal(filtered, table)
+
+
+def test_resolve_output_dir_separates_policies() -> None:
+    analysis_dir = Path('/tmp/analysis')
+
+    default_high = _resolve_output_dir(analysis_dir, None, 'high')
+    custom_balanced = _resolve_output_dir(analysis_dir, Path('/tmp/custom_quick_plots'), 'balanced')
+
+    assert default_high == analysis_dir / 'quick_plots' / 'high'
+    assert custom_balanced == Path('/tmp/custom_quick_plots') / 'balanced'
+

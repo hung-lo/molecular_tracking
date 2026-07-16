@@ -9,6 +9,7 @@ import tifffile
 
 from affine_overlap_matcher import AffineOverlapParams, VoxelSpacing
 from run_daywise_matched_roi_pipeline import DaywiseMatchedPipelineConfig, run_daywise_matched_roi_pipeline
+from run_daywise_graph_matching import run_daywise_graph_matching
 from run_daywise_roi_matching import run_daywise_roi_matching
 
 
@@ -95,6 +96,7 @@ def test_run_daywise_matched_roi_pipeline_exports_expected_tables(tmp_path: Path
     assert raw["channel"].isin(["red", "green"]).all()
     assert complete.shape[0] == 12
     assert set(complete["match_policy"].astype(str)) == {"high", "balanced"}
+    assert set(complete["elapsed_days"].astype(int)) == {0, 1}
     assert float(complete.loc[(complete["match_policy"] == "high") & (complete["roi_id"] == 1) & (complete["day"] == 0), "red"].iloc[0]) == 10.0
     assert float(complete.loc[(complete["match_policy"] == "high") & (complete["roi_id"] == 1) & (complete["day"] == 0), "green"].iloc[0]) == 40.0
     assert tracks.shape[0] == 6
@@ -104,3 +106,33 @@ def test_run_daywise_matched_roi_pipeline_exports_expected_tables(tmp_path: Path
     assert set(filter_counts["match_policy"].astype(str)) == {"high", "balanced"}
     assert filter_counts["step_order"].min() == 0
     assert run_log["output_paths"]["matched_track_qc_summary"].endswith("matched_track_qc_summary.csv")
+
+
+def test_run_daywise_matched_roi_pipeline_accepts_graph_policy(tmp_path: Path) -> None:
+    manifest_path, _ = _build_dataset(tmp_path)
+    graph_match_dir = run_daywise_graph_matching(
+        manifest_path=manifest_path,
+        output_dir=tmp_path / "graph_match_out",
+        overwrite=True,
+        skip_qc=True,
+    )
+    output_dir = run_daywise_matched_roi_pipeline(
+        DaywiseMatchedPipelineConfig(
+            dataset=str(tmp_path),
+            manifest=str(manifest_path),
+            match_dir=str(graph_match_dir),
+            policies=("graph",),
+            green_dark=0.0,
+            red_dark=0.0,
+        )
+    )
+
+    complete = pd.read_csv(output_dir / "matched_roi_day_table_complete.csv")
+    fit_summary = pd.read_csv(output_dir / "matched_daywise_green_red_linear_fit_summary.csv")
+    run_log = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
+
+    assert set(complete["match_policy"].astype(str)) == {"graph"}
+    assert complete.shape[0] == 4
+    assert set(complete["elapsed_days"].astype(int)) == {0, 1}
+    assert set(fit_summary["match_policy"].astype(str)) == {"graph"}
+    assert run_log["output_paths"]["matched_daywise_green_red_linear_fit_summary"].endswith("matched_daywise_green_red_linear_fit_summary.csv")

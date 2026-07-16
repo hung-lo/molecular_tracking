@@ -1,0 +1,4 @@
+session_index,session_id,acquisition_date,mask_path,red_image_path,green_image_path,required
+0,20260511,2026-05-11,masks/20260511_mask.tif,images/20260511_R.tif,images/20260511_G.tif,true
+1,20260512,2026-05-12,masks/20260512_mask.tif,images/20260512_R.tif,images/20260512_G.tif,true
+2,20260513,2026-05-13,masks/20260513_mask.tif,images/20260513_R.tif,images/20260513_G.tif,true

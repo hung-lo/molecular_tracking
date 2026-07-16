@@ -56,6 +56,16 @@ molecular_tracking/
 - `tests/`: tests for reusable analysis and matching behavior.
 - `notebooks/`: only intentionally kept demo or reference notebooks.
 
+## Docs and examples
+
+- `docs/daywise_roi_matching_algorithm.md`: baseline matcher overview.
+- `docs/daywise_spatial_graph_matching.md`: experimental graph refinement overview.
+- `docs/daywise_pipeline.md`: daywise extraction and completeness rules.
+- `docs/output_schema.md`: public CSV schema reference.
+- `docs/qc_interpretation.md`: how to read matching QC.
+- `docs/troubleshooting.md`: common failure modes and checks.
+- `examples/daywise_session_manifest.csv`: starter manifest template.
+
 ## Data and outputs
 
 This repo is meant to stay code-first and reproducible.
@@ -310,6 +320,25 @@ uv run python plotting/run_weekly_matched_output_quick_plots.py \
 ```
 
 The script looks for the daywise `matched_*` tables as well as the older `weekly_matched_*` names. It also honors `match_policy` when that column exists, so `high` is the default for daywise outputs and weekly tables remain unchanged. The output root is split by policy, so repeated `high` and `balanced` runs do not overwrite each other.
+
+### Experimental graph matcher
+
+If you want to try the local spatial-graph refinement, run the separate graph command after the baseline daywise matcher:
+
+```bash
+uv run python matching/run_daywise_graph_matching.py   --manifest /path/to/daywise_session_manifest.csv   --output-dir /path/to/roi_match_runs/20260716_graph_v1   --xy-um-per-px 0.693359375   --z-um-per-plane 5.0   --max-pair-gap 2
+```
+
+This writes the baseline `high` and `balanced` tables plus the experimental `graph` outputs alongside them:
+
+- `pairwise_matches_graph.csv`
+- `tracks_graph.csv`
+- `cycle_consistency_graph.csv`
+- `cycle_edge_checks_graph.csv`
+- `track_edges_graph.csv`
+- `track_length_summary_graph.csv`
+
+The graph run also reuses the same automatic QC bundle under `<match-dir>/qc/`, so you can compare the three policy branches in one place.
 
 ### How it fits the current workflow
 

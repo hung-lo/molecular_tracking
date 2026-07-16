@@ -71,16 +71,16 @@ def _figure_for_table(title: str, ncols: int = 2, nrows: int = 2) -> tuple[plt.F
 
 def _plot_pairwise_distributions(
     output_dir: Path,
-    pairwise_summary: pd.DataFrame,
+    pairwise_summary_long: pd.DataFrame,
     pairwise_matches: pd.DataFrame,
     *,
     dpi: int,
 ) -> list[Path]:
     saved: list[Path] = []
-    if pairwise_summary.empty and pairwise_matches.empty:
+    if pairwise_summary_long.empty and pairwise_matches.empty:
         return saved
 
-    summary = pairwise_summary.copy()
+    summary = pairwise_summary_long.copy()
     if not summary.empty and "pair_gap" in summary.columns:
         summary["pair_kind"] = np.where(summary["pair_gap"].astype(int) == 1, "adjacent", "skip")
     else:
@@ -95,12 +95,11 @@ def _plot_pairwise_distributions(
             continue
         fig, axes = _figure_for_table(f"Daywise {policy} pair distributions")
         if not policy_summary.empty:
-            if "n_high" in policy_summary.columns:
-                axes[0, 0].hist(policy_summary["n_high"].fillna(0).astype(float), bins=20, color="#2d6cdf", alpha=0.8)
-                axes[0, 0].set_title("Accepted high edges per pair")
-            if "n_balanced" in policy_summary.columns:
-                axes[0, 1].hist(policy_summary["n_balanced"].fillna(0).astype(float), bins=20, color="#31a354", alpha=0.8)
-                axes[0, 1].set_title("Accepted balanced edges per pair")
+            if "n_matches" in policy_summary.columns:
+                axes[0, 0].hist(policy_summary["n_matches"].fillna(0).astype(float), bins=20, color="#2d6cdf", alpha=0.8)
+                axes[0, 0].set_title("Accepted matches per pair")
+                axes[0, 1].hist(policy_summary["n_matches"].fillna(0).astype(float), bins=20, color="#31a354", alpha=0.8)
+                axes[0, 1].set_title("Accepted matches per pair")
             if "transform_residual_median_um" in policy_summary.columns:
                 axes[1, 0].hist(policy_summary["transform_residual_median_um"].dropna().astype(float), bins=20, color="#8c6bb1", alpha=0.8)
                 axes[1, 0].set_title("Transform residual median (um)")
@@ -200,6 +199,45 @@ def _plot_track_summaries(output_dir: Path, tracks: pd.DataFrame, policy: str, *
     return saved
 
 
+def _build_pairwise_summary_long(
+    pairwise_summary: pd.DataFrame,
+    pairwise_summary_graph: pd.DataFrame,
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    if not pairwise_summary.empty:
+        for row in pairwise_summary.itertuples(index=False):
+            base = row._asdict()
+            for policy, value_key in (("high", "n_high"), ("balanced", "n_balanced")):
+                rows.append(
+                    {
+                        "match_policy": policy,
+                        "day_a": base.get("day_a"),
+                        "day_b": base.get("day_b"),
+                        "pair_gap": base.get("pair_gap"),
+                        "n_matches": base.get(value_key),
+                        "elapsed_sec": base.get("elapsed_sec"),
+                        "transform_residual_median_um": base.get("transform_residual_median_um"),
+                        "transform_residual_p95_um": base.get("transform_residual_p95_um"),
+                    }
+                )
+    if not pairwise_summary_graph.empty:
+        for row in pairwise_summary_graph.itertuples(index=False):
+            base = row._asdict()
+            rows.append(
+                {
+                    "match_policy": str(base.get("match_policy", "graph")),
+                    "day_a": base.get("day_a"),
+                    "day_b": base.get("day_b"),
+                    "pair_gap": base.get("pair_gap"),
+                    "n_matches": base.get("n_graph", base.get("n_matches", 0)),
+                    "elapsed_sec": base.get("elapsed_sec"),
+                    "transform_residual_median_um": base.get("transform_residual_median_um"),
+                    "transform_residual_p95_um": base.get("transform_residual_p95_um"),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def _build_review_sample(
     tracks_high: pd.DataFrame,
     tracks_balanced: pd.DataFrame,
@@ -254,32 +292,43 @@ def generate_matching_qc(config: MatchingQCConfig) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     pairwise_summary = _load_csv(match_dir, "pairwise_summary.csv")
+    pairwise_summary_graph = _load_csv(match_dir, "pairwise_summary_graph.csv")
     pairwise_matches_high = _load_csv(match_dir, "pairwise_matches_high.csv")
     pairwise_matches_balanced = _load_csv(match_dir, "pairwise_matches_balanced.csv")
+    pairwise_matches_graph = _load_csv(match_dir, "pairwise_matches_graph.csv")
     tracks_high = _load_csv(match_dir, "tracks_high.csv")
     tracks_balanced = _load_csv(match_dir, "tracks_balanced.csv")
+    tracks_graph = _load_csv(match_dir, "tracks_graph.csv")
     cycle_high = _load_csv(match_dir, "cycle_consistency_high.csv")
     cycle_balanced = _load_csv(match_dir, "cycle_consistency_balanced.csv")
+    cycle_graph = _load_csv(match_dir, "cycle_consistency_graph.csv")
     track_length_summary = _load_csv(match_dir, "track_length_summary.csv")
+    track_length_summary_graph = _load_csv(match_dir, "track_length_summary_graph.csv")
+
+    pairwise_summary_long = _build_pairwise_summary_long(pairwise_summary, pairwise_summary_graph)
+    pairwise_matches_all = pd.concat(
+        [table for table in [pairwise_matches_high, pairwise_matches_balanced, pairwise_matches_graph] if not table.empty],
+        ignore_index=True,
+    ) if any(not table.empty for table in [pairwise_matches_high, pairwise_matches_balanced, pairwise_matches_graph]) else pd.DataFrame()
 
     saved_paths: list[Path] = []
     if config.generate_visual_examples:
         saved_paths.extend(
             _plot_pairwise_distributions(
                 output_dir,
-                pairwise_summary,
-                pd.concat([pairwise_matches_high, pairwise_matches_balanced], ignore_index=True)
-                if not pairwise_matches_high.empty or not pairwise_matches_balanced.empty
-                else pd.DataFrame(),
+                pairwise_summary_long,
+                pairwise_matches_all,
                 dpi=int(config.dpi),
             )
         )
         saved_paths.extend(_plot_track_summaries(output_dir, tracks_high, "high", dpi=int(config.dpi)))
         saved_paths.extend(_plot_track_summaries(output_dir, tracks_balanced, "balanced", dpi=int(config.dpi)))
+        if not tracks_graph.empty:
+            saved_paths.extend(_plot_track_summaries(output_dir, tracks_graph, "graph", dpi=int(config.dpi)))
 
     fig, ax = plt.subplots(figsize=(8, 4))
     plotted = False
-    for policy, table, color in (("high", cycle_high, "#2d6cdf"), ("balanced", cycle_balanced, "#31a354")):
+    for policy, table, color in (("high", cycle_high, "#2d6cdf"), ("balanced", cycle_balanced, "#31a354"), ("graph", cycle_graph, "#f28e2b")):
         if table.empty or "agreement" not in table.columns:
             continue
         plotted = True
@@ -296,10 +345,15 @@ def generate_matching_qc(config: MatchingQCConfig) -> dict[str, Path]:
         ax.set_ylim(0, 1)
     saved_paths.append(_save_figure(output_dir / "cycle_agreement.png", fig, dpi=int(config.dpi)))
 
-    if not track_length_summary.empty:
+    if not track_length_summary.empty or not track_length_summary_graph.empty:
         fig, ax = plt.subplots(figsize=(7, 4))
-        for policy, color in (("high", "#2d6cdf"), ("balanced", "#31a354")):
-            subset = track_length_summary.loc[track_length_summary["match_policy"].astype(str) == policy]
+        for policy, table, color in (("high", track_length_summary, "#2d6cdf"), ("balanced", track_length_summary, "#31a354"), ("graph", track_length_summary_graph, "#f28e2b")):
+            if table.empty:
+                continue
+            if "match_policy" in table.columns:
+                subset = table.loc[table["match_policy"].astype(str) == policy]
+            else:
+                subset = table.copy()
             if subset.empty:
                 continue
             ax.step(
@@ -317,6 +371,11 @@ def generate_matching_qc(config: MatchingQCConfig) -> dict[str, Path]:
         saved_paths.append(_save_figure(output_dir / "track_length_summary.png", fig, dpi=int(config.dpi)))
 
     review_sample = _build_review_sample(tracks_high, tracks_balanced, config.sample_limit, config.review_seed)
+    if not tracks_graph.empty:
+        graph_sample = tracks_graph.head(min(len(tracks_graph), int(config.sample_limit))).copy()
+        if not graph_sample.empty:
+            graph_sample.insert(0, "review_category", "graph_preview")
+            review_sample = pd.concat([review_sample, graph_sample], ignore_index=True) if not review_sample.empty else graph_sample
     if len(review_sample) > int(config.max_total_examples):
         review_sample = review_sample.head(int(config.max_total_examples)).copy()
     review_sample.to_csv(output_dir / "manual_review_sample.csv", index=False)

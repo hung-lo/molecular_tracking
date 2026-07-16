@@ -186,6 +186,14 @@ def _normalize_manifest_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
     return output.sort_values("session_index").reset_index(drop=True)
 
 
+def _elapsed_days_lookup(records: list[SessionRecord]) -> dict[str, int]:
+    required_dates = [record.acquisition_date for record in records if record.required]
+    if not required_dates:
+        return {str(record.session_id): 0 for record in records}
+    start_date = min(required_dates)
+    return {str(record.session_id): int((record.acquisition_date - start_date).days) for record in records}
+
+
 def _load_mask_stack(path: Path) -> np.ndarray:
     try:
         return np.asarray(tifffile.memmap(path))
@@ -222,6 +230,7 @@ def _policy_observation_lookup(
     records: list[SessionRecord],
     policy: str,
 ) -> pd.DataFrame:
+    elapsed_days_by_session = _elapsed_days_lookup(records)
     rows: list[dict[str, object]] = []
     for _, track_row in match_table.iterrows():
         cluster_id = int(track_row["cluster_id"])
@@ -240,6 +249,7 @@ def _policy_observation_lookup(
                     "day": int(record.session_index),
                     "session_id": str(record.session_id),
                     "acquisition_date": record.acquisition_date.isoformat(),
+                    "elapsed_days": int(elapsed_days_by_session[str(record.session_id)]),
                     "mask_label": int(label_value),
                     "required": bool(record.required),
                 }
@@ -267,6 +277,7 @@ def _extract_policy_raw_table(
                 "day",
                 "session_id",
                 "acquisition_date",
+                "elapsed_days",
                 "mask_label",
                 "required",
                 "channel",
@@ -323,6 +334,7 @@ def _extract_policy_raw_table(
 
 
 def _track_lookup(tracks_table: pd.DataFrame, policy: str, records: list[SessionRecord]) -> pd.DataFrame:
+    elapsed_days_by_session = _elapsed_days_lookup(records)
     rows: list[dict[str, object]] = []
     for _, track_row in tracks_table.iterrows():
         cluster_id = int(track_row["cluster_id"])
@@ -341,6 +353,7 @@ def _track_lookup(tracks_table: pd.DataFrame, policy: str, records: list[Session
                     "day": int(record.session_index),
                     "session_id": str(record.session_id),
                     "acquisition_date": record.acquisition_date.isoformat(),
+                    "elapsed_days": int(elapsed_days_by_session[str(record.session_id)]),
                     "mask_label": int(label_value),
                     "required": bool(record.required),
                 }
@@ -363,6 +376,7 @@ def _build_roi_day_table(corrected_table: pd.DataFrame, track_lookup: pd.DataFra
             "session_index",
             "session_id",
             "acquisition_date",
+            "elapsed_days",
             "required",
         ]
     ].drop_duplicates()

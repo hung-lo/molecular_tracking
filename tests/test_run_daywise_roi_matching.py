@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 
+import pytest
 import numpy as np
 import pandas as pd
 import tifffile
@@ -79,3 +80,18 @@ def test_run_daywise_roi_matching_exports_required_tables(tmp_path: Path) -> Non
     assert run_log["row_counts"]["tracks_balanced"] > 0
     assert run_log["output_paths"]["tracks_high"].endswith("tracks_high.csv")
     assert run_log["qc_output_dir"].endswith("qc")
+
+@pytest.mark.parametrize("max_pair_gap", [0, -1, 3, 1.5])
+def test_run_daywise_roi_matching_rejects_invalid_pair_gap_values(tmp_path: Path, max_pair_gap: float) -> None:
+    manifest_path = _build_dataset(tmp_path)
+
+    with pytest.raises(ValueError):
+        run_daywise_roi_matching(
+            manifest_path=manifest_path,
+            output_dir=tmp_path / f"match_out_{max_pair_gap}",
+            spacing=VoxelSpacing(),
+            params=AffineOverlapParams(),
+            max_pair_gap=max_pair_gap,
+            overwrite=True,
+        )
+

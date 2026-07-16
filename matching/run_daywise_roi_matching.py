@@ -41,6 +41,102 @@ from roi_track_graph import (
     summarize_track_cycle_metadata,
 )
 
+PAIRWISE_SUMMARY_COLUMNS = [
+    "day_a",
+    "day_b",
+    "pair_gap",
+    "shift_z",
+    "shift_y",
+    "shift_x",
+    "n_a",
+    "n_b",
+    "n_overlap_pairs",
+    "n_mutual_overlap",
+    "n_seed",
+    "n_transform_fit",
+    "n_high",
+    "n_balanced",
+    "high_frac_smaller",
+    "balanced_frac_smaller",
+    "refinement_method",
+    "transform_method",
+    "transform_fallback_reason",
+    "transform_residual_median_um",
+    "transform_residual_p95_um",
+    "xy_fallback",
+    "z_fallback",
+    "xy_fallback_reason",
+    "z_fallback_reason",
+    "elapsed_sec",
+]
+PAIRWISE_TRANSFORM_COLUMNS = [
+    "day_a",
+    "day_b",
+    "pair_gap",
+    "z_intercept",
+    "z_scale",
+    "y_intercept",
+    "y_from_y",
+    "y_from_x",
+    "x_intercept",
+    "x_from_y",
+    "x_from_x",
+    "method",
+    "fallback_reason",
+    "n_seed",
+    "n_inlier",
+    "residual_median_um",
+    "residual_p95_um",
+]
+PAIRWISE_CANDIDATE_COLUMNS = [
+    "day_a",
+    "day_b",
+    "pair_gap",
+    "idx_a",
+    "idx_b",
+    "label_a",
+    "label_b",
+    "candidate_source",
+    "distance_um",
+    "ambiguity",
+    "dice",
+    "iou",
+    "area_ratio",
+    "spatial_term",
+    "ambiguity_term",
+    "score",
+    "high_rule",
+    "balanced_rule",
+]
+PAIRWISE_MATCH_COLUMNS = [
+    "match_policy",
+    "day_a",
+    "day_b",
+    "pair_gap",
+    "session_index_a",
+    "session_index_b",
+    "idx_a",
+    "idx_b",
+    "label_a",
+    "label_b",
+    "candidate_source",
+    "distance_um",
+    "ambiguity",
+    "dice",
+    "iou",
+    "area_ratio",
+    "spatial_term",
+    "ambiguity_term",
+    "score",
+    "high_rule",
+    "balanced_rule",
+    "assignment_policy",
+    "transform_method",
+    "transform_fallback_reason",
+    "transform_residual_median_um",
+    "transform_residual_p95_um",
+]
+
 
 def format_duration_seconds(duration_seconds: float) -> str:
     """Format elapsed wall-clock time as ``HH:MM:SS``."""
@@ -139,6 +235,7 @@ def _fingerprint_run(
     *,
     manifest_hash: str,
     records: list[SessionRecord],
+    mask_hashes: dict[str, str],
     params: AffineOverlapParams,
     spacing: VoxelSpacing,
     max_pair_gap: int,
@@ -149,7 +246,7 @@ def _fingerprint_run(
         "algorithm_version": MATCHER_ALGORITHM_VERSION,
         "manifest_hash": manifest_hash,
         "session_ids": [record.session_id for record in records],
-        "mask_hashes": {record.session_id: _sha256_file(record.mask_path) for record in records},
+        "mask_hashes": mask_hashes,
         "spacing": asdict(spacing),
         "params": asdict(params),
         "max_pair_gap": int(max_pair_gap),
@@ -170,8 +267,7 @@ def _normalize_pair_table(
     """Attach run provenance to one accepted pair table."""
 
     if table is None or table.empty:
-        columns = list(table.columns) if table is not None else []
-        return pd.DataFrame(columns=columns)
+        return pd.DataFrame(columns=PAIRWISE_MATCH_COLUMNS)
     output = table.copy()
     output.insert(0, "match_policy", policy)
     output.insert(1, "day_a", day_a)
@@ -228,17 +324,26 @@ def run_daywise_roi_matching(
 
     manifest_path = Path(manifest_path).resolve()
     output_dir = Path(output_dir).resolve()
-    if max_pair_gap > 2:
-        raise ValueError("--max-pair-gap values above 2 are not supported in affine_overlap_v1.")
+    try:
+        max_pair_gap_value = float(max_pair_gap)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("--max-pair-gap must be either 1 or 2.") from exc
+    if not max_pair_gap_value.is_integer():
+        raise ValueError("--max-pair-gap must be either 1 or 2.")
+    max_pair_gap = int(max_pair_gap_value)
+    if max_pair_gap not in {1, 2}:
+        raise ValueError("--max-pair-gap must be either 1 or 2.")
     spacing = spacing or VoxelSpacing()
     params = params or AffineOverlapParams()
 
     records = load_session_manifest(manifest_path)
     validate_manifest_for_matching(records)
     manifest_hash = _sha256_file(manifest_path)
+    mask_hashes = {record.session_id: _sha256_file(record.mask_path) for record in records}
     fingerprint = _fingerprint_run(
         manifest_hash=manifest_hash,
         records=records,
+        mask_hashes=mask_hashes,
         params=params,
         spacing=spacing,
         max_pair_gap=max_pair_gap,
@@ -270,7 +375,7 @@ def run_daywise_roi_matching(
     features_by_session: dict[str, pd.DataFrame] = {}
     input_hashes: list[dict[str, object]] = []
     for record in records:
-        mask_hash = _sha256_file(record.mask_path)
+        mask_hash = mask_hashes[record.session_id]
         mask_stack = _load_mask_stack(record.mask_path)
         feature_table = extract_roi_features(mask_stack, session_id=record.session_id, spacing=spacing)
         feature_table = feature_table.copy()
@@ -354,11 +459,14 @@ def run_daywise_roi_matching(
                 candidate_df.insert(2, "pair_gap", int(pair_gap))
                 candidate_rows.append(candidate_df)
 
-    pairwise_summary = pd.DataFrame(pair_summaries)
-    pairwise_summary = pairwise_summary.sort_values(["day_a", "day_b"]).reset_index(drop=True)
+    pairwise_summary = pd.DataFrame(pair_summaries, columns=PAIRWISE_SUMMARY_COLUMNS)
+    if not pairwise_summary.empty:
+        pairwise_summary = pairwise_summary.sort_values(["day_a", "day_b"]).reset_index(drop=True)
     pairwise_summary.to_csv(output_dir / "pairwise_summary.csv", index=False)
 
-    pairwise_transforms = pd.DataFrame(pair_transforms).sort_values(["day_a", "day_b"]).reset_index(drop=True)
+    pairwise_transforms = pd.DataFrame(pair_transforms, columns=PAIRWISE_TRANSFORM_COLUMNS)
+    if not pairwise_transforms.empty:
+        pairwise_transforms = pairwise_transforms.sort_values(["day_a", "day_b"]).reset_index(drop=True)
     pairwise_transforms.to_csv(output_dir / "pairwise_transforms.csv", index=False)
 
     combined_high_rows: list[pd.DataFrame] = []
@@ -396,13 +504,13 @@ def run_daywise_roi_matching(
         if not balanced_df.empty:
             combined_balanced_rows.append(balanced_df)
 
-    pairwise_matches_high = pd.concat(combined_high_rows, ignore_index=True) if combined_high_rows else pd.DataFrame()
-    pairwise_matches_balanced = pd.concat(combined_balanced_rows, ignore_index=True) if combined_balanced_rows else pd.DataFrame()
+    pairwise_matches_high = pd.concat(combined_high_rows, ignore_index=True) if combined_high_rows else pd.DataFrame(columns=PAIRWISE_MATCH_COLUMNS)
+    pairwise_matches_balanced = pd.concat(combined_balanced_rows, ignore_index=True) if combined_balanced_rows else pd.DataFrame(columns=PAIRWISE_MATCH_COLUMNS)
     pairwise_matches_high.to_csv(output_dir / "pairwise_matches_high.csv", index=False)
     pairwise_matches_balanced.to_csv(output_dir / "pairwise_matches_balanced.csv", index=False)
 
     if save_candidates:
-        candidate_table = pd.concat(candidate_rows, ignore_index=True) if candidate_rows else pd.DataFrame()
+        candidate_table = pd.concat(candidate_rows, ignore_index=True) if candidate_rows else pd.DataFrame(columns=PAIRWISE_CANDIDATE_COLUMNS)
         candidate_table.to_csv(output_dir / "pairwise_candidates.csv", index=False)
 
     tracks_high, edges_high = build_tracks_from_pair_tables(
@@ -454,7 +562,7 @@ def run_daywise_roi_matching(
                 "session_index": int(record.session_index),
                 "session_id": record.session_id,
                 "mask_path": str(record.mask_path),
-                "mask_sha256": _sha256_file(record.mask_path),
+                "mask_sha256": mask_hashes[record.session_id],
                 "red_image_path": str(record.red_image_path) if record.red_image_path is not None else "",
                 "green_image_path": str(record.green_image_path) if record.green_image_path is not None else "",
                 "red_sha256": _sha256_file(record.red_image_path) if record.red_image_path is not None else None,

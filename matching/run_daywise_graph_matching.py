@@ -30,9 +30,39 @@ from roi_track_graph import (
     build_tracks_from_pair_tables,
     summarize_track_cycle_metadata,
 )
-from run_daywise_roi_matching import run_daywise_roi_matching
+from run_daywise_roi_matching import (
+    PAIRWISE_CANDIDATE_COLUMNS,
+    PAIRWISE_MATCH_COLUMNS,
+    PAIRWISE_SUMMARY_COLUMNS,
+    PAIRWISE_TRANSFORM_COLUMNS,
+    run_daywise_roi_matching,
+)
 from spatial_graph_matcher import GRAPH_MATCHER_ALGORITHM_VERSION, GraphPairMatchResult, SpatialGraphParams, refine_pair_with_spatial_graph
 from session_manifest import load_session_manifest
+
+GRAPH_PAIRWISE_SUMMARY_COLUMNS = PAIRWISE_SUMMARY_COLUMNS + [
+    "match_policy",
+    "n_graph",
+    "n_graph_anchors",
+    "n_graph_changed",
+    "graph_match_policy",
+]
+GRAPH_PAIRWISE_MATCH_COLUMNS = PAIRWISE_MATCH_COLUMNS + [
+    "base_score",
+    "graph_rule",
+    "graph_status",
+    "graph_support_count",
+    "graph_support_fraction",
+    "graph_residual_median_um",
+    "graph_residual_mean_um",
+    "graph_residual_p90_um",
+    "graph_inlier_fraction",
+    "graph_score",
+    "refined_score",
+    "is_graph_anchor",
+    "assignment_source",
+]
+GRAPH_CHANGES_COLUMNS = ["label_a", "label_b", "in_balanced", "in_graph", "changed"]
 
 GRAPH_RUNNER_ALGORITHM_VERSION = "daywise_graph_runner_v1"
 
@@ -186,7 +216,6 @@ def run_daywise_graph_matching(
         roi_features["session_id"] = roi_features["session_id"].astype(str)
     features_by_session = _build_features_by_session(roi_features)
 
-    pair_results: dict[tuple[str, str], PairMatchResult] = {}
     graph_results: list[GraphPairMatchResult] = []
     for row in pairwise_transforms.itertuples(index=False):
         day_a = str(row.day_a)
@@ -216,7 +245,6 @@ def run_daywise_graph_matching(
             params=graph_params,
             pair_gap=int(pair_summary_row.iloc[0].get("pair_gap", 0)) if "pair_gap" in pair_summary_row.columns else None,
         )
-        pair_results[(day_a, day_b)] = baseline_result
         graph_results.append(graph_result)
 
     graph_pair_tables = {
@@ -238,9 +266,11 @@ def run_daywise_graph_matching(
     graph_tracks = summarize_track_cycle_metadata(graph_tracks, graph_cycle_edge_checks)
     graph_length_summary = build_track_length_summary_table(graph_tracks)
 
-    graph_pairwise_matches = pd.concat([result.graph_matches for result in graph_results], ignore_index=True) if graph_results else pd.DataFrame()
-    graph_pairwise_summary = pd.DataFrame([result.summary for result in graph_results]).sort_values(["day_a", "day_b"]).reset_index(drop=True)
-    graph_changes = pd.concat([result.changes for result in graph_results], ignore_index=True) if graph_results else pd.DataFrame()
+    graph_pairwise_matches = pd.concat([result.graph_matches for result in graph_results], ignore_index=True) if graph_results else pd.DataFrame(columns=GRAPH_PAIRWISE_MATCH_COLUMNS)
+    graph_pairwise_summary = pd.DataFrame([result.summary for result in graph_results], columns=GRAPH_PAIRWISE_SUMMARY_COLUMNS)
+    if not graph_pairwise_summary.empty:
+        graph_pairwise_summary = graph_pairwise_summary.sort_values(["day_a", "day_b"]).reset_index(drop=True)
+    graph_changes = pd.concat([result.changes for result in graph_results], ignore_index=True) if graph_results else pd.DataFrame(columns=GRAPH_CHANGES_COLUMNS)
 
     graph_pairwise_matches.to_csv(output_dir / "pairwise_matches_graph.csv", index=False)
     graph_pairwise_summary.to_csv(output_dir / "pairwise_summary_graph.csv", index=False)
@@ -251,8 +281,9 @@ def run_daywise_graph_matching(
     graph_length_summary.to_csv(output_dir / "track_length_summary_graph.csv", index=False)
     graph_changes.to_csv(output_dir / "graph_match_changes.csv", index=False)
 
-    run_log = _load_csv(output_dir / "run_log.json")
     run_log_payload = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
+    warnings: list[str] = []
+    qc_output_path = Path(qc_output_dir).resolve() if qc_output_dir is not None else output_dir / "qc"
     run_log_payload.update(
         {
             "graph_matcher_algorithm_version": GRAPH_MATCHER_ALGORITHM_VERSION,
@@ -282,26 +313,45 @@ def run_daywise_graph_matching(
             },
         }
     )
+    run_log_payload["matching_status"] = "completed"
+    run_log_payload["qc_status"] = "not_requested" if skip_qc else "pending"
+    run_log_payload["qc_output_dir"] = str(qc_output_path)
+    run_log_payload["qc_error_type"] = None
+    run_log_payload["qc_error"] = None
     run_log_payload["run_finished_utc"] = datetime.now(timezone.utc).isoformat()
+    run_log_payload["warnings"] = warnings
     _export_json(output_dir / "run_log.json", run_log_payload)
 
     if not skip_qc:
-        qc_dir = Path(qc_output_dir).resolve() if qc_output_dir is not None else output_dir / "qc"
-        generate_matching_qc(
-            DaywiseQCPlotConfig(
-                match_dir=output_dir,
-                output_dir=qc_dir,
-                sample_limit=int(qc_max_examples),
-                review_seed=int(qc_random_seed),
-                include_skip_pairs=True,
-                image_format=str(qc_image_format),
-                dpi=int(qc_dpi),
-                max_examples_per_category=int(qc_max_examples),
-                max_total_examples=int(qc_max_total_examples),
-                generate_visual_examples=True,
-                random_seed=int(qc_random_seed),
+        qc_dir = qc_output_path
+        try:
+            generate_matching_qc(
+                DaywiseQCPlotConfig(
+                    match_dir=output_dir,
+                    output_dir=qc_dir,
+                    sample_limit=int(qc_max_examples),
+                    review_seed=int(qc_random_seed),
+                    include_skip_pairs=True,
+                    image_format=str(qc_image_format),
+                    dpi=int(qc_dpi),
+                    max_examples_per_category=int(qc_max_examples),
+                    max_total_examples=int(qc_max_total_examples),
+                    generate_visual_examples=True,
+                    random_seed=int(qc_random_seed),
+                )
             )
-        )
+        except Exception as exc:
+            run_log_payload["qc_status"] = "failed"
+            run_log_payload["qc_error_type"] = type(exc).__name__
+            run_log_payload["qc_error"] = str(exc)
+            warnings.append("qc_failed")
+            _export_json(output_dir / "run_log.json", run_log_payload)
+            if require_qc_success:
+                raise
+        else:
+            run_log_payload["qc_status"] = "completed"
+            run_log_payload["qc_output_dir"] = str(qc_dir)
+            _export_json(output_dir / "run_log.json", run_log_payload)
 
     total_duration_seconds = time.perf_counter() - run_start_seconds
     print(f"[{format_duration_seconds(total_duration_seconds)}] Graph ROI matching completed", flush=True)

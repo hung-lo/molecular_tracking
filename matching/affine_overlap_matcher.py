@@ -271,11 +271,11 @@ def extract_roi_features(
     return records
 
 
-def _binary_occupancy_projection(mask: np.ndarray) -> np.ndarray:
+def _binary_occupancy_projection(mask: np.ndarray, sigma_xy: float) -> np.ndarray:
     """Return a smoothed occupancy projection across z."""
 
     projection = (mask > 0).sum(axis=0).astype(np.float32)
-    return ndimage.gaussian_filter(projection, sigma=2.0)
+    return ndimage.gaussian_filter(projection, sigma=float(sigma_xy))
 
 
 def _z_occupancy_profile(mask: np.ndarray) -> np.ndarray:
@@ -305,8 +305,8 @@ def estimate_global_shift(
         "occupancy_sigma_xy": float(params.occupancy_sigma_xy),
     }
 
-    projection_a = _binary_occupancy_projection(mask_a)
-    projection_b = _binary_occupancy_projection(mask_b)
+    projection_a = _binary_occupancy_projection(mask_a, params.occupancy_sigma_xy)
+    projection_b = _binary_occupancy_projection(mask_b, params.occupancy_sigma_xy)
     if not np.isfinite(projection_a).all() or not np.isfinite(projection_b).all():
         shift_yx = np.zeros(2, dtype=float)
         summary["xy_fallback"] = True

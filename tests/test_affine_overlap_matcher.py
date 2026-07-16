@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+import affine_overlap_matcher as matcher
 from affine_overlap_matcher import (
     AffineOverlapParams,
     VoxelSpacing,
@@ -65,6 +66,31 @@ def test_sparse_overlap_and_mutual_pairs_detects_identical_labels() -> None:
     assert overlap["dice"].tolist() == [1.0, 1.0]
     assert overlap["iou"].tolist() == [1.0, 1.0]
     assert mutual[["label_a", "label_b"]].to_dict(orient="records") == [{"label_a": 1, "label_b": 1}, {"label_a": 2, "label_b": 2}]
+
+
+def test_estimate_global_shift_uses_configured_occupancy_sigma(monkeypatch) -> None:
+    seen: dict[str, float] = {}
+
+    def fake_gaussian_filter(projection, sigma):
+        seen["sigma"] = float(sigma)
+        return projection
+
+    monkeypatch.setattr(matcher.ndimage, "gaussian_filter", fake_gaussian_filter)
+    monkeypatch.setattr(matcher, "phase_cross_correlation", lambda *args, **kwargs: (np.zeros(2, dtype=float), None, None))
+
+    mask = np.zeros((2, 3, 3), dtype=np.uint16)
+    mask[0, 0, 0] = 1
+    mask[1, 1, 1] = 2
+
+    shift, summary = matcher.estimate_global_shift(
+        mask,
+        mask,
+        matcher.AffineOverlapParams(occupancy_sigma_xy=3.5),
+    )
+
+    assert np.allclose(shift, np.zeros(3, dtype=float))
+    assert summary["occupancy_sigma_xy"] == 3.5
+    assert seen["sigma"] == 3.5
 
 
 def test_fit_restricted_transform_falls_back_with_too_few_seeds() -> None:

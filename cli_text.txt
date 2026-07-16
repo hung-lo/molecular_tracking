@@ -75,6 +75,11 @@ uv run python matching/daywise_roi_matcher_qc_plots.py \
   --match-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_roi_match_runs/20260713_affine_overlap_v1 \
   --output-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_roi_match_runs/20260713_affine_overlap_v1/qc_plots
 
+uv run python matching/daywise_roi_matcher_qc_plots.py \
+  --match-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_roi_match_runs/20260714_affine_overlap_v1 \
+  --output-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_roi_match_runs/20260714_affine_overlap_v1/qc_plots
+
+
 ## then extract intensity from raw images
 
 uv run python core/run_daywise_matched_roi_pipeline.py \
@@ -84,3 +89,17 @@ uv run python core/run_daywise_matched_roi_pipeline.py \
   --policies high balanced \
   --green-dark 319 \
   --red-dark 534
+
+
+uv run python core/run_daywise_matched_roi_pipeline.py \
+  --dataset /mnt/d/_data/_newAAV_2026/weekly_registration_test \
+  --manifest /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_session_manifest.csv \
+  --match-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_roi_match_runs/20260714_affine_overlap_v1 \
+  --policies high balanced \
+  --green-dark 319 \
+  --red-dark 534
+
+## experimental graph matcher
+
+uv run python matching/run_daywise_graph_matching.py   --manifest /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_session_manifest.csv   --output-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_roi_match_runs/20260716_graph_v1   --xy-um-per-px 0.693359375   --z-um-per-plane 5.0   --max-pair-gap 2
+

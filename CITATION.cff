@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use this repository, please cite it."
+title: "molecular_tracking"
+version: "0.1.0"
+authors:
+  - family-names: Hung
+    given-names: Lo
+keywords:
+  - ROI matching
+  - molecular tracking
+  - Cellpose
+  - SAM
+repository-code: "https://github.com/hung-lo/molecular_tracking"

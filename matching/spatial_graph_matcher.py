@@ -14,6 +14,37 @@ from scipy.spatial import cKDTree
 from affine_overlap_matcher import PairMatchResult, VoxelSpacing, RestrictedTransform
 
 GRAPH_MATCHER_ALGORITHM_VERSION = "local_spatial_graph_v1"
+GRAPH_CANDIDATE_COLUMNS = [
+    "idx_a",
+    "idx_b",
+    "label_a",
+    "label_b",
+    "candidate_source",
+    "distance_um",
+    "ambiguity",
+    "dice",
+    "iou",
+    "area_ratio",
+    "spatial_term",
+    "ambiguity_term",
+    "score",
+    "high_rule",
+    "balanced_rule",
+    "base_score",
+    "graph_rule",
+    "graph_status",
+    "match_policy",
+    "graph_support_count",
+    "graph_support_fraction",
+    "graph_residual_median_um",
+    "graph_residual_mean_um",
+    "graph_residual_p90_um",
+    "graph_inlier_fraction",
+    "graph_score",
+    "refined_score",
+    "is_graph_anchor",
+]
+GRAPH_MATCH_COLUMNS = GRAPH_CANDIDATE_COLUMNS + ["assignment_policy", "assignment_source"]
 
 
 @dataclass(frozen=True)
@@ -224,12 +255,13 @@ def add_graph_consistency_scores(
     params: SpatialGraphParams,
 ) -> pd.DataFrame:
     if candidates is None or candidates.empty:
-        return pd.DataFrame(columns=list(candidates.columns) if candidates is not None else [])
+        return pd.DataFrame(columns=GRAPH_CANDIDATE_COLUMNS)
 
     table = candidates.copy()
     table["base_score"] = pd.to_numeric(table.get("score", np.nan), errors="coerce")
     table["graph_rule"] = table.get("balanced_rule", False).astype(bool)
     table["graph_status"] = "not_balanced"
+    table["match_policy"] = "graph"
     table["graph_support_count"] = 0
     table["graph_support_fraction"] = 0.0
     table["graph_residual_median_um"] = np.nan
@@ -273,20 +305,38 @@ def add_graph_consistency_scores(
 
 def graph_one_to_one_assignment(graph_candidates: pd.DataFrame, anchors: pd.DataFrame, params: SpatialGraphParams) -> pd.DataFrame:
     if graph_candidates is None or graph_candidates.empty:
-        columns = list(graph_candidates.columns) if graph_candidates is not None else []
-        return pd.DataFrame(columns=columns)
+        return pd.DataFrame(columns=GRAPH_MATCH_COLUMNS)
 
     table = graph_candidates.copy()
     graph_rule = table.get("graph_rule", table.get("balanced_rule", False)).astype(bool)
     candidates = table.loc[graph_rule].copy()
     if candidates.empty:
-        return candidates
+        return pd.DataFrame(columns=GRAPH_MATCH_COLUMNS)
 
     if anchors is None or anchors.empty:
         balanced_mask = candidates["balanced_rule"].astype(bool) if "balanced_rule" in candidates.columns else pd.Series(True, index=candidates.index)
         fallback = candidates.loc[balanced_mask].copy()
+        if fallback.empty:
+            return pd.DataFrame(columns=GRAPH_MATCH_COLUMNS)
         fallback["assignment_policy"] = "graph"
         fallback["assignment_source"] = "baseline_fallback"
+        fallback["match_policy"] = "graph"
+        for column, default in [
+            ("base_score", fallback.get("score", np.nan)),
+            ("graph_rule", fallback.get("balanced_rule", False)),
+            ("graph_status", "baseline_fallback"),
+            ("graph_support_count", 0),
+            ("graph_support_fraction", 0.0),
+            ("graph_residual_median_um", np.nan),
+            ("graph_residual_mean_um", np.nan),
+            ("graph_residual_p90_um", np.nan),
+            ("graph_inlier_fraction", np.nan),
+            ("graph_score", np.nan),
+            ("refined_score", fallback.get("score", np.nan)),
+            ("is_graph_anchor", False),
+        ]:
+            if column not in fallback.columns:
+                fallback[column] = default
         return fallback.reset_index(drop=True)
 
     anchor_pairs = {(int(row.label_a), int(row.label_b)) for row in anchors.itertuples(index=False)}
@@ -306,6 +356,7 @@ def graph_one_to_one_assignment(graph_candidates: pd.DataFrame, anchors: pd.Data
         data = row._asdict()
         data["assignment_policy"] = "graph"
         data["assignment_source"] = "locked_anchor"
+        data["match_policy"] = "graph"
         accepted_rows.append(data)
 
     remaining = candidates.loc[~candidates["label_a"].isin(used_a) & ~candidates["label_b"].isin(used_b)].copy()
@@ -324,16 +375,45 @@ def graph_one_to_one_assignment(graph_candidates: pd.DataFrame, anchors: pd.Data
         data = row._asdict()
         data["assignment_policy"] = "graph"
         data["assignment_source"] = "graph_refined"
+        data["match_policy"] = "graph"
         accepted_rows.append(data)
 
     if not accepted_rows:
-        balanced_mask = candidates["balanced_rule"].astype(bool) if "balanced_rule" in candidates.columns else pd.Series(True, index=candidates.index)
-        fallback = candidates.loc[balanced_mask].copy()
-        fallback["assignment_policy"] = "graph"
-        fallback["assignment_source"] = "baseline_fallback"
-        return fallback.reset_index(drop=True)
+        return pd.DataFrame(columns=GRAPH_MATCH_COLUMNS)
 
     accepted = pd.DataFrame(accepted_rows)
+    for column in [
+        "base_score",
+        "graph_rule",
+        "graph_status",
+        "graph_support_count",
+        "graph_support_fraction",
+        "graph_residual_median_um",
+        "graph_residual_mean_um",
+        "graph_residual_p90_um",
+        "graph_inlier_fraction",
+        "graph_score",
+        "refined_score",
+        "is_graph_anchor",
+        "assignment_policy",
+        "assignment_source",
+        "match_policy",
+    ]:
+        if column not in accepted.columns:
+            if column in {"graph_status", "assignment_policy", "assignment_source", "match_policy"}:
+                accepted[column] = "graph" if column in {"assignment_policy", "match_policy"} else "graph_refined"
+            elif column == "graph_rule":
+                accepted[column] = accepted.get("balanced_rule", False)
+            elif column == "base_score" or column == "refined_score":
+                accepted[column] = accepted.get("score", np.nan)
+            elif column == "graph_support_count":
+                accepted[column] = 0
+            elif column == "graph_support_fraction":
+                accepted[column] = 0.0
+            elif column == "is_graph_anchor":
+                accepted[column] = False
+            else:
+                accepted[column] = np.nan
     return accepted.reset_index(drop=True)
 
 
@@ -365,6 +445,7 @@ def summarize_graph_pair(
             "day_a": session_a,
             "day_b": session_b,
             "pair_gap": int(pair_gap) if pair_gap is not None else None,
+            "match_policy": "graph",
             "n_graph": int(len(graph_matches)),
             "n_graph_anchors": int(len(anchors)),
             "n_graph_changed": int(changes["changed"].sum()) if not changes.empty else 0,
@@ -396,10 +477,25 @@ def refine_pair_with_spatial_graph(
     graph_candidates = add_graph_consistency_scores(candidates, anchors, coords_a_by_label, coords_b_by_label, params)
     if anchors.empty:
         graph_matches = balanced_matches.copy()
-        if not graph_matches.empty:
+        if graph_matches.empty:
+            graph_matches = pd.DataFrame(columns=GRAPH_MATCH_COLUMNS)
+        else:
             graph_matches = graph_matches.copy()
             graph_matches["assignment_policy"] = "graph"
             graph_matches["assignment_source"] = "baseline_fallback"
+            graph_matches["match_policy"] = "graph"
+            graph_matches["base_score"] = graph_matches.get("score", np.nan)
+            graph_matches["graph_rule"] = graph_matches.get("balanced_rule", False)
+            graph_matches["graph_status"] = "baseline_fallback"
+            graph_matches["graph_support_count"] = 0
+            graph_matches["graph_support_fraction"] = 0.0
+            graph_matches["graph_residual_median_um"] = np.nan
+            graph_matches["graph_residual_mean_um"] = np.nan
+            graph_matches["graph_residual_p90_um"] = np.nan
+            graph_matches["graph_inlier_fraction"] = np.nan
+            graph_matches["graph_score"] = np.nan
+            graph_matches["refined_score"] = graph_matches.get("score", np.nan)
+            graph_matches["is_graph_anchor"] = False
     else:
         graph_matches = graph_one_to_one_assignment(graph_candidates, anchors, params)
 

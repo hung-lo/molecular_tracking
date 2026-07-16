@@ -10,6 +10,51 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+TRACK_LENGTH_SUMMARY_COLUMNS = ["match_policy", "n_days_present", "missing_internal_days", "n_tracks"]
+TRACK_CYCLE_SUMMARY_COLUMNS = [
+    "match_policy",
+    "day_a",
+    "day_b",
+    "day_c",
+    "n_composed",
+    "n_comparable",
+    "n_agree",
+    "agreement",
+]
+TRACK_CYCLE_DETAIL_COLUMNS = [
+    "match_policy",
+    "day_a",
+    "day_b",
+    "day_c",
+    "label_a",
+    "label_b_composed",
+    "label_c_composed",
+    "label_c_direct",
+    "cycle_agrees",
+    "track_uid",
+]
+TRACK_EDGE_COLUMNS = [
+    "match_policy",
+    "edge_type",
+    "pair_gap",
+    "day_a",
+    "day_b",
+    "label_a",
+    "label_b",
+    "score",
+    "dice",
+    "distance_um",
+    "ambiguity",
+    "high_rule",
+    "balanced_rule",
+    "candidate_source",
+    "assignment_policy",
+    "transform_method",
+    "transform_fallback_reason",
+    "accepted_for_track",
+    "rejection_reason",
+]
+
 
 @dataclass(frozen=True)
 class TrackGraphResult:
@@ -363,7 +408,11 @@ def build_tracks_from_pair_tables(
         ascending=[False, True, True, True, True],
     ).reset_index(drop=True)
     tracks_table.insert(0, "cluster_id", np.arange(1, len(tracks_table) + 1))
-    return tracks_table, pd.DataFrame(edge_rows)
+    if edge_rows:
+        edge_table = pd.DataFrame(edge_rows)
+    else:
+        edge_table = pd.DataFrame(columns=TRACK_EDGE_COLUMNS)
+    return tracks_table, edge_table
 
 
 def build_cycle_consistency_tables(
@@ -440,7 +489,15 @@ def build_cycle_consistency_tables(
                 }
             )
 
-    return pd.DataFrame(summary_rows), pd.DataFrame(detail_rows)
+    if summary_rows:
+        summary_table = pd.DataFrame(summary_rows)
+    else:
+        summary_table = pd.DataFrame(columns=TRACK_CYCLE_SUMMARY_COLUMNS)
+    if detail_rows:
+        detail_table = pd.DataFrame(detail_rows)
+    else:
+        detail_table = pd.DataFrame(columns=TRACK_CYCLE_DETAIL_COLUMNS)
+    return summary_table, detail_table
 
 
 def summarize_track_cycle_metadata(
@@ -490,7 +547,7 @@ def build_track_length_summary_table(tracks_table: pd.DataFrame) -> pd.DataFrame
     """Summarize the track-length distribution."""
 
     if tracks_table.empty:
-        return pd.DataFrame(columns=["policy", "n_days_present", "missing_internal_days", "n_tracks"])
+        return pd.DataFrame(columns=TRACK_LENGTH_SUMMARY_COLUMNS)
     summary = (
         tracks_table.groupby(["match_policy", "n_days_present", "missing_internal_days"], dropna=False)
         .size()

@@ -103,3 +103,17 @@ uv run python core/run_daywise_matched_roi_pipeline.py \
 
 uv run python matching/run_daywise_graph_matching.py   --manifest /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_session_manifest.csv   --output-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_roi_match_runs/20260716_graph_v1   --xy-um-per-px 0.693359375   --z-um-per-plane 5.0   --max-pair-gap 2
 
+
+
+
+## graph base matcher
+uv run python matching/run_daywise_graph_matching.py \
+  --manifest /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_session_manifest.csv \
+  --output-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_roi_match_runs/20260716_graph_v1 \
+  --xy-um-per-px 0.693359375   --z-um-per-plane 5.0   --max-pair-gap 2
+
+## seems working, now try quick plotting and extract roi intensity
+
+uv run python matching/daywise_roi_matcher_qc_plots.py \
+  --match-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_roi_match_runs/20260716_graph_v1 \
+  --output-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_roi_match_runs/20260716_graph_v1/qc_plots

@@ -141,3 +141,12 @@ uv run python core/run_daywise_master_pipeline.py \
   --xy-um-per-px 0.693359375 \
   --z-um-per-plane 5.0 \
   --max-pair-gap 2
+
+  uv run python core/run_daywise_master_pipeline.py \
+  --dataset /mnt/d/_data/_newAAV_2026/weekly_registration_test \
+  --manifest /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_session_manifest.csv \
+  --output-root /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_roi_match_runs \
+  --run-name 20260721_master_v2_fixPlots \
+  --xy-um-per-px 0.693359375 \
+  --z-um-per-plane 5.0 \
+  --max-pair-gap 2

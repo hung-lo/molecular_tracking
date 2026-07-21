@@ -117,3 +117,27 @@ uv run python matching/run_daywise_graph_matching.py \
 uv run python matching/daywise_roi_matcher_qc_plots.py \
   --match-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_roi_match_runs/20260716_graph_v1 \
   --output-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_roi_match_runs/20260716_graph_v1/qc_plots
+
+
+uv run python core/run_daywise_matched_roi_pipeline.py \
+  --dataset /mnt/d/_data/_newAAV_2026/weekly_registration_test \
+  --manifest /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_session_manifest.csv \
+  --match-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_roi_match_runs/20260716_graph_v1 \
+  --policies graph high balanced \
+  --green-dark 319 \
+  --red-dark 534
+
+
+
+
+
+## new master pipeline test 
+
+uv run python core/run_daywise_master_pipeline.py \
+  --dataset /mnt/d/_data/_newAAV_2026/weekly_registration_test \
+  --manifest /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_session_manifest.csv \
+  --output-root /mnt/d/_data/_newAAV_2026/weekly_registration_test/daywise_roi_match_runs \
+  --run-name 20260721_master_v1 \
+  --xy-um-per-px 0.693359375 \
+  --z-um-per-plane 5.0 \
+  --max-pair-gap 2

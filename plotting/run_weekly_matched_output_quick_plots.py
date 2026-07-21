@@ -192,6 +192,7 @@ def build_quick_plots(
     plot_fit_parameter_summary(
         fit_summary=fit_summary,
         output_path=output_dir / "daywise_green_red_linear_fit_parameters.png",
+        roi_metrics=metrics_table,
         start_date=start_date,
     )
 
@@ -210,6 +211,8 @@ def build_quick_plots(
             roi_summary=roi_summary,
             max_rois=top_n,
             direction=direction_label,
+            random_sample=True,
+            random_seed=0,
         )
         if top_rois.empty:
             log_message(run_start_seconds, f"No ranked {direction_label} clusters found; skipping directional plots")

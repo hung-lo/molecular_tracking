@@ -54,8 +54,9 @@ def log_message(run_start_seconds: float, message: str) -> None:
 def make_day_date_labels(
     day_values: np.ndarray,
     start_date: str = "20260511",
+    acquisition_dates: pd.Series | np.ndarray | list[str] | None = None,
 ) -> list[str]:
-    """Convert integer day offsets into date labels.
+    """Convert integer day offsets or acquisition dates into date labels.
 
     Parameters
     ----------
@@ -63,6 +64,9 @@ def make_day_date_labels(
         One-dimensional array of integer day offsets relative to ``start_date``.
     start_date : str, default="20260511"
         Reference date in ``YYYYMMDD`` format.
+    acquisition_dates : sequence of str, optional
+        When provided, each entry is parsed as the actual acquisition date for
+        the matching day value and used directly in the output labels.
 
     Returns
     -------
@@ -70,12 +74,75 @@ def make_day_date_labels(
         Date labels in ``YYYYMMDD`` format, one for each input day value.
     """
 
+    if acquisition_dates is not None:
+        acquisition_list = list(acquisition_dates)
+        if len(acquisition_list) == len(day_values):
+            labels: list[str] = []
+            for raw_value in acquisition_list:
+                parsed_value = pd.to_datetime(raw_value, errors="coerce")
+                if pd.notna(parsed_value):
+                    labels.append(parsed_value.strftime("%Y%m%d"))
+                else:
+                    labels.append(str(raw_value))
+            return labels
+
     reference_date = pd.to_datetime(start_date, format="%Y%m%d")
     labels: list[str] = []
     for day_value in day_values:
         date_value = reference_date + pd.to_timedelta(int(day_value), unit="D")
         labels.append(date_value.strftime("%Y%m%d"))
     return labels
+
+
+def _filter_green_artifacts(
+    day_table: pd.DataFrame,
+    green_artifact_threshold: float,
+) -> tuple[pd.DataFrame, int]:
+    """Drop rows that look like obvious green-channel artifacts."""
+
+    if day_table.empty:
+        return day_table.copy(), 0
+    cleaned = day_table.replace([np.inf, -np.inf], np.nan).dropna(subset=["red", "green"]).copy()
+    if cleaned.empty:
+        return cleaned, 0
+    artifact_mask = cleaned["green"].gt(float(green_artifact_threshold))
+    excluded_count = int(artifact_mask.sum())
+    if excluded_count == 0:
+        return cleaned.reset_index(drop=True), 0
+    return cleaned.loc[~artifact_mask].reset_index(drop=True), excluded_count
+
+
+def _resolve_day_date_labels(
+    roi_metrics: pd.DataFrame,
+    day_values: np.ndarray,
+    start_date: str = "20260511",
+) -> list[str]:
+    """Prefer actual acquisition dates when they are available."""
+
+    if "acquisition_date" in roi_metrics.columns and "day" in roi_metrics.columns:
+        date_lookup = (
+            roi_metrics.loc[:, ["day", "acquisition_date"]]
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna(subset=["day", "acquisition_date"])
+            .assign(
+                day=lambda frame: pd.to_numeric(frame["day"], errors="coerce"),
+                acquisition_date=lambda frame: pd.to_datetime(
+                    frame["acquisition_date"], errors="coerce"
+                ),
+            )
+            .dropna(subset=["day", "acquisition_date"])
+            .drop_duplicates(subset=["day"])
+            .set_index("day")["acquisition_date"]
+            .to_dict()
+        )
+        acquisition_dates = [date_lookup.get(int(day_value)) for day_value in day_values]
+        if all(date is not None and pd.notna(date) for date in acquisition_dates):
+            return make_day_date_labels(
+                day_values,
+                start_date=start_date,
+                acquisition_dates=acquisition_dates,
+            )
+    return make_day_date_labels(day_values, start_date=start_date)
 
 
 def compute_regression_ci_band(
@@ -139,6 +206,7 @@ def plot_daywise_scatter_summary(
     fit_summary: pd.DataFrame,
     output_path: Path,
     start_date: str = "20260511",
+    green_artifact_threshold: float = 1500.0,
 ) -> None:
     """Plot per-day red-vs-green scatters with fitted lines and CI bands.
 
@@ -154,27 +222,86 @@ def plot_daywise_scatter_summary(
         PNG path for the saved scatter summary figure.
     start_date : str, default="20260511"
         Reference date used to convert day offsets into date labels.
+    green_artifact_threshold : float, default=1500.0
+        Rows with corrected green values above this threshold are treated as
+        artifacts and excluded from the fitted lines.
     """
 
-    day_values = fit_summary["day"].to_numpy(dtype=int)
-    date_labels = make_day_date_labels(day_values, start_date=start_date)
+    if roi_metrics.empty:
+        raise ValueError("No ROI metrics were available for scatter plotting.")
 
-    figure, axes = plt.subplots(1, len(day_values), figsize=(22, 4.8), facecolor="white")
+    filtered_metrics, excluded_total = _filter_green_artifacts(
+        roi_metrics,
+        green_artifact_threshold=green_artifact_threshold,
+    )
+    if filtered_metrics.empty:
+        raise ValueError("No ROI metrics remained after filtering green artifacts.")
+    plot_fit_summary = summarize_daily_green_red_linear_fits(filtered_metrics)
+    day_values = plot_fit_summary["day"].to_numpy(dtype=int)
+    date_labels = _resolve_day_date_labels(
+        roi_metrics,
+        day_values,
+        start_date=start_date,
+    )
+
+    panels: list[tuple[int, pd.DataFrame, int]] = []
+    x_min = np.inf
+    x_max = -np.inf
+    y_min = np.inf
+    y_max = -np.inf
+    for day_value in day_values:
+        day_table = (
+            roi_metrics.loc[
+                roi_metrics["day"].eq(day_value),
+                [
+                    column
+                    for column in ["red", "green", "track_match_source"]
+                    if column in roi_metrics.columns
+                ],
+            ]
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna(subset=["red", "green"])
+            .reset_index(drop=True)
+        )
+        filtered_day_table, excluded_count = _filter_green_artifacts(
+            day_table,
+            green_artifact_threshold=green_artifact_threshold,
+        )
+        if filtered_day_table.empty and not day_table.empty:
+            filtered_day_table = day_table.copy()
+            excluded_count = 0
+        if not filtered_day_table.empty:
+            x_min = min(x_min, float(filtered_day_table["red"].min()))
+            x_max = max(x_max, float(filtered_day_table["red"].max()))
+            y_min = min(y_min, float(filtered_day_table["green"].min()))
+            y_max = max(y_max, float(filtered_day_table["green"].max()))
+        panels.append((int(day_value), filtered_day_table, excluded_count))
+
+    figure, axes = plt.subplots(
+        1,
+        len(day_values),
+        figsize=(22, 4.8),
+        sharex=True,
+        sharey=True,
+        facecolor="white",
+    )
     if len(day_values) == 1:
         axes = [axes]
 
-    for axis, day_value, date_label in zip(axes, day_values, date_labels, strict=True):
-        day_table = (
-            roi_metrics.loc[roi_metrics["day"] == day_value, ["red", "green"]]
-            .replace([np.inf, -np.inf], np.nan)
-            .dropna()
-            .reset_index(drop=True)
-        )
+    for axis, (day_value, day_table, excluded_count), date_label in zip(
+        axes, panels, date_labels, strict=True
+    ):
         x_values = day_table["red"].to_numpy(dtype=float)
         y_values = day_table["green"].to_numpy(dtype=float)
-        x_grid, y_hat, y_low, y_high = compute_regression_ci_band(x_values, y_values)
+        if len(day_table) >= 2:
+            x_grid, y_hat, y_low, y_high = compute_regression_ci_band(x_values, y_values)
+        else:
+            x_grid = np.asarray([], dtype=float)
+            y_hat = np.asarray([], dtype=float)
+            y_low = np.asarray([], dtype=float)
+            y_high = np.asarray([], dtype=float)
 
-        fit_row = fit_summary.loc[fit_summary["day"] == day_value].iloc[0]
+        fit_row = plot_fit_summary.loc[plot_fit_summary["day"].eq(day_value)].iloc[0]
         axis.scatter(
             x_values,
             y_values,
@@ -184,9 +311,9 @@ def plot_daywise_scatter_summary(
             edgecolors="none",
             rasterized=True,
         )
-        if np.all(np.isfinite(y_low)):
+        if len(x_grid) > 0 and np.all(np.isfinite(y_low)) and np.all(np.isfinite(y_high)):
             axis.fill_between(x_grid, y_low, y_high, color="#8ecae6", alpha=0.35, linewidth=0)
-        axis.plot(x_grid, y_hat, color="#d62828", linewidth=2.0)
+            axis.plot(x_grid, y_hat, color="#d62828", linewidth=2.0)
 
         axis.set_title(f"Day {day_value}\n{date_label}", fontsize=11)
         axis.set_xlabel("Corrected red intensity", fontsize=10)
@@ -201,6 +328,11 @@ def plot_daywise_scatter_summary(
                 f"intercept = {fit_row['intercept']:.1f}\n"
                 f"R² = {fit_row['r_squared']:.3f}\n"
                 f"n = {int(fit_row['n_rois'])}"
+                + (
+                    f"\nexcluded green>{green_artifact_threshold:g}: {excluded_count}"
+                    if excluded_count
+                    else ""
+                )
             ),
             transform=axis.transAxes,
             ha="left",
@@ -208,6 +340,13 @@ def plot_daywise_scatter_summary(
             fontsize=9,
             bbox={"facecolor": "white", "edgecolor": "0.85", "alpha": 0.9},
         )
+
+    if np.isfinite(x_min) and np.isfinite(x_max) and np.isfinite(y_min) and np.isfinite(y_max):
+        x_pad = max((x_max - x_min) * 0.05, 1.0)
+        y_pad = max((y_max - y_min) * 0.05, 1.0)
+        for axis in axes:
+            axis.set_xlim(x_min - x_pad, x_max + x_pad)
+            axis.set_ylim(y_min - y_pad, y_max + y_pad)
 
     figure.suptitle(
         "Day-wise corrected red vs green ROI values with separate linear fits",
@@ -220,7 +359,9 @@ def plot_daywise_scatter_summary(
             "Each panel shows one imaging day from the current mean-merge SAM "
             "size+shape-filtered ROI set. The red line is the fitted linear "
             "relationship between corrected red and green values, and the blue "
-            "band is the 95% confidence interval of the mean fit."
+            "band is the 95% confidence interval of the mean fit. "
+            f"Green values above {green_artifact_threshold:g} were excluded from the fit; "
+            f"total excluded rows = {excluded_total}."
         ),
         ha="center",
         va="bottom",
@@ -234,7 +375,9 @@ def plot_daywise_scatter_summary(
 def plot_fit_parameter_summary(
     fit_summary: pd.DataFrame,
     output_path: Path,
+    roi_metrics: pd.DataFrame | None = None,
     start_date: str = "20260511",
+    green_artifact_threshold: float = 1500.0,
 ) -> None:
     """Plot day-wise slope, intercept, fit quality, and ROI count summaries.
 
@@ -245,12 +388,34 @@ def plot_fit_parameter_summary(
         :func:`summarize_daily_green_red_linear_fits`.
     output_path : pathlib.Path
         PNG path for the saved summary figure.
+    roi_metrics : pandas.DataFrame, optional
+        Raw ROI/day table. When provided, the plotted fit summary is recomputed
+        after excluding rows whose corrected green values exceed
+        ``green_artifact_threshold``.
     start_date : str, default="20260511"
         Reference date used to convert day offsets into date labels.
+    green_artifact_threshold : float, default=1500.0
+        Rows with corrected green values above this threshold are treated as
+        artifacts and excluded from the plotted fit summary.
     """
 
-    day_values = fit_summary["day"].to_numpy(dtype=int)
-    date_labels = make_day_date_labels(day_values, start_date=start_date)
+    plot_fit_summary = fit_summary.copy()
+    excluded_total = 0
+    if roi_metrics is not None and not roi_metrics.empty:
+        filtered_metrics, excluded_total = _filter_green_artifacts(
+            roi_metrics,
+            green_artifact_threshold=green_artifact_threshold,
+        )
+        if not filtered_metrics.empty:
+            plot_fit_summary = summarize_daily_green_red_linear_fits(filtered_metrics)
+            roi_metrics = filtered_metrics
+
+    day_values = plot_fit_summary["day"].to_numpy(dtype=int)
+    date_labels = _resolve_day_date_labels(
+        roi_metrics if roi_metrics is not None else plot_fit_summary,
+        day_values,
+        start_date=start_date,
+    )
     x_positions = np.arange(len(day_values))
 
     figure, axes = plt.subplots(2, 2, figsize=(11, 7.5), facecolor="white")
@@ -258,13 +423,13 @@ def plot_fit_parameter_summary(
 
     slope_axis.errorbar(
         x_positions,
-        fit_summary["slope"].to_numpy(dtype=float),
+        plot_fit_summary["slope"].to_numpy(dtype=float),
         yerr=np.vstack(
             [
-                fit_summary["slope"].to_numpy(dtype=float)
-                - fit_summary["slope_ci_low"].to_numpy(dtype=float),
-                fit_summary["slope_ci_high"].to_numpy(dtype=float)
-                - fit_summary["slope"].to_numpy(dtype=float),
+                plot_fit_summary["slope"].to_numpy(dtype=float)
+                - plot_fit_summary["slope_ci_low"].to_numpy(dtype=float),
+                plot_fit_summary["slope_ci_high"].to_numpy(dtype=float)
+                - plot_fit_summary["slope"].to_numpy(dtype=float),
             ]
         ),
         fmt="o-",
@@ -277,13 +442,13 @@ def plot_fit_parameter_summary(
 
     intercept_axis.errorbar(
         x_positions,
-        fit_summary["intercept"].to_numpy(dtype=float),
+        plot_fit_summary["intercept"].to_numpy(dtype=float),
         yerr=np.vstack(
             [
-                fit_summary["intercept"].to_numpy(dtype=float)
-                - fit_summary["intercept_ci_low"].to_numpy(dtype=float),
-                fit_summary["intercept_ci_high"].to_numpy(dtype=float)
-                - fit_summary["intercept"].to_numpy(dtype=float),
+                plot_fit_summary["intercept"].to_numpy(dtype=float)
+                - plot_fit_summary["intercept_ci_low"].to_numpy(dtype=float),
+                plot_fit_summary["intercept_ci_high"].to_numpy(dtype=float)
+                - plot_fit_summary["intercept"].to_numpy(dtype=float),
             ]
         ),
         fmt="o-",
@@ -296,7 +461,7 @@ def plot_fit_parameter_summary(
 
     r2_axis.plot(
         x_positions,
-        fit_summary["r_squared"].to_numpy(dtype=float),
+        plot_fit_summary["r_squared"].to_numpy(dtype=float),
         "o-",
         color="#2a9d8f",
     )
@@ -306,7 +471,7 @@ def plot_fit_parameter_summary(
 
     n_axis.bar(
         x_positions,
-        fit_summary["n_rois"].to_numpy(dtype=int),
+        plot_fit_summary["n_rois"].to_numpy(dtype=int),
         color="#adb5bd",
         edgecolor="#6c757d",
     )
@@ -324,7 +489,9 @@ def plot_fit_parameter_summary(
         (
             "This summary tracks how the fitted corrected green-vs-red "
             "relationship changes across imaging days for the current mean-merge "
-            "SAM size+shape-filtered ROI set."
+            "SAM size+shape-filtered ROI set. "
+            f"Green values above {green_artifact_threshold:g} were excluded from the plotted fit; "
+            f"total excluded rows = {excluded_total}."
         ),
         ha="center",
         va="bottom",
@@ -470,6 +637,7 @@ def main() -> None:
     plot_fit_parameter_summary(
         fit_summary=fit_summary,
         output_path=parameter_plot_path,
+        roi_metrics=roi_metrics,
     )
 
     shutil.copy2(__file__, output_dir / Path(__file__).name)

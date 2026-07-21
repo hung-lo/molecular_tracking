@@ -51,8 +51,10 @@ def log_message(run_start_seconds: float, message: str) -> None:
 from roi_log_ratio_analysis import (
     compute_green_red_fit_residuals,
     select_ranked_roi_days,
+    select_top_changing_rois,
     summarize_residual_sign_changes,
     summarize_daily_green_red_linear_fits,
+    summarize_roi_metrics,
 )
 
 
@@ -249,7 +251,9 @@ def plot_directional_roi_residuals_vs_day(
 
     day_values = np.sort(ranked_roi_table["day"].unique())
     day_labels = make_day_labels(day_values, start_date=start_date)
-    color_values = plt.cm.viridis(np.linspace(0.0, 1.0, len(day_values)))
+    roi_ids = ranked_roi_table["roi_id"].drop_duplicates().astype(int).tolist()
+    roi_colors = plt.cm.turbo(np.linspace(0.0, 1.0, max(1, len(roi_ids)), endpoint=False))
+    roi_color_map = {roi_id: roi_colors[index] for index, roi_id in enumerate(roi_ids)}
 
     figure, axis = plt.subplots(figsize=(10.0, 7.5), facecolor="white")
     axis.axhline(0.0, color="#d62828", linewidth=1.8, linestyle="--", alpha=0.9, zorder=1)
@@ -259,29 +263,25 @@ def plot_directional_roi_residuals_vs_day(
         x_values = roi_table["day"].to_numpy(dtype=int)
         residual_values = roi_table["green_fit_residual"].to_numpy(dtype=float)
         rank_value = int(roi_table["selection_rank"].iloc[0])
+        roi_color = roi_color_map.get(int(roi_id), "0.35")
 
         axis.plot(
             x_values,
             residual_values,
-            color="0.78",
-            linewidth=1.0,
-            alpha=0.8,
+            color=roi_color,
+            linewidth=1.1,
+            alpha=0.82,
             zorder=2,
         )
-        for point_index, (day_value, residual_value) in enumerate(
-            zip(x_values, residual_values, strict=True)
-        ):
-            axis.plot(
-                day_value,
-                residual_value,
-                color=color_values[point_index],
-                marker="o",
-                linestyle="None",
-                markersize=5.5,
-                markeredgecolor="black",
-                markeredgewidth=0.25,
-                zorder=3,
-            )
+        axis.scatter(
+            x_values,
+            residual_values,
+            s=24,
+            color=roi_color,
+            edgecolors="black",
+            linewidths=0.25,
+            zorder=3,
+        )
 
         axis.text(
             x_values[-1] + 0.03,
@@ -290,33 +290,18 @@ def plot_directional_roi_residuals_vs_day(
             fontsize=7,
             ha="left",
             va="center",
-            color="0.2",
+            color=roi_color,
         )
 
-    legend_handles = [
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            color="none",
-            markerfacecolor=color_values[index],
-            markeredgecolor="black",
-            markeredgewidth=0.25,
-            markersize=5.5,
-            label=f"Day {int(day_value)} ({day_label})",
-        )
-        for index, (day_value, day_label) in enumerate(zip(day_values, day_labels, strict=True))
-    ]
-    legend_handles.append(
-        Line2D([0], [0], color="#d62828", linewidth=1.8, linestyle="--", label="Residual = 0")
+    axis.set_xticks(
+        day_values,
+        [f"Day {int(day)}\n{label}" for day, label in zip(day_values, day_labels, strict=True)],
     )
-    axis.legend(handles=legend_handles, loc="upper right", fontsize=8, frameon=True, ncol=1)
-    axis.set_xticks(day_values, [f"Day {int(day)}\n{label}" for day, label in zip(day_values, day_labels, strict=True)])
     axis.set_xlabel("Imaging day", fontsize=11)
     axis.set_ylabel("Signed green-fit residual", fontsize=11)
     axis.set_title(
-        f"{title_prefix} {direction_label} ROIs: signed residual trajectories\n"
-        "Crossing zero means crossing the day-specific fitted green-red relationship",
+        f"{title_prefix} {direction_label} ROIs: signed residual trajectories by ROI color\n"
+        "Each colored line follows one ROI across days",
         fontsize=13,
     )
     axis.tick_params(labelsize=10)
@@ -327,7 +312,8 @@ def plot_directional_roi_residuals_vs_day(
         (
             "Residual = observed corrected green minus the green value predicted "
             "from that day's fitted red-green line. Positive values are greener "
-            "than expected; negative values are less green than expected."
+            "than expected; negative values are less green than expected. "
+            "Each ROI keeps a fixed color across all days."
         ),
         ha="center",
         va="bottom",
@@ -355,7 +341,7 @@ def write_summary_markdown(
     residual_table_path : pathlib.Path
         CSV file containing the ROI/day residual table.
     top30_table_path : pathlib.Path
-        CSV file containing the selected top-30 decreasing ROI residual table.
+        CSV file containing the selected 30-ROI residual subset.
     scatter_plot_path : pathlib.Path
         PNG file containing the trajectory scatter plot.
     residual_plot_path : pathlib.Path
@@ -369,17 +355,17 @@ def write_summary_markdown(
         "# Day-wise Green-vs-Red Fit Residuals",
         "",
         "Goal: measure how far each ROI sits above or below the day-specific",
-        f"population green-vs-red fit, then visualize the top ranked {direction_label}",
-        "ROIs in corrected red-green space.",
+        f"population green-vs-red fit, then visualize a fixed-seed sampled {direction_label}",
+        "ROI subset in corrected red-green space.",
         "",
         "Key metric:",
         "- `green_fit_residual = observed green - predicted green from that day's fit`",
         "",
         "Outputs:",
         f"- Full ROI/day residual table: `{residual_table_path}`",
-        f"- Top 30 {direction_label} residual subset: `{top30_table_path}`",
-        f"- Top 30 {direction_label} red-green scatter plot: `{scatter_plot_path}`",
-        f"- Top 30 {direction_label} residual-vs-day plot: `{residual_plot_path}`",
+        f"- Sampled 30 {direction_label} residual subset: `{top30_table_path}`",
+        f"- Sampled 30 {direction_label} red-green scatter plot: `{scatter_plot_path}`",
+        f"- Sampled 30 {direction_label} residual-vs-day plot: `{residual_plot_path}`",
         "",
         "Interpretation note:",
         "- A positive residual means the ROI is greener than expected for its red",
@@ -395,8 +381,9 @@ def write_run_log(
     output_dir: Path,
     average_slope: float,
     average_intercept: float,
-    top30_roi_ids: list[int],
+    sampled_roi_ids: list[int],
     direction_label: str,
+    roi_sample_seed: int,
     total_duration_seconds: float,
 ) -> None:
     """Write a short run log for reproducibility.
@@ -409,8 +396,8 @@ def write_run_log(
         Mean slope across the day-wise linear fits.
     average_intercept : float
         Mean intercept across the day-wise linear fits.
-    top30_roi_ids : list[int]
-        ROI IDs included in the plotted top-30 ranked set.
+    sampled_roi_ids : list[int]
+        ROI IDs included in the plotted sampled set.
     direction_label : str
         Human-readable direction label such as ``"decreasing"`` or
         ``"increasing"`` used in the log metadata key.
@@ -422,7 +409,8 @@ def write_run_log(
         f"run_timestamp={datetime.now().isoformat()}",
         f"average_slope={average_slope}",
         f"average_intercept={average_intercept}",
-        f"top30_{direction_label}_roi_ids={','.join(str(roi_id) for roi_id in top30_roi_ids)}",
+        f"sampled_{direction_label}_roi_ids={','.join(str(roi_id) for roi_id in sampled_roi_ids)}",
+        f"roi_sample_seed={int(roi_sample_seed)}",
         f"total_duration_seconds={float(total_duration_seconds):.3f}",
         f"total_duration_hms={format_duration_seconds(total_duration_seconds)}",
     ]
@@ -460,10 +448,6 @@ def run_directional_residual_analysis(
         shape_qc_dir
         / "roi_log_ratio_metrics_size_and_shape_filtered.csv"
     )
-    top30_path = (
-        shape_qc_dir
-        / f"top30_{direction_label}_rois_size_and_shape_filtered.csv"
-    )
     output_root = shape_qc_dir
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = output_root / f"{output_dir_prefix}_{timestamp}"
@@ -487,31 +471,38 @@ def run_directional_residual_analysis(
     fit_summary_path = output_dir / "daywise_green_red_linear_fit_summary.csv"
     fit_summary.to_csv(fit_summary_path, index=False)
 
-    top30_rois = pd.read_csv(top30_path).sort_values("selection_rank").head(30).copy()
-    top30_roi_ids = top30_rois["roi_id"].astype(int).tolist()
+    roi_summary = summarize_roi_metrics(roi_metrics)
+    sampled_rois = select_top_changing_rois(
+        roi_summary=roi_summary,
+        max_rois=30,
+        direction=direction_label,
+        random_sample=True,
+        random_seed=0,
+    )
+    sampled_roi_ids = sampled_rois["roi_id"].astype(int).tolist()
     top30_table = select_ranked_roi_days(
         roi_day_table=full_residual_table,
-        ranking_table=top30_rois,
-        top_n=30,
+        ranking_table=sampled_rois,
+        top_n=len(sampled_rois),
         ranking_columns=["selection_rank", "min_delta_log2_green_over_red"],
     )
     top30_table_path = output_dir / f"top30_{direction_label}_green_red_fit_residuals.csv"
     top30_table.to_csv(top30_table_path, index=False)
-    log_message(run_start_seconds, f"Selected {len(top30_table['roi_id'].unique())} ranked {direction_label} ROIs; rendering plots")
+    log_message(run_start_seconds, f"Selected {len(top30_table['roi_id'].unique())} sampled {direction_label} ROIs; rendering plots")
 
     scatter_plot_path = output_dir / f"top30_{direction_label}_green_red_trajectory_scatter_average_fit.png"
     plot_directional_roi_trajectories_scatter(
         ranked_roi_table=top30_table,
         fit_summary=fit_summary,
         output_path=scatter_plot_path,
-        title_prefix="Top 30",
+        title_prefix="Sampled 30",
         direction_label=direction_label,
     )
     residual_plot_path = output_dir / f"top30_{direction_label}_green_fit_residual_vs_day.png"
     plot_directional_roi_residuals_vs_day(
         ranked_roi_table=top30_table,
         output_path=residual_plot_path,
-        title_prefix="Top 30",
+        title_prefix="Sampled 30",
         direction_label=direction_label,
     )
 
@@ -529,8 +520,9 @@ def run_directional_residual_analysis(
         output_dir=output_dir,
         average_slope=float(fit_summary["slope"].mean()),
         average_intercept=float(fit_summary["intercept"].mean()),
-        top30_roi_ids=top30_roi_ids,
+        sampled_roi_ids=sampled_roi_ids,
         direction_label=direction_label,
+        roi_sample_seed=0,
         total_duration_seconds=total_duration_seconds,
     )
 

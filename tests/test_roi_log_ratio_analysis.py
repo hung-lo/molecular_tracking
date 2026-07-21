@@ -440,6 +440,43 @@ def test_candidate_ranking_can_select_increasing_ratio_rois() -> None:
     assert np.all(selected["selection_direction"] == "increasing")
 
 
+def test_candidate_ranking_can_randomly_sample_a_fixed_subset() -> None:
+    summary = pd.DataFrame(
+        {
+            "roi_id": [1, 2, 3, 4, 5, 6],
+            "day0_brightness": [100.0, 110.0, 120.0, 130.0, 140.0, 150.0],
+            "day0_green": [10.0, 20.0, 20.0, 30.0, 25.0, 35.0],
+            "red_cv": [0.04, 0.05, 0.03, 0.02, 0.06, 0.01],
+            "min_delta_log2_green_over_red": [-0.6, -0.4, -0.2, -0.1, 0.0, 0.1],
+            "max_delta_log2_green_over_red": [0.2, 0.5, 0.7, 0.9, 1.1, 1.4],
+            "delta_log2_range": [0.8, 0.9, 0.9, 1.0, 1.1, 1.3],
+        }
+    )
+
+    first = select_top_changing_rois(
+        summary,
+        max_rois=3,
+        red_cv_max=0.1,
+        min_day0_brightness_quantile=0.0,
+        random_sample=True,
+        random_seed=7,
+    )
+    second = select_top_changing_rois(
+        summary,
+        max_rois=3,
+        red_cv_max=0.1,
+        min_day0_brightness_quantile=0.0,
+        random_sample=True,
+        random_seed=7,
+    )
+
+    pd.testing.assert_frame_equal(first, second)
+    assert len(first) == 3
+    assert set(first["roi_id"]).issubset({1, 2, 3, 4, 5, 6})
+    assert set(first["selection_metric_column"].astype(str)) == {"random_sample"}
+    assert set(first["selection_random_seed"].astype(int)) == {7}
+
+
 def test_size_thresholds_and_size_merge_support_roi_filtering() -> None:
     roi_size_table = pd.DataFrame(
         {

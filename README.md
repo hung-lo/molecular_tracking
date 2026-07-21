@@ -340,6 +340,35 @@ This writes the baseline `high` and `balanced` tables plus the experimental `gra
 
 The graph run also reuses the same automatic QC bundle under `<match-dir>/qc/`, so you can compare the three policy branches in one place.
 
+### Daywise master pipeline
+
+If you want one wrapper that runs graph matching, compares graph vs balanced affine, extracts the graph-policy intensities, propagates the agreement labels, and renders the standard quick plots, use the master runner:
+
+```bash
+uv run python core/run_daywise_master_pipeline.py \
+  --dataset /path/to/dataset_root \
+  --manifest /path/to/daywise_session_manifest.csv \
+  --output-root /path/to/daywise_master_runs \
+  --run-name 20260716_master_v1 \
+  --xy-um-per-px 0.693359375 \
+  --z-um-per-plane 5.0 \
+  --max-pair-gap 2
+```
+
+The most important flags are:
+
+- `--dataset`: the dataset root that contains the daily images and masks.
+- `--manifest`: the daywise session manifest CSV.
+- `--output-root`: where the master run folder should be created.
+- `--run-name`: optional stable folder name for the run.
+- `--xy-um-per-px`, `--z-um-per-plane`, and `--max-pair-gap`: the matching geometry settings.
+
+The master pipeline creates one run directory containing the matching output, the matched ROI extraction tables, the agreement annotations, the quick plots, the wrapped red-vs-green summary figure, and two run-level summaries:
+
+- `run_manifest.json`
+- `SUMMARY.md`
+
+This is an additive entry point. It does not change the existing daywise matcher or the weekly workflow; it just packages the same downstream pieces into a single run directory with agreement labels and a wrapped red-vs-green summary plot.
 ### How it fits the current workflow
 
 - The weekly workflow stays exactly as it is today.

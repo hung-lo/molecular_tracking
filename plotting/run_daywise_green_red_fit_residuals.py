@@ -218,7 +218,7 @@ def plot_directional_roi_trajectories_scatter(
         va="bottom",
         fontsize=9,
     )
-    figure.tight_layout(rect=(0.04, 0.10, 1.0, 0.95))
+    figure.tight_layout(rect=(0.04, 0.14, 1.0, 0.95))
     figure.savefig(output_path, dpi=180)
     plt.close(figure)
 
@@ -251,11 +251,20 @@ def plot_directional_roi_residuals_vs_day(
 
     day_values = np.sort(ranked_roi_table["day"].unique())
     day_labels = make_day_labels(day_values, start_date=start_date)
-    roi_ids = ranked_roi_table["roi_id"].drop_duplicates().astype(int).tolist()
-    roi_colors = plt.cm.turbo(np.linspace(0.0, 1.0, max(1, len(roi_ids)), endpoint=False))
-    roi_color_map = {roi_id: roi_colors[index] for index, roi_id in enumerate(roi_ids)}
+    roi_order = (
+        ranked_roi_table.loc[:, ["roi_id", "selection_rank"]]
+        .drop_duplicates(subset=["roi_id"])
+        .sort_values(["selection_rank", "roi_id"])
+    )
+    roi_colors = plt.cm.viridis(
+        np.linspace(0.08, 0.92, max(1, len(roi_order)), endpoint=True)
+    )
+    roi_color_map = {
+        int(row.roi_id): roi_colors[index]
+        for index, row in enumerate(roi_order.itertuples(index=False))
+    }
 
-    figure, axis = plt.subplots(figsize=(10.0, 7.5), facecolor="white")
+    figure, axis = plt.subplots(figsize=(12.0, 8.0), facecolor="white")
     axis.axhline(0.0, color="#d62828", linewidth=1.8, linestyle="--", alpha=0.9, zorder=1)
 
     for roi_id, roi_table in ranked_roi_table.groupby("roi_id", sort=True):
@@ -293,11 +302,12 @@ def plot_directional_roi_residuals_vs_day(
             color=roi_color,
         )
 
-    axis.set_xticks(
-        day_values,
+    axis.set_xticks(day_values)
+    axis.set_xticklabels(
         [f"Day {int(day)}\n{label}" for day, label in zip(day_values, day_labels, strict=True)],
+        fontsize=9,
     )
-    axis.set_xlabel("Imaging day", fontsize=11)
+    axis.tick_params(axis="x", pad=8)
     axis.set_ylabel("Signed green-fit residual", fontsize=11)
     axis.set_title(
         f"{title_prefix} {direction_label} ROIs: signed residual trajectories by ROI color\n"

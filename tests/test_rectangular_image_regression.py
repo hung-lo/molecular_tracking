@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from rectangular_crop import center_crop_zyx
+from registration_helpers import ants_from_zyx
 from affine_overlap_matcher import (
     RestrictedTransform,
     VoxelSpacing,
@@ -12,6 +13,17 @@ from affine_overlap_matcher import (
 )
 from roi_matcher import MatchParams, match_roi_masks
 from run_registered_roi_pipeline import compute_fixed_crop_bounds
+
+
+def test_ants_from_zyx_accepts_rectangular_volume() -> None:
+    ants = pytest.importorskip("ants")
+    shape = (5, 64, 96)
+    image = np.zeros(shape, dtype=np.float32)
+
+    converted = ants_from_zyx(image, ants_module=ants)
+
+    assert tuple(converted.shape) == shape
+    assert tuple(converted.spacing) == (5.0, 710.0 / 1024.0, 710.0 / 1024.0)
 
 
 def test_center_crop_supports_rectangular_volume() -> None:

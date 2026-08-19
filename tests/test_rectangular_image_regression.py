@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from rectangular_crop import center_crop_zyx
 from affine_overlap_matcher import (
     RestrictedTransform,
     VoxelSpacing,
@@ -11,6 +12,22 @@ from affine_overlap_matcher import (
 )
 from roi_matcher import MatchParams, match_roi_masks
 from run_registered_roi_pipeline import compute_fixed_crop_bounds
+
+
+def test_center_crop_supports_rectangular_volume() -> None:
+    image = np.arange(7 * 93 * 157, dtype=np.int64).reshape(7, 93, 157)
+    cropped = center_crop_zyx(image, (61, 121))
+
+    assert cropped.shape == (7, 61, 121)
+    assert np.array_equal(cropped, image[:, 16:77, 18:139])
+
+
+def test_center_crop_rejects_invalid_rectangular_dimensions() -> None:
+    image = np.zeros((7, 93, 157), dtype=np.uint8)
+    with pytest.raises(ValueError, match="does not fit"):
+        center_crop_zyx(image, (94, 121))
+    with pytest.raises(ValueError, match="does not fit"):
+        center_crop_zyx(image, (61, 158))
 
 
 def test_crop_bounds_support_independent_rectangular_dimensions() -> None:

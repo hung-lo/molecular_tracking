@@ -262,6 +262,15 @@ def compute_fixed_crop_bounds(
     """
 
     image_height, image_width = image_shape_yx
+    if image_height <= 0 or image_width <= 0:
+        raise ValueError("image_shape_yx must contain positive dimensions.")
+    if crop_height_px <= 0 or crop_width_px <= 0:
+        raise ValueError("crop_height_px and crop_width_px must be positive.")
+    if crop_height_px > image_height or crop_width_px > image_width:
+        raise ValueError(
+            "Requested crop dimensions must not exceed the image dimensions "
+            f"(crop={(crop_height_px, crop_width_px)}, image={(image_height, image_width)})."
+        )
 
     y_start = int(round(y_center - crop_height_px / 2))
     y_stop = y_start + int(crop_height_px)

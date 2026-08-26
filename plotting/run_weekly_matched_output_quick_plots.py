@@ -304,7 +304,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional root directory for the quick-plot exports; policy-specific subfolders are created beneath it.",
     )
-    parser.add_argument("--start-date", default="20260511", help="Reference date in YYYYMMDD format.")
+    parser.add_argument("--start-date", default=None, help="Reference date in YYYYMMDD format.")
     parser.add_argument("--top-n", type=int, default=30, help="Number of top increasing/decreasing clusters to plot.")
     parser.add_argument(
         "--policy",

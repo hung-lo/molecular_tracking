@@ -1,4 +1,5 @@
 import json
+import pytest
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -83,25 +84,20 @@ def make_long_table() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def test_resolve_dataset_dir_supports_default_and_aliases() -> None:
-    project_root = Path("/mnt/d/_data/_newAAV_2026/Fucci-Tri_avg_images")
+def test_resolve_dataset_dir_requires_explicit_path_or_legacy_root(tmp_path: Path) -> None:
+    dataset = tmp_path / "legacy_root" / "1050_data"
+    dataset.mkdir(parents=True)
+    with pytest.raises(ValueError, match="explicit dataset"):
+        resolve_dataset_dir()
+    assert resolve_dataset_dir(dataset) == dataset.resolve()
+    assert resolve_dataset_dir("1050", legacy_root=dataset.parent) == dataset.resolve()
 
-    assert resolve_dataset_dir().name == "1050_data"
-    assert resolve_dataset_dir("1050") == project_root / "1050_data"
-    assert resolve_dataset_dir("920") == project_root / "920_data"
 
-
-def test_dataset_analysis_helpers_build_expected_subdirectories() -> None:
-    project_root = Path("/mnt/d/_data/_newAAV_2026/Fucci-Tri_avg_images")
-
-    assert get_dataset_analysis_dir("1050") == project_root / "1050_data" / "analysis"
-    assert get_shape_qc_analysis_dir("1050") == (
-        project_root
-        / "1050_data"
-        / "analysis"
-        / "roi_log_ratio_outputs_dark_median_corrected_meanMergeCPSAM_ROIs"
-        / "shape_qc_filter"
-    )
+def test_dataset_analysis_helpers_use_explicit_legacy_root(tmp_path: Path) -> None:
+    dataset = tmp_path / "legacy_root" / "1050_data"
+    dataset.mkdir(parents=True)
+    assert get_dataset_analysis_dir("1050", legacy_root=dataset.parent) == dataset / "analysis"
+    assert get_shape_qc_analysis_dir("1050", legacy_root=dataset.parent) == dataset / "analysis" / "roi_log_ratio_outputs_dark_median_corrected_meanMergeCPSAM_ROIs" / "shape_qc_filter"
 
 
 def test_infer_start_date_from_dataset_dir_uses_earliest_raw_tiff(tmp_path: Path) -> None:

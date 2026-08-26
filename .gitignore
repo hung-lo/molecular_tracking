@@ -24,6 +24,8 @@ env/
 # Local or external data folders
 /1050_data/
 /920_data/
+/config/project.local.toml
+/metadata/generated/
 
 # Regenerated analysis outputs
 /analysis/

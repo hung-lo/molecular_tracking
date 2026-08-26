@@ -594,7 +594,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dataset",
-        default="1050",
+        default=None,
         help="Dataset alias (e.g. 1050 or 920) or an explicit dataset directory path.",
     )
     return parser.parse_args()

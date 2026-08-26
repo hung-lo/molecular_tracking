@@ -1,0 +1,5 @@
+mouse_id,experimental_group,cohort,sex,genotype,viral_constructs,virus_serotypes,virus_promoters,fluorophores,injection_date,injection_site,imaging_region,imaging_hemisphere,raw_mouse_folder,reference_session_or_folder,excluded_sessions_or_special_cases,notes
+Fucci-Tri_1,Fucci-Tri,2026_05,M,WT,Fucci-Tri,AAV9,CNS2_V4-1,AzaleaB5; H2-3; mVenus,,mPFC,mPFC,right,Fucci-Tri_1,,Ignore *_vol10; exclude noncanonical acquisition folders by default,920 acquisition introduced on 20260526
+Fucci-Tri_2,Fucci-Tri,2026_08,M,WT,Fucci-Tri,AAV9,CNS2_V4-1,AzaleaB5; H2-3; mVenus,,mPFC,mPFC,left,Fucci-Tri_2,,Ignore *_vol10,
+Fucci-Dead_1,Fucci-Dead,2026_08,M,WT,Fucci-Tri-Dead-p27ck-,AAV9,CNS2_V4-1,AzaleaB5; H2-3; mVenus,,mPFC,mPFC,left,Fucci-Dead_1,,Ignore *_vol10,
+Fucci-Dead_2,Fucci-Dead,2026_08,M,WT,Fucci-Tri-Dead-p27ck-,AAV9,CNS2_V4-1,AzaleaB5; H2-3; mVenus,,mPFC,mPFC,left,Fucci-Dead_2,,Ignore *_vol10,

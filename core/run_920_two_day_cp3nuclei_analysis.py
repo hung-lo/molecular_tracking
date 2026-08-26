@@ -8,6 +8,7 @@ longer limited to two imaging days.
 from __future__ import annotations
 
 import argparse
+from project_cli import resolve_selection
 
 from run_registered_roi_pipeline import RegisteredPipelineConfig, run_registered_roi_pipeline
 
@@ -31,10 +32,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project-config", default=None)
+    parser.add_argument("--mouse-id", default=None)
     parser.add_argument(
         "--dataset",
-        default="920",
-        help="Dataset alias or explicit dataset directory path. Defaults to the current 920_data dataset.",
+        default=None,
+        help="Explicit legacy 920 dataset directory; alternatively pass --project-config and --mouse-id.",
     )
     parser.add_argument(
         "--start-date",
@@ -111,6 +114,8 @@ def main() -> None:
     """Run the shared registered-space ROI pipeline with 920 nm defaults."""
 
     args = parse_args()
+    context = resolve_selection(dataset=args.dataset, project_config=args.project_config, mouse_id=args.mouse_id, laser_nm=920)
+    args.dataset = str(context.dataset_dir)
     inverse_mask_channel = None if args.inverse_mask_channel == "auto" else args.inverse_mask_channel
     skip_raw_space_validation = True
     if args.enable_raw_space_validation:

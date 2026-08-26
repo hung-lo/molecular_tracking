@@ -1,5 +1,28 @@
 # molecular_tracking
 
+## Multi-mouse project workflow (primary)
+
+Raw ThorImage folders are read-only inputs. Copy `config/project.example.toml` to the ignored
+`config/project.local.toml`, then edit the raw and derivatives roots.
+
+```bash
+python tools/build_data_catalog.py --project-config config/project.local.toml --dry-run
+python tools/build_data_catalog.py --project-config config/project.local.toml --strict
+python tools/build_session_manifest.py --project-config config/project.local.toml --mouse-id Fucci-Tri_1 --laser-nm 1050
+.venv/bin/python core/run_daywise_master_pipeline.py --project-config config/project.local.toml --mouse-id Fucci-Tri_1 --laser-nm 1050
+```
+
+1050 nm is required and primary; 920 nm is optional. Acquisitions containing `_vol10` are
+alignment-only and never enter quantitative manifests. Generated files go under the separate
+derivatives root. Until preprocessing and segmentation products exist, the manifest builder
+writes `session_manifest_plan.csv`, not an analysis-ready manifest. See
+`docs/multi_mouse_workflow.md`.
+
+## Legacy explicit-path workflows
+
+Commands later in this README are retained as legacy examples. They require explicit dataset,
+manifest, match, and output paths and never select a mouse implicitly.
+
 Small repository for ROI and molecular-tracking analysis code with a clean split between reusable logic, plotting scripts, matching utilities, tests, and intentionally kept notebooks.
 
 ## Packages

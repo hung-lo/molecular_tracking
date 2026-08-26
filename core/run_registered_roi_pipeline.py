@@ -1947,7 +1947,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--dataset', default='1050', help='Dataset alias (e.g. 1050 or 920) or an explicit dataset directory path.')
+    parser.add_argument('--dataset', default=None, help='Dataset alias (e.g. 1050 or 920) or an explicit dataset directory path.')
     parser.add_argument('--start-date', default=None, help='Optional reference date in YYYYMMDD format that defines day 0. If omitted, the earliest raw TIFF date in the dataset directory is used.')
     parser.add_argument('--mask-name', required=True, help='ROI mask filename inside the dataset directory.')
     parser.add_argument('--green-dark', type=float, default=319.0, help='Green-channel dark offset in arbitrary fluorescence units.')

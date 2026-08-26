@@ -1,0 +1,18 @@
+# Copy to project.local.toml and edit. Windows equivalents begin D:\\_data\\_newAAV_2026.
+[paths]
+raw_root = "/mnt/d/_data/_newAAV_2026/raw_data"
+derivatives_root = "/mnt/d/_data/_newAAV_2026/molecular_tracking_derivatives"
+mice_csv = "../metadata/mice.csv"
+legacy_fucci_tri_root = "/mnt/d/_data/_newAAV_2026/Fucci-Tri_avg_images"
+[rig]
+primary_laser_nm = 1050
+optional_laser_nm = 920
+pockels_1_laser_nm = 920
+pockels_2_laser_nm = 1050
+chan_a_signal = "green"
+chan_b_signal = "red"
+[canonical_volume]
+imaging_planes = 41
+flyback_planes = 1
+z_step_um = 5.0
+volumes = 50

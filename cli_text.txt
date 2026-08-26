@@ -1,3 +1,6 @@
+# Legacy explicit-path command archive
+# These examples do not select project mice and must be parameterized before use.
+
 ### just a quick cli commands here for me to copy and paste
 
 

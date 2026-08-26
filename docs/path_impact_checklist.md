@@ -1,19 +1,44 @@
 # Phase 1 path-impact checklist
 
-Status for the authoritative audit:
+- `core/analysis_paths.py`: updated; no source-directory or global-mouse fallback. Explicit
+  legacy paths remain supported, and aliases require an explicit legacy root.
+- `core/project_config.py`, `core/project_cli.py`: added validated, non-nested roots; shared
+  selector; mouse validation; exact-run validation; processed-product resolution; stale-ready
+  manifest checks; selected mouse/laser output containment.
+- `core/run_daywise_master_pipeline.py`: updated for mutually exclusive legacy/project modes,
+  validated automatic manifests, XML spacing and overrides, run-contained extraction work, and
+  complete mouse/catalog/session provenance.
+- `core/run_daywise_matched_roi_pipeline.py`: updated for shared project selection and an
+  explicit output root. Legacy dataset/manifest/match paths remain supported.
+- `core/run_registered_roi_pipeline.py`: updated; project mode resolves only a prepared
+  `registered` product and writes under selected derivatives runs. Legacy explicit paths remain.
+- `core/run_weekly_matched_roi_pipeline.py`: updated; project mode resolves only a prepared
+  `weekly_registered` product. Legacy explicit paths remain.
+- `core/run_920_two_day_cp3nuclei_analysis.py`: updated; explicit legacy mode is valid even
+  though the wrapper forces 920, while project mode validates a usable prepared 920 product.
+- `core/roi_log_ratio_analysis.py`: updated; reusable reference dates are explicit/nullable.
+- Residual, linear-summary, raw-space, and quick-plot CLIs under `plotting/`: updated for exact
+  analysis/run selection; project inputs are validated against an explicit config/mouse/laser;
+  no latest-run selection exists. Legacy exact inputs remain supported.
+- `plotting/raw_space_triplet_panels.py` and `plotting/shared_raw_space_group_panel.py`: updated;
+  reusable dates are explicit/nullable.
+- `notebooks/weeklyRegister_20260531.ipynb`: setup/path cell now requires config, mouse, and
+  laser; all paths are derivative paths and ANTs calls receive XML-derived ZYX spacing. Crop,
+  `genericLabel`, and geometry logic is retained.
+- `notebooks/cellposeSAM_batch_segmentation_20260712.ipynb`: setup/input/output cell now uses
+  explicit project selection and derivative preprocessing/segmentation paths.
+- Four historical analysis notebooks: intentionally retained as legacy/reference notebooks with
+  prominent first-cell warnings; no mouse is inferred.
+- `tests/test_roi_log_ratio_analysis.py`: old global-root assertions replaced by explicit-path
+  compatibility tests; synthetic dates are now passed explicitly.
+- `tests/test_roi_matcher.py`: optional real-data test is gated by
+  `MOLECULAR_TRACKING_REAL_MATCHER_DIR`; synthetic tests remain the CI requirement.
+- `README.md`, `cli_text.txt`, `.gitignore`, and `examples/README.md`: updated; project workflow is
+  primary, old commands are labeled legacy, and local config/generated metadata are ignored.
+- `examples/daywise_session_manifest.csv`: intentionally retained as a labeled synthetic
+  legacy-format example.
+- Low-level matching CLIs under `matching/`: intentionally unchanged exact-path tools.
 
-- `core/analysis_paths.py`: updated to require explicit paths or an explicit legacy root.
-- `core/project_cli.py`: added shared mutually-exclusive selection and raw-safe output contract.
-- `core/run_daywise_master_pipeline.py`, matched/registered/weekly/920 wrappers: legacy explicit
-  paths remain supported; full project-mode wiring is pending final integration.
-- Plotting entry points and reusable reference-date defaults: audited; project exact-run wiring
-  and removal of historical defaults remain pending final integration.
-- Matching engines: intentionally unchanged because they already consume explicit paths.
-- Operational and historical notebooks: retained unchanged pending targeted cell-only edits.
-- Tests: new config, selector, XML, and catalog-focused synthetic coverage added; old path
-  assertions still require conversion.
-- `README.md`, `cli_text.txt`, examples, and `.gitignore`: audited; detailed workflow docs were
-  added, with existing primary docs still pending consolidation.
-
-This checklist intentionally does not claim complete Phase 1 integration while those pending
-items remain.
+Phase 1 performs logical discovery and derivative catalog/manifest preparation only. Physical
+data migration and preprocessing execution remain separate future operations requiring a dry-run
+plan and explicit approval. Raw ThorImage folders are never moved or rewritten.

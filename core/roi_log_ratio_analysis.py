@@ -6,14 +6,14 @@ import numpy as np
 import pandas as pd
 
 
-def extract_day_from_image_name(image_name: str, start_date: str = "20260511") -> int:
+def extract_day_from_image_name(image_name: str, start_date: str | None = None) -> int:
     """Convert an image filename into a day index.
 
     Parameters
     ----------
     image_name : str
         Filename with an 8-digit date prefix such as ``20260511_R.tif``.
-    start_date : str, default="20260511"
+    start_date : str, default=None
         Reference date in ``YYYYMMDD`` format that defines day 0.
 
     Returns
@@ -22,6 +22,8 @@ def extract_day_from_image_name(image_name: str, start_date: str = "20260511") -
         Integer day offset relative to ``start_date`` in units of days.
     """
 
+    if start_date is None:
+        raise ValueError("A reference start_date is required for data without acquisition-date metadata.")
     date_key = image_name.split("_")[0]
     image_date = pd.to_datetime(date_key, format="%Y%m%d")
     reference_date = pd.to_datetime(start_date, format="%Y%m%d")
@@ -31,7 +33,7 @@ def extract_day_from_image_name(image_name: str, start_date: str = "20260511") -
 def wide_table_from_long_table(
     intensity_table: pd.DataFrame,
     intensity_column: str = "mean_intensity_corrected",
-    start_date: str = "20260511",
+    start_date: str | None = None,
 ) -> pd.DataFrame:
     """Pivot a long ROI intensity table into one row per ROI and day.
 
@@ -42,7 +44,7 @@ def wide_table_from_long_table(
         column. Intensities are arbitrary fluorescence units per ROI.
     intensity_column : str, default="mean_intensity_corrected"
         Column name that contains the per-ROI intensity value to analyze.
-    start_date : str, default="20260511"
+    start_date : str, default=None
         Reference date in ``YYYYMMDD`` format for computing day indices when the
         table does not already include a ``day`` column.
 
@@ -1473,7 +1475,7 @@ def _parse_dated_channel_tiff_name(
 def build_registered_image_lookup(
     image_dir: str | Path,
     channels: tuple[str, ...] = ("red", "green"),
-    start_date: str = "20260511",
+    start_date: str | None = None,
     day0_mode: str = "raw",
 ) -> dict[tuple[int, str], Path]:
     """Map each day and channel to the corresponding registered TIFF file.
@@ -1486,7 +1488,7 @@ def build_registered_image_lookup(
         such as ``20260511_R_crop_256_SyN.tif``.
     channels : tuple[str, ...], default=("red", "green")
         Channel names to include. Supported names are ``"red"`` and ``"green"``.
-    start_date : str, default="20260511"
+    start_date : str, default=None
         Reference date in ``YYYYMMDD`` format that defines day 0 for this
         dataset.
     day0_mode : {"raw", "syn"}, default="raw"
@@ -1535,7 +1537,7 @@ def build_registered_image_lookup(
 def build_raw_image_lookup(
     image_dir: str | Path,
     channels: tuple[str, ...] = ("red", "green"),
-    start_date: str = "20260511",
+    start_date: str | None = None,
 ) -> dict[tuple[int, str], Path]:
     """Map each day and channel to the corresponding raw TIFF file.
 
@@ -1546,7 +1548,7 @@ def build_raw_image_lookup(
         ``20260512_R.tif`` and ``20260512_G.tif``.
     channels : tuple[str, ...], default=("red", "green")
         Channel names to include. Supported names are ``"red"`` and ``"green"``.
-    start_date : str, default="20260511"
+    start_date : str, default=None
         Reference date in ``YYYYMMDD`` format that defines day 0 for this
         dataset.
 
@@ -1584,7 +1586,7 @@ def build_inverse_warped_mask_lookup(
     day0_mask_name: str = "mean_image_merge_cp_masks_SAM.tif",
     inverse_mask_suffix: str = "_ROI_mask_SyN_inversed.tif",
     preferred_channel: str | None = None,
-    start_date: str = "20260511",
+    start_date: str | None = None,
 ) -> dict[int, Path]:
     """Map each day to the ROI mask defined in that day's raw image space.
 
@@ -1603,7 +1605,7 @@ def build_inverse_warped_mask_lookup(
         Optional channel preference used when more than one inverse-warped mask
         exists for the same day. When ``None``, the lookup requires at most one
         matching inverse mask per day.
-    start_date : str, default="20260511"
+    start_date : str, default=None
         Reference date in ``YYYYMMDD`` format that defines day 0 for this
         dataset.
 

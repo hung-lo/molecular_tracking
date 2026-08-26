@@ -11,3 +11,4 @@ def test_rectangular_metadata_and_ramp_values():
     m=parse_experiment_xml(FIXTURES/"rectangular_920.xml")
     assert (m.pixel_x,m.pixel_y,m.width_um,m.height_um)==(1536,768,1065,532.5)
     assert m.pockels[0].start==80 and m.pockels[1].stop==0
+    assert len(m.pockels) == 4

@@ -109,8 +109,8 @@ def test_infer_start_date_from_dataset_dir_uses_earliest_raw_tiff(tmp_path: Path
 
 
 def test_extract_day_from_image_name() -> None:
-    assert extract_day_from_image_name("20260511_R.tif") == 0
-    assert extract_day_from_image_name("20260515_G_SyN.tif") == 4
+    assert extract_day_from_image_name("20260511_R.tif", start_date="20260511") == 0
+    assert extract_day_from_image_name("20260515_G_SyN.tif", start_date="20260511") == 4
 
 
 def test_build_registered_image_lookup_supports_custom_start_date(tmp_path: Path) -> None:
@@ -203,7 +203,7 @@ def test_extract_registered_dataset_roi_intensity_table_handles_two_day_dataset(
 
 def test_filter_complete_rois_keeps_only_full_day_rois() -> None:
     long_table = make_long_table()
-    wide_table = wide_table_from_long_table(long_table)
+    wide_table = wide_table_from_long_table(long_table, start_date="20260511")
     filtered = filter_complete_rois(wide_table)
 
     assert set(filtered["roi_id"].unique()) == {1, 2}
@@ -262,7 +262,7 @@ def test_infer_default_inverse_mask_channel_uses_dataset_aliases() -> None:
 
 def test_log_ratio_metrics_match_expected_values() -> None:
     long_table = make_long_table()
-    wide_table = filter_complete_rois(wide_table_from_long_table(long_table))
+    wide_table = filter_complete_rois(wide_table_from_long_table(long_table, start_date="20260511"))
     metrics = compute_log_ratio_metrics(wide_table, epsilon=1.0)
 
     roi1_day0 = metrics[(metrics["roi_id"] == 1) & (metrics["day"] == 0)].iloc[0]
@@ -282,7 +282,7 @@ def test_log_ratio_metrics_match_expected_values() -> None:
 
 def test_day0_normalized_delta_is_zero_on_day0() -> None:
     long_table = make_long_table()
-    wide_table = filter_complete_rois(wide_table_from_long_table(long_table))
+    wide_table = filter_complete_rois(wide_table_from_long_table(long_table, start_date="20260511"))
     metrics = compute_log_ratio_metrics(wide_table, epsilon=1.0)
 
     day0_rows = metrics[metrics["day"] == 0]
@@ -291,7 +291,7 @@ def test_day0_normalized_delta_is_zero_on_day0() -> None:
 
 def test_green_values_can_be_normalized_to_day0() -> None:
     long_table = make_long_table()
-    wide_table = filter_complete_rois(wide_table_from_long_table(long_table))
+    wide_table = filter_complete_rois(wide_table_from_long_table(long_table, start_date="20260511"))
     metrics = compute_log_ratio_metrics(wide_table, epsilon=1.0)
     normalized = add_day0_normalized_column(metrics, source_column="green")
 
@@ -393,7 +393,7 @@ def test_roi_mean_extraction_without_zero_exclusion_keeps_all_rois() -> None:
 
 def test_candidate_ranking_prefers_large_green_drop_with_stable_red() -> None:
     long_table = make_long_table()
-    wide_table = filter_complete_rois(wide_table_from_long_table(long_table))
+    wide_table = filter_complete_rois(wide_table_from_long_table(long_table, start_date="20260511"))
     metrics = compute_log_ratio_metrics(wide_table, epsilon=1.0)
     summary = summarize_roi_metrics(metrics)
     selected = select_top_changing_rois(
@@ -578,7 +578,7 @@ def test_build_inverse_warped_mask_lookup_maps_day0_and_moving_days(tmp_path) ->
     day1_mask.write_bytes(b"")
     day2_mask.write_bytes(b"")
 
-    lookup = build_inverse_warped_mask_lookup(tmp_path)
+    lookup = build_inverse_warped_mask_lookup(tmp_path, start_date="20260511")
 
     assert lookup[0] == day0_mask
     assert lookup[1] == day1_mask
@@ -594,7 +594,7 @@ def test_build_raw_image_lookup_ignores_registered_images(tmp_path) -> None:
     for path in [raw_day0_red, raw_day1_red, raw_day1_green, registered_red, mean_image]:
         path.write_bytes(b"")
 
-    lookup = build_raw_image_lookup(tmp_path)
+    lookup = build_raw_image_lookup(tmp_path, start_date="20260511")
 
     assert lookup[(0, "red")] == raw_day0_red
     assert lookup[(1, "red")] == raw_day1_red
@@ -656,6 +656,7 @@ def test_render_raw_space_triplet_panel_writes_expected_number_of_tiles(tmp_path
 
     metadata_rows = render_raw_space_triplet_panel(
         roi_id=5,
+        start_date="20260511",
         raw_stack_lookup=raw_stack_lookup,
         mask_stack_lookup=mask_stack_lookup,
         output_path=output_path,
@@ -710,6 +711,7 @@ def test_render_shared_raw_space_group_panel_writes_shared_fov_panel(tmp_path: P
 
     metadata_rows = render_shared_raw_space_group_panel(
         roi_ids=[10, 20],
+        start_date="20260511",
         raw_stack_lookup=raw_stack_lookup,
         mask_stack_lookup={0: mask0, 1: mask1},
         output_path=output_path,

@@ -26,6 +26,7 @@ for _import_dir in (
 
 
 from analysis_paths import get_dataset_analysis_dir, resolve_dataset_dir
+from project_cli import add_project_selector, catalog_spacing, resolve_processed_dataset, resolve_selection
 from roi_log_ratio_analysis import (
     apply_channel_dark_correction,
     build_registered_image_lookup,
@@ -49,6 +50,7 @@ class WeeklyMatchedPipelineConfig:
 
     dataset: str
     match_csv: str
+    output_root: str | None = None
     start_date: str | None = None
     week_mask_template: str = "{week_name}_average_cp_masks.tif"
     green_dark: float = 319.0
@@ -397,7 +399,7 @@ def run_weekly_matched_roi_pipeline(config: WeeklyMatchedPipelineConfig) -> Path
     effective_start_date = config.start_date or infer_start_date_from_dataset_dir(dataset_dir)
     config = WeeklyMatchedPipelineConfig(**{**asdict(config), "start_date": effective_start_date})
 
-    analysis_root = get_dataset_analysis_dir(config.dataset)
+    analysis_root = Path(config.output_root).expanduser().resolve() if config.output_root else get_dataset_analysis_dir(config.dataset)
     analysis_root.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = analysis_root / f"weekly_matched_roi_pipeline_{match_csv_path.stem}_{timestamp}"
@@ -548,11 +550,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments for the weekly matched ROI pipeline."""
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--dataset",
-        required=True,
-        help="Dataset alias or explicit dataset directory path.",
-    )
+    add_project_selector(parser)
     parser.add_argument(
         "--match-csv",
         required=True,
@@ -578,8 +576,12 @@ def main() -> None:
     """Run the weekly matched ROI pipeline from the command line."""
 
     args = parse_args()
+    context=resolve_selection(dataset=args.dataset,project_config=args.project_config,mouse_id=args.mouse_id,laser_nm=args.laser_nm)
+    args.dataset=str(resolve_processed_dataset(context,product_name="weekly_registered"))
+    output_root=str(context.analysis_dir) if context.mode == "project" else None
     config = WeeklyMatchedPipelineConfig(
         dataset=args.dataset,
+        output_root=output_root,
         match_csv=args.match_csv,
         start_date=args.start_date,
         week_mask_template=args.week_mask_template,

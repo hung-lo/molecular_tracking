@@ -31,6 +31,7 @@ for _import_dir in (
 
 
 from analysis_paths import get_shape_qc_analysis_dir, resolve_dataset_dir
+from project_cli import add_project_selector, resolve_exact_analysis_dir, resolve_selection
 
 
 def format_duration_seconds(duration_seconds: float) -> str:
@@ -68,7 +69,7 @@ def make_day_labels(
     ----------
     day_values : numpy.ndarray
         One-dimensional integer array of day offsets relative to ``start_date``.
-    start_date : str, default="20260511"
+    start_date : str, default=None
         Reference date in ``YYYYMMDD`` format.
 
     Returns
@@ -111,7 +112,7 @@ def plot_directional_roi_trajectories_scatter(
     direction_label : str
         Human-readable direction label such as ``"decreasing"`` or
         ``"increasing"`` used in the plot title.
-    start_date : str, default="20260511"
+    start_date : str, default=None
         Reference date in ``YYYYMMDD`` format used for day labels.
     """
 
@@ -245,7 +246,7 @@ def plot_directional_roi_residuals_vs_day(
     direction_label : str
         Human-readable direction label such as ``"decreasing"`` or
         ``"increasing"`` used in the plot title.
-    start_date : str, default="20260511"
+    start_date : str, default=None
         Reference date in ``YYYYMMDD`` format used for day labels.
     """
 
@@ -431,6 +432,7 @@ def run_directional_residual_analysis(
     dataset: str | Path | None,
     direction_label: str,
     output_dir_prefix: str,
+    analysis_dir: str | Path | None = None,
 ) -> Path:
     """Run the directional residual analysis for one ranked ROI set.
 
@@ -453,7 +455,7 @@ def run_directional_residual_analysis(
     run_start_seconds = time.perf_counter()
     log_message(run_start_seconds, f"Starting {direction_label} green-fit residual analysis | dataset={dataset}")
     base_dir = resolve_dataset_dir(dataset)
-    shape_qc_dir = get_shape_qc_analysis_dir(dataset)
+    shape_qc_dir = Path(analysis_dir).expanduser().resolve() if analysis_dir else get_shape_qc_analysis_dir(dataset)
     metrics_path = (
         shape_qc_dir
         / "roi_log_ratio_metrics_size_and_shape_filtered.csv"
@@ -556,11 +558,8 @@ def parse_args() -> argparse.Namespace:
     """
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--dataset",
-        default=None,
-        help="Dataset alias (e.g. 1050 or 920) or an explicit dataset directory path.",
-    )
+    add_project_selector(parser)
+    parser.add_argument("--analysis-dir", default=None, help="Exact project run or analysis directory; never inferred.")
     return parser.parse_args()
 
 
@@ -568,10 +567,13 @@ def main() -> None:
     """Run the day-wise green-vs-red residual analysis for decreasing ROIs."""
 
     args = parse_args()
+    context=resolve_selection(dataset=args.dataset,project_config=args.project_config,mouse_id=args.mouse_id,laser_nm=args.laser_nm)
+    analysis_dir=resolve_exact_analysis_dir(context,args.analysis_dir) if context.mode == "project" or args.analysis_dir else None
     run_directional_residual_analysis(
         dataset=args.dataset,
         direction_label="decreasing",
         output_dir_prefix="daywise_green_red_fit_residuals",
+        analysis_dir=analysis_dir,
     )
 
 

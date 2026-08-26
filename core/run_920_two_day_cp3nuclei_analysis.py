@@ -8,7 +8,7 @@ longer limited to two imaging days.
 from __future__ import annotations
 
 import argparse
-from project_cli import resolve_selection
+from project_cli import add_project_selector, catalog_spacing, resolve_processed_dataset, resolve_selection
 
 from run_registered_roi_pipeline import RegisteredPipelineConfig, run_registered_roi_pipeline
 
@@ -32,13 +32,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project-config", default=None)
-    parser.add_argument("--mouse-id", default=None)
-    parser.add_argument(
-        "--dataset",
-        default=None,
-        help="Explicit legacy 920 dataset directory; alternatively pass --project-config and --mouse-id.",
-    )
+    add_project_selector(parser)
     parser.add_argument(
         "--start-date",
         default=None,
@@ -114,8 +108,14 @@ def main() -> None:
     """Run the shared registered-space ROI pipeline with 920 nm defaults."""
 
     args = parse_args()
+    if args.laser_nm is not None and args.laser_nm != 920: raise ValueError("This compatibility wrapper always uses laser_nm=920.")
     context = resolve_selection(dataset=args.dataset, project_config=args.project_config, mouse_id=args.mouse_id, laser_nm=920)
-    args.dataset = str(context.dataset_dir)
+    args.dataset = str(resolve_processed_dataset(context, product_name="registered"))
+    if context.mode == "project":
+        catalog_x, catalog_y, catalog_z = catalog_spacing(context)
+        if catalog_x != catalog_y: raise ValueError("Registered compatibility pipeline requires equal X/Y spacing")
+        args.xy_um_per_px=catalog_x
+        args.z_um_per_plane=catalog_z
     inverse_mask_channel = None if args.inverse_mask_channel == "auto" else args.inverse_mask_channel
     skip_raw_space_validation = True
     if args.enable_raw_space_validation:

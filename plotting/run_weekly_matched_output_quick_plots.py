@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import argparse
+import json
 import sys
 import time
 
@@ -21,6 +22,7 @@ for _import_dir in (
         sys.path.append(_import_dir_str)
 
 
+from project_cli import add_project_selector, resolve_analysis_selection
 from roi_log_ratio_analysis import (
     select_ranked_roi_days,
     select_top_changing_rois,
@@ -130,7 +132,7 @@ def _resolve_output_dir(analysis_dir: Path, output_dir: str | Path | None, polic
 
 def build_quick_plots(
     analysis_dir: str | Path,
-    start_date: str = "20260511",
+    start_date: str | None = None,
     top_n: int = 30,
     policy: str = "high",
     output_dir: str | Path | None = None,
@@ -139,6 +141,24 @@ def build_quick_plots(
 
     run_start_seconds = time.perf_counter()
     analysis_dir = Path(analysis_dir)
+    if start_date is None:
+        metadata_candidates = [analysis_dir / "run_manifest.json", analysis_dir.parent / "run_manifest.json", analysis_dir / "run_log.json"]
+        for metadata_path in metadata_candidates:
+            if not metadata_path.is_file():
+                continue
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            first_date = payload.get("manifest", {}).get("first_date") or payload.get("start_date")
+            if first_date:
+                start_date = str(first_date).replace("-", "")
+                break
+        if start_date is None:
+            resolved_manifest = analysis_dir / "session_manifest_resolved.csv"
+            if resolved_manifest.is_file():
+                manifest_frame = pd.read_csv(resolved_manifest)
+                if "acquisition_date" in manifest_frame and not manifest_frame.empty:
+                    start_date = str(manifest_frame["acquisition_date"].min()).replace("-", "")
+        if start_date is None:
+            raise ValueError("No reference-date metadata was found; pass --start-date for this legacy output.")
     log_message(run_start_seconds, f"Starting matched ROI quick plots | analysis_dir={analysis_dir}")
     metrics_path = _first_existing_path(
         analysis_dir,
@@ -298,6 +318,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI args for the quick-plot renderer."""
 
     parser = argparse.ArgumentParser(description=__doc__)
+    add_project_selector(parser)
     parser.add_argument("--analysis-dir", required=True, help="Completed matched ROI analysis output directory.")
     parser.add_argument(
         "--output-dir",
@@ -319,8 +340,9 @@ def main() -> None:
     """Render quick QC plots from an existing analysis output directory."""
 
     args = parse_args()
+    _context, analysis_dir = resolve_analysis_selection(analysis_dir=args.analysis_dir,dataset=args.dataset,project_config=args.project_config,mouse_id=args.mouse_id,laser_nm=args.laser_nm)
     output_dir = build_quick_plots(
-        analysis_dir=args.analysis_dir,
+        analysis_dir=analysis_dir,
         start_date=args.start_date,
         top_n=args.top_n,
         policy=args.policy,

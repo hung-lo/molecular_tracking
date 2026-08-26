@@ -53,7 +53,7 @@ for _import_dir in (
 
 from affine_overlap_matcher import AffineOverlapParams, VoxelSpacing
 from analysis_paths import get_dataset_analysis_dir, resolve_dataset_dir
-from project_cli import catalog_spacing, ready_manifest_path, resolve_selection
+from project_cli import catalog_path, catalog_spacing, file_sha256, ready_manifest_path, resolve_selection, selected_catalog_rows, selected_mouse_metadata
 from run_daywise_graph_matching import run_daywise_graph_matching
 from run_daywise_green_red_linear_fit_summary import compute_regression_ci_band
 from roi_log_ratio_analysis import summarize_daily_green_red_linear_fits
@@ -83,6 +83,8 @@ class MasterPipelineConfig:
     manifest: str
     output_root: str | None = None
     run_name: str | None = None
+    mode: str = "legacy"
+    project_provenance: dict[str, Any] | None = None
     xy_um_per_px: float = 710.0 / 1024.0
     z_um_per_plane: float = 5.0
     max_pair_gap: int = 2
@@ -845,6 +847,7 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
                 dataset=str(dataset_dir),
                 manifest=str(manifest_path),
                 match_dir=str(match_dir),
+                output_root=str(run_dir / "extraction_work"),
                 policies=("graph",),
                 green_dark=float(config.green_dark),
                 red_dark=float(config.red_dark),
@@ -903,6 +906,9 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
     total_seconds = time.perf_counter() - start_seconds
     run_manifest = {
         "master_runner_version": MASTER_RUNNER_VERSION,
+        "mode": config.mode,
+        "project": config.project_provenance,
+        **(config.project_provenance or {}),
         "run_started_local": datetime.now().astimezone().isoformat(),
         "run_finished_utc": finished_utc,
         "duration_seconds": float(total_seconds),
@@ -1002,13 +1008,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> Path:
     args = parse_args(argv)
     context = resolve_selection(dataset=args.dataset, project_config=args.project_config, mouse_id=args.mouse_id, laser_nm=args.laser_nm, output_root=args.output_root)
+    requested_manifest=args.manifest
+    requested_xy=args.xy_um_per_px
+    requested_z=args.z_um_per_plane
     if context.project_config is not None:
+        if requested_manifest is not None: raise ValueError("Project mode selects its validated manifest automatically; do not pass --manifest.")
         args.dataset = str(context.dataset_dir)
         args.manifest = str(ready_manifest_path(context))
         args.output_root = str(context.analysis_dir)
-        catalog_xy, catalog_z = catalog_spacing(context)
+        catalog_x, catalog_y, catalog_z = catalog_spacing(context)
+        if catalog_x != catalog_y: raise ValueError("Master pipeline currently requires equal catalog X/Y spacing")
+        catalog_xy=catalog_x
+        mouse_meta=selected_mouse_metadata(context)
+        selected_rows=selected_catalog_rows(context)
+        source_catalog=catalog_path(context)
+        companion=Path(args.manifest).with_name("manifest_metadata.json")
+        project_provenance={"mouse_id":context.mouse_id,"experimental_group":mouse_meta.get("experimental_group"),"cohort":mouse_meta.get("cohort"),"viral_constructs":mouse_meta.get("viral_constructs"),"laser_nm":context.laser_nm,"source_catalog_path":str(source_catalog),"source_catalog_sha256":file_sha256(source_catalog),"source_manifest_path":str(args.manifest),"manifest_metadata_path":str(companion),"selected_session_ids":[row["session_id"] for row in selected_rows],"selected_acquisition_ids":[row["acquisition_id"] for row in selected_rows],"catalog_spacing_um":{"x":catalog_x,"y":catalog_y,"z":catalog_z},"spacing_overrides_um":{"xy":requested_xy,"z":requested_z}}
         args.xy_um_per_px = catalog_xy if args.xy_um_per_px is None else args.xy_um_per_px
         args.z_um_per_plane = catalog_z if args.z_um_per_plane is None else args.z_um_per_plane
+        project_provenance["effective_spacing_um"]={"x":args.xy_um_per_px,"y":args.xy_um_per_px,"z":args.z_um_per_plane}
     elif args.xy_um_per_px is None or args.z_um_per_plane is None:
         args.xy_um_per_px = 710.0 / 1024.0 if args.xy_um_per_px is None else args.xy_um_per_px
         args.z_um_per_plane = 5.0 if args.z_um_per_plane is None else args.z_um_per_plane
@@ -1023,6 +1041,8 @@ def main(argv: list[str] | None = None) -> Path:
         manifest=args.manifest,
         output_root=args.output_root,
         run_name=args.run_name,
+        mode=context.mode,
+        project_provenance=project_provenance if context.mode == "project" else None,
         xy_um_per_px=args.xy_um_per_px,
         z_um_per_plane=args.z_um_per_plane,
         max_pair_gap=args.max_pair_gap,

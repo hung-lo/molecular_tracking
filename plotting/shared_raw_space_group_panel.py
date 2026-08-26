@@ -51,7 +51,7 @@ class SharedRawSpaceGroupGeometry:
 
 def make_day_date_labels(
     day_values: np.ndarray,
-    start_date: str = "20260511",
+    start_date: str | None = None,
 ) -> list[str]:
     """Convert integer day offsets into ``YYYYMMDD`` labels.
 
@@ -59,7 +59,7 @@ def make_day_date_labels(
     ----------
     day_values : numpy.ndarray
         One-dimensional array of integer day offsets relative to day 0.
-    start_date : str, default="20260511"
+    start_date : str, default=None
         Reference date in ``YYYYMMDD`` format.
 
     Returns
@@ -241,7 +241,7 @@ def render_shared_raw_space_group_panel(
     raw_stack_lookup: dict[tuple[int, str], np.ndarray],
     mask_stack_lookup: dict[int, np.ndarray],
     output_path: Path,
-    start_date: str = "20260511",
+    start_date: str | None = None,
     half_window_z: int = 1,
     crop_pad_xy: int = 20,
     min_crop_size_px: int = 48,
@@ -262,7 +262,7 @@ def render_shared_raw_space_group_panel(
         ``(z, y, x)``.
     output_path : pathlib.Path
         PNG file to create.
-    start_date : str, default="20260511"
+    start_date : str, default=None
         Reference date in ``YYYYMMDD`` format used for day labels.
     half_window_z : int, default=1
         Number of z planes to display above and below the shared centroid

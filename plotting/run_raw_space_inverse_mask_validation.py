@@ -40,6 +40,7 @@ for _import_dir in (
 
 
 from analysis_paths import get_shape_qc_analysis_dir, resolve_dataset_dir
+from project_cli import add_project_selector, resolve_exact_analysis_dir, resolve_processed_dataset, resolve_selection
 from roi_log_ratio_analysis import (
     build_inverse_warped_mask_lookup,
     build_raw_image_lookup,
@@ -548,11 +549,8 @@ def parse_args() -> argparse.Namespace:
     """
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--dataset",
-        default=None,
-        help="Dataset alias (e.g. 1050 or 920) or an explicit dataset directory path.",
-    )
+    add_project_selector(parser)
+    parser.add_argument("--analysis-dir", default=None, help="Exact project run or analysis directory.")
     return parser.parse_args()
 
 
@@ -566,9 +564,11 @@ def main() -> None:
 
     run_start_seconds = time.perf_counter()
     args = parse_args()
+    context=resolve_selection(dataset=args.dataset,project_config=args.project_config,mouse_id=args.mouse_id,laser_nm=args.laser_nm)
+    exact_analysis=resolve_exact_analysis_dir(context,args.analysis_dir) if context.mode == "project" or args.analysis_dir else None
     log_message(run_start_seconds, f"Starting raw-space inverse-mask validation | dataset={args.dataset}")
-    base_dir = resolve_dataset_dir(args.dataset)
-    shape_qc_dir = get_shape_qc_analysis_dir(args.dataset)
+    base_dir = resolve_processed_dataset(context,product_name="registered")
+    shape_qc_dir = exact_analysis if exact_analysis else get_shape_qc_analysis_dir(args.dataset)
     selection_table_path = (
         shape_qc_dir
         / "top30_decreasing_rois_size_and_shape_filtered.csv"

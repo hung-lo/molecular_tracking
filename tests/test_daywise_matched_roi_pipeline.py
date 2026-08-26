@@ -132,7 +132,7 @@ def test_run_daywise_matched_roi_pipeline_accepts_graph_policy(tmp_path: Path) -
     run_log = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
 
     assert set(complete["match_policy"].astype(str)) == {"graph"}
-    assert complete.shape[0] == 4
+    assert complete.shape[0] == 6
     assert set(complete["elapsed_days"].astype(int)) == {0, 1}
     assert set(fit_summary["match_policy"].astype(str)) == {"graph"}
     assert run_log["output_paths"]["matched_daywise_green_red_linear_fit_summary"].endswith("matched_daywise_green_red_linear_fit_summary.csv")

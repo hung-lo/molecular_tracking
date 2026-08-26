@@ -1,3 +1,5 @@
+import os
+import pytest
 from pathlib import Path
 
 import numpy as np
@@ -446,15 +448,18 @@ def test_export_match_tables_writes_track_pair_and_qc_csvs(tmp_path: Path) -> No
 
 
 def test_cropped_syn_masks_produce_nonempty_pairwise_matches_and_track_summary() -> None:
+    real_dir_value = os.environ.get("MOLECULAR_TRACKING_REAL_MATCHER_DIR")
+    if not real_dir_value:
+        pytest.skip("Set MOLECULAR_TRACKING_REAL_MATCHER_DIR to enable the optional real-data matcher test.")
+    real_dir = Path(real_dir_value).expanduser().resolve()
     mask_paths = [
-        Path("/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_256/week1_average_cp_masks_SyN.tif"),
-        Path("/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_256/week2_average_cp_masks_SyN.tif"),
-        Path("/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_256/week3_average_cp_masks_SyN.tif"),
-        Path("/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_256/week4_average_cp_masks.tif"),
+        real_dir / "week1_average_cp_masks_SyN.tif",
+        real_dir / "week2_average_cp_masks_SyN.tif",
+        real_dir / "week3_average_cp_masks_SyN.tif",
+        real_dir / "week4_average_cp_masks.tif",
     ]
-
-    if not all(path.exists() for path in mask_paths):
-        return
+    if not all(path.is_file() for path in mask_paths):
+        pytest.skip(f"Configured real-data matcher directory is incomplete: {real_dir}")
 
     mask_stacks = [tifffile.imread(path) for path in mask_paths]
     tracks, pair_tables, qc_table = match_roi_masks(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 
 from run_daywise_green_red_fit_residuals import run_directional_residual_analysis
+from project_cli import add_project_selector, resolve_exact_analysis_dir, resolve_selection
 
 
 def parse_args() -> argparse.Namespace:
@@ -17,11 +18,8 @@ def parse_args() -> argparse.Namespace:
     """
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--dataset",
-        default=None,
-        help="Dataset alias (e.g. 1050 or 920) or an explicit dataset directory path.",
-    )
+    add_project_selector(parser)
+    parser.add_argument("--analysis-dir", default=None)
     return parser.parse_args()
 
 
@@ -35,10 +33,13 @@ def main() -> None:
     """
 
     args = parse_args()
+    context=resolve_selection(dataset=args.dataset,project_config=args.project_config,mouse_id=args.mouse_id,laser_nm=args.laser_nm)
+    analysis_dir=resolve_exact_analysis_dir(context,args.analysis_dir) if context.mode == "project" or args.analysis_dir else None
     run_directional_residual_analysis(
         dataset=args.dataset,
         direction_label="increasing",
         output_dir_prefix="daywise_green_red_fit_residuals_increasing",
+        analysis_dir=analysis_dir,
     )
 
 

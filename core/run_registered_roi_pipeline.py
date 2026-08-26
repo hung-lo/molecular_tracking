@@ -38,6 +38,7 @@ for _import_dir in (
 
 
 from analysis_paths import get_dataset_analysis_dir, resolve_dataset_dir
+from project_cli import add_project_selector, catalog_spacing, resolve_processed_dataset, resolve_selection
 from roi_log_ratio_analysis import (
     add_day0_normalized_column,
     apply_channel_dark_correction,
@@ -127,7 +128,8 @@ class RegisteredPipelineConfig:
         raw-space validation figures are often the slowest stage.
     """
 
-    dataset: str = "1050"
+    dataset: str
+    output_root: str | None = None
     start_date: str | None = None
     mask_name: str = ""
     green_dark: float = 319.0
@@ -1560,7 +1562,7 @@ def run_registered_roi_pipeline(config: RegisteredPipelineConfig) -> Path:
     base_dir = resolve_dataset_dir(config.dataset)
     effective_start_date = config.start_date or infer_start_date_from_dataset_dir(base_dir)
     config = RegisteredPipelineConfig(**{**asdict(config), "start_date": effective_start_date})
-    analysis_root = get_dataset_analysis_dir(config.dataset)
+    analysis_root = Path(config.output_root).expanduser().resolve() if config.output_root else get_dataset_analysis_dir(config.dataset)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     mask_stem = Path(config.mask_name).stem
     output_dir = analysis_root / f'registered_roi_pipeline_{mask_stem}_{timestamp}'
@@ -1947,7 +1949,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--dataset', default=None, help='Dataset alias (e.g. 1050 or 920) or an explicit dataset directory path.')
+    add_project_selector(parser)
     parser.add_argument('--start-date', default=None, help='Optional reference date in YYYYMMDD format that defines day 0. If omitted, the earliest raw TIFF date in the dataset directory is used.')
     parser.add_argument('--mask-name', required=True, help='ROI mask filename inside the dataset directory.')
     parser.add_argument('--green-dark', type=float, default=319.0, help='Green-channel dark offset in arbitrary fluorescence units.')
@@ -1969,6 +1971,13 @@ def main() -> None:
     """Run the shared registered-space ROI pipeline from the command line."""
 
     args = parse_args()
+    context=resolve_selection(dataset=args.dataset,project_config=args.project_config,mouse_id=args.mouse_id,laser_nm=args.laser_nm)
+    args.dataset=str(resolve_processed_dataset(context,product_name="registered"))
+    output_root=None
+    if context.mode == "project":
+        x_spacing,y_spacing,z_spacing=catalog_spacing(context)
+        if x_spacing != y_spacing: raise ValueError("Registered pipeline requires equal X/Y spacing")
+        args.xy_um_per_px=x_spacing; args.z_um_per_plane=z_spacing; output_root=str(context.analysis_dir)
     inverse_mask_channel = None if args.inverse_mask_channel == 'auto' else args.inverse_mask_channel
     skip_raw_space_validation = True
     if args.enable_raw_space_validation:
@@ -1977,6 +1986,7 @@ def main() -> None:
         skip_raw_space_validation = True
     config = RegisteredPipelineConfig(
         dataset=args.dataset,
+        output_root=output_root,
         start_date=args.start_date,
         mask_name=args.mask_name,
         green_dark=args.green_dark,

@@ -26,6 +26,7 @@ for _import_dir in (_REPO_ROOT / "core", _REPO_ROOT / "matching"):
         sys.path.append(_import_dir_str)
 
 from analysis_paths import get_dataset_analysis_dir, resolve_dataset_dir
+from project_cli import add_project_selector, ready_manifest_path, resolve_selection
 from roi_log_ratio_analysis import (
     apply_channel_dark_correction,
     compute_green_red_fit_residuals,
@@ -68,6 +69,7 @@ class DaywiseMatchedPipelineConfig:
     dataset: str
     manifest: str
     match_dir: str
+    output_root: str | None = None
     policies: tuple[str, ...] = ("high", "balanced")
     green_dark: float = 319.0
     red_dark: float = 534.0
@@ -880,7 +882,7 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
     if list(match_manifest.columns) != expected_columns or not match_manifest.equals(expected_manifest):
         raise ValueError("The resolved manifest in match_dir does not match the provided manifest.")
 
-    output_root = get_dataset_analysis_dir(config.dataset)
+    output_root = Path(config.output_root).expanduser().resolve() if config.output_root else get_dataset_analysis_dir(config.dataset)
     output_root.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = output_root / f"daywise_matched_roi_pipeline_{match_dir.name}_{timestamp}"
@@ -1121,8 +1123,8 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", required=True, help="Dataset alias or explicit dataset directory path.")
-    parser.add_argument("--manifest", required=True, help="Manifest CSV used for matching and extraction.")
+    add_project_selector(parser)
+    parser.add_argument("--manifest", default=None, help="Manifest CSV used for matching and extraction.")
     parser.add_argument("--match-dir", required=True, help="Output directory from matching/run_daywise_roi_matching.py.")
     parser.add_argument("--policies", nargs="+", default=["high", "balanced"], help="Policies to analyze.")
     parser.add_argument("--green-dark", type=float, default=319.0, help="Green-channel dark offset.")
@@ -1142,10 +1144,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> Path:
     args = parse_args(argv)
+    context=resolve_selection(dataset=args.dataset,project_config=args.project_config,mouse_id=args.mouse_id,laser_nm=args.laser_nm)
+    if context.mode == "project":
+        if args.manifest is not None: raise ValueError("Project mode selects its validated manifest automatically; do not pass --manifest.")
+        args.dataset=str(context.dataset_dir); args.manifest=str(ready_manifest_path(context)); args.output_root=str(context.analysis_dir)
+    else:
+        if not args.manifest: raise ValueError("Legacy mode requires explicit --manifest.")
+        args.output_root=None
     config = DaywiseMatchedPipelineConfig(
         dataset=args.dataset,
         manifest=args.manifest,
         match_dir=args.match_dir,
+        output_root=args.output_root,
         policies=tuple(args.policies),
         green_dark=args.green_dark,
         red_dark=args.red_dark,

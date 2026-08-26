@@ -31,6 +31,7 @@ for _import_dir in (
 
 
 from analysis_paths import get_shape_qc_analysis_dir, resolve_dataset_dir
+from project_cli import add_project_selector, resolve_exact_analysis_dir, resolve_selection
 from roi_log_ratio_analysis import summarize_daily_green_red_linear_fits
 
 
@@ -62,7 +63,7 @@ def make_day_date_labels(
     ----------
     day_values : numpy.ndarray
         One-dimensional array of integer day offsets relative to ``start_date``.
-    start_date : str, default="20260511"
+    start_date : str, default=None
         Reference date in ``YYYYMMDD`` format.
     acquisition_dates : sequence of str, optional
         When provided, each entry is parsed as the actual acquisition date for
@@ -220,7 +221,7 @@ def plot_daywise_scatter_summary(
         :func:`summarize_daily_green_red_linear_fits`.
     output_path : pathlib.Path
         PNG path for the saved scatter summary figure.
-    start_date : str, default="20260511"
+    start_date : str, default=None
         Reference date used to convert day offsets into date labels.
     green_artifact_threshold : float, default=1500.0
         Rows with corrected green values above this threshold are treated as
@@ -392,7 +393,7 @@ def plot_fit_parameter_summary(
         Raw ROI/day table. When provided, the plotted fit summary is recomputed
         after excluding rows whose corrected green values exceed
         ``green_artifact_threshold``.
-    start_date : str, default="20260511"
+    start_date : str, default=None
         Reference date used to convert day offsets into date labels.
     green_artifact_threshold : float, default=1500.0
         Rows with corrected green values above this threshold are treated as
@@ -592,11 +593,8 @@ def parse_args() -> argparse.Namespace:
     """
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--dataset",
-        default=None,
-        help="Dataset alias (e.g. 1050 or 920) or an explicit dataset directory path.",
-    )
+    add_project_selector(parser)
+    parser.add_argument("--analysis-dir", default=None, help="Exact project run or analysis directory.")
     return parser.parse_args()
 
 
@@ -605,9 +603,11 @@ def main() -> None:
 
     run_start_seconds = time.perf_counter()
     args = parse_args()
+    context=resolve_selection(dataset=args.dataset,project_config=args.project_config,mouse_id=args.mouse_id,laser_nm=args.laser_nm)
+    exact_analysis=resolve_exact_analysis_dir(context,args.analysis_dir) if context.mode == "project" or args.analysis_dir else None
     log_message(run_start_seconds, f"Starting day-wise green-vs-red linear fit summary | dataset={args.dataset}")
     base_dir = resolve_dataset_dir(args.dataset)
-    shape_qc_dir = get_shape_qc_analysis_dir(args.dataset)
+    shape_qc_dir = exact_analysis if exact_analysis else get_shape_qc_analysis_dir(args.dataset)
     input_metrics_path = (
         shape_qc_dir
         / "roi_log_ratio_metrics_size_and_shape_filtered.csv"

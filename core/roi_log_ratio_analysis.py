@@ -1523,13 +1523,19 @@ def build_registered_image_lookup(
         day = extract_day_from_image_name(path.name, start_date=start_date)
         if day < 0:
             continue
-        if day == 0:
-            if day0_mode == "raw" and not is_syn:
-                lookup[(day, channel)] = path
-            elif day0_mode == "syn" and is_syn:
-                lookup[(day, channel)] = path
-        elif is_syn:
-            lookup[(day, channel)] = path
+
+        selected = (day == 0 and day0_mode == "raw" and not is_syn) or (day == 0 and day0_mode == "syn" and is_syn) or (day > 0 and is_syn)
+        if not selected:
+            continue
+
+        key = (day, channel)
+        existing = lookup.get(key)
+        if existing is not None and existing != path:
+            raise ValueError(
+                f"Duplicate registered image candidates for day {day} channel {channel}: "
+                f"{existing} and {path}"
+            )
+        lookup[key] = path
 
     return lookup
 

@@ -38,7 +38,6 @@ from roi_log_ratio_analysis import (
     summarize_residual_sign_changes,
     wide_table_from_long_table,
 )
-from run_registered_roi_pipeline import infer_start_date_from_dataset_dir
 
 
 ANALYSIS_VERSION = "0.1.0"
@@ -162,6 +161,29 @@ def validate_registered_lookup(
     return required_days
 
 
+def infer_start_date_from_weekly_registered_product(dataset_dir: str | Path) -> str:
+    """Infer the day-0 date from published weekly_registered TIFF filenames."""
+
+    dataset_dir = Path(dataset_dir)
+    candidate_dates: list[str] = []
+    for path in dataset_dir.iterdir():
+        if not path.is_file() or path.suffix.lower() != ".tif":
+            continue
+        parts = path.stem.split("_")
+        if len(parts) < 2 or len(parts[0]) != 8 or not parts[0].isdigit():
+            continue
+        if parts[1] not in {"R", "G"}:
+            continue
+        candidate_dates.append(parts[0])
+
+    if not candidate_dates:
+        raise FileNotFoundError(
+            f"Could not infer a start date from weekly_registered TIFF files in {dataset_dir}."
+        )
+
+    return min(candidate_dates)
+
+
 def resolve_week_mask_path(
     dataset_dir: str | Path,
     week_name: str,
@@ -189,6 +211,65 @@ def resolve_week_mask_path(
 
     candidate_str = ", ".join(candidate_names)
     raise FileNotFoundError(f"No week mask found for {week_name}. Tried: {candidate_str}")
+
+
+def validate_weekly_registered_product(
+    dataset_dir: str | Path,
+    match_csv_path: str | Path,
+    start_date: str,
+    week_mask_template: str = "{week_name}_average_cp_masks.tif",
+) -> pd.DataFrame:
+    """Validate a prepared weekly_registered product before analysis starts."""
+
+    dataset_dir = Path(dataset_dir)
+    match_csv_path = Path(match_csv_path).resolve()
+    if not match_csv_path.is_file():
+        raise FileNotFoundError(f"match_csv was not found: {match_csv_path}")
+
+    match_table = pd.read_csv(match_csv_path)
+    registered_lookup = build_registered_image_lookup(
+        image_dir=dataset_dir,
+        start_date=start_date,
+        day0_mode="syn",
+    )
+    if not registered_lookup:
+        raise FileNotFoundError(
+            f"weekly_registered contains no selected daywise SyN image pairs: {dataset_dir}"
+        )
+
+    validate_registered_lookup(registered_lookup)
+
+    shape_to_paths: dict[tuple[int, ...], list[Path]] = {}
+    for path in sorted({path.resolve() for path in registered_lookup.values()}):
+        shape = tuple(int(value) for value in tifffile.imread(path).shape)
+        shape_to_paths.setdefault(shape, []).append(path)
+
+    if len(shape_to_paths) != 1:
+        detail = "; ".join(
+            f"shape {shape}: {', '.join(path.name for path in paths)}"
+            for shape, paths in sorted(shape_to_paths.items(), key=lambda item: item[0])
+        )
+        raise ValueError(f"Prepared weekly product contains inconsistent TIFF dimensions: {detail}")
+
+    selected_shape = next(iter(shape_to_paths))
+    metadata = None
+    for candidate_name in ("weekly_product_metadata.json", "crop_metadata.json"):
+        candidate_path = dataset_dir / candidate_name
+        if candidate_path.is_file():
+            metadata = json.loads(candidate_path.read_text(encoding="utf-8"))
+            break
+
+    if metadata and metadata.get("crop_shape") is not None:
+        crop_shape = tuple(int(value) for value in metadata["crop_shape"])
+        if tuple(int(value) for value in selected_shape[-2:]) != crop_shape:
+            raise ValueError(
+                f"Prepared weekly product crop_shape {crop_shape} does not match TIFF dimensions {selected_shape}"
+            )
+
+    for week_name in extract_ordered_week_names(match_table):
+        resolve_week_mask_path(dataset_dir, week_name, week_mask_template)
+
+    return match_table
 
 
 def extract_weekly_matched_roi_intensity_table(
@@ -396,8 +477,14 @@ def run_weekly_matched_roi_pipeline(config: WeeklyMatchedPipelineConfig) -> Path
     if not match_csv_path.exists():
         raise FileNotFoundError(f"match_csv was not found: {match_csv_path}")
 
-    effective_start_date = config.start_date or infer_start_date_from_dataset_dir(dataset_dir)
+    effective_start_date = config.start_date or infer_start_date_from_weekly_registered_product(dataset_dir)
     config = WeeklyMatchedPipelineConfig(**{**asdict(config), "start_date": effective_start_date})
+    match_table = validate_weekly_registered_product(
+        dataset_dir=dataset_dir,
+        match_csv_path=match_csv_path,
+        start_date=config.start_date,
+        week_mask_template=config.week_mask_template,
+    )
 
     analysis_root = Path(config.output_root).expanduser().resolve() if config.output_root else get_dataset_analysis_dir(config.dataset)
     analysis_root.mkdir(parents=True, exist_ok=True)
@@ -416,7 +503,6 @@ def run_weekly_matched_roi_pipeline(config: WeeklyMatchedPipelineConfig) -> Path
         stage_label="Load matcher CSV and extract matched ROI intensities",
         pipeline_start_seconds=pipeline_start_seconds,
     )
-    match_table = pd.read_csv(match_csv_path)
     raw_table, week_assignment_table, required_days = extract_weekly_matched_roi_intensity_table(
         dataset_dir=dataset_dir,
         match_table=match_table,
@@ -578,6 +664,19 @@ def main() -> None:
     args = parse_args()
     context=resolve_selection(dataset=args.dataset,project_config=args.project_config,mouse_id=args.mouse_id,laser_nm=args.laser_nm)
     args.dataset=str(resolve_processed_dataset(context,product_name="weekly_registered"))
+    effective_start_date = args.start_date
+    if effective_start_date is None:
+        try:
+            effective_start_date = infer_start_date_from_weekly_registered_product(Path(args.dataset))
+        except FileNotFoundError:
+            effective_start_date = None
+    if effective_start_date is not None:
+        validate_weekly_registered_product(
+            dataset_dir=args.dataset,
+            match_csv_path=args.match_csv,
+            start_date=effective_start_date,
+            week_mask_template=args.week_mask_template,
+        )
     output_root=str(context.analysis_dir) if context.mode == "project" else None
     config = WeeklyMatchedPipelineConfig(
         dataset=args.dataset,

@@ -331,6 +331,7 @@ def test_weekly_notebook_uses_registered_source_and_weekly_registered_output():
     assert "registered_input_dir = project_paths.registered_product_dir.as_posix()" in code
     assert "build_expected_weekly_product_filenames" in code
     assert "build_weekly_product_metadata" in code
+    assert "derive_reference_week_name_from_medoid_image" in code
     assert "stable_registered_stem" in code
     assert "weekly_stage_dir = prepare_weekly_product_workspace" in code
     assert "REFRESH_WEEKLY_PRODUCT = False" in code
@@ -345,8 +346,11 @@ def test_weekly_notebook_uses_registered_source_and_weekly_registered_output():
         assert "os.remove(" not in later_cell
         assert "publish_staged_weekly_product(" not in later_cell
     assert 'average_file_list = sorted(glob(f"{weekly_stage_dir}/*_average.tif"))' in code
-    assert 'reference_image = (weekly_stage_dir / f"{reference_week_name}_average.tif").as_posix()' in code
+    assert 'medoid_image = average_file_list[medoid_index]' in code
+    assert 'reference_image = medoid_image' in code
+    assert 'reference_week_name = derive_reference_week_name_from_medoid_image(reference_image)' in code
+    assert 'expected_stage_filenames = build_expected_weekly_product_filenames(week_dict, week_names, reference_week_name=reference_week_name)' in code
     assert 'output_path_g = weekly_output_dir /' not in code
     assert 'output_fname_mask = weekly_output_dir /' not in code
-    assert 'reference_week_name = week_names[-1]' in code
+    assert 'reference_week_name = week_names[-1]' not in code
     assert "project_paths.preprocessing_dir.as_posix()" not in code

@@ -38,17 +38,44 @@ def stable_registered_stem(image_path: str | Path) -> str:
     return Path(image_path).stem.split("_crop", 1)[0]
 
 
-def _normalize_reference_week_name(
+def derive_reference_week_name_from_medoid_image(medoid_image: str | Path) -> str:
+    """Derive the weekly reference name from a medoid average TIFF filename."""
+
+    medoid_name = Path(medoid_image).name
+    if not medoid_name.endswith(".tif"):
+        raise ValueError(f"Medoid image must be a TIFF file: {medoid_name}")
+
+    stem = Path(medoid_image).stem
+    if not stem.endswith("_average"):
+        raise ValueError(f"Medoid image must end with '_average.tif': {medoid_name}")
+
+    week_name = stem.removesuffix("_average")
+    if not week_name.startswith("week") or not week_name[4:].isdigit():
+        raise ValueError(f"Medoid image must be named like 'weekN_average.tif': {medoid_name}")
+
+    return week_name
+
+
+def _resolve_reference_week_name(
     week_names: Sequence[str],
     reference_week_name: str | None,
 ) -> str:
     if not week_names:
         raise ValueError("week_names must contain at least one week.")
 
-    resolved_reference = reference_week_name or week_names[-1]
-    if resolved_reference not in week_names:
+    if reference_week_name is None:
+        if len(week_names) == 1:
+            resolved_reference = week_names[0]
+        else:
+            raise ValueError(
+                "reference_week_name is required when more than one week is present."
+            )
+    else:
+        resolved_reference = reference_week_name
+
+    if week_names.count(resolved_reference) != 1:
         raise ValueError(
-            f"reference_week_name must be one of the provided week_names: {resolved_reference}"
+            f"reference_week_name must occur exactly once in week_names: {resolved_reference}"
         )
     return resolved_reference
 
@@ -61,7 +88,7 @@ def build_expected_weekly_product_filenames(
 ) -> set[str]:
     """Derive the expected published file names from staged weekly inputs."""
 
-    resolved_reference_week_name = _normalize_reference_week_name(week_names, reference_week_name)
+    resolved_reference_week_name = _resolve_reference_week_name(week_names, reference_week_name)
     expected_names: set[str] = set()
     for week_name in week_names:
         if week_name not in week_dict:
@@ -98,6 +125,7 @@ def build_weekly_product_metadata(
 ) -> dict[str, object]:
     """Build the notebook metadata payload for a published weekly product."""
 
+    resolved_reference_week_name = _resolve_reference_week_name(week_names, reference_week_name)
     return {
         "crop_shape": None if crop_shape is None else [int(value) for value in crop_shape],
         "crop_label": crop_label,
@@ -109,7 +137,7 @@ def build_weekly_product_metadata(
         "staging_dir": Path(staging_dir).as_posix(),
         "weekly_output_dir": Path(weekly_output_dir).as_posix(),
         "week_names": list(week_names),
-        "reference_week_name": reference_week_name,
+        "reference_week_name": resolved_reference_week_name,
         "published_at": published_at,
     }
 

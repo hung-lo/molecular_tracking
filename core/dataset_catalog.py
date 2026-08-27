@@ -149,7 +149,7 @@ def build_manifest_plan(config,rows,mouse_id:str,laser_nm:int|None=None,*,source
     selected=[grouped[key][0] for key in sorted(grouped,key=lambda k:(k[1],k[0]))]
     primary=[r for r in rows if r["mouse_id"]==mouse_id and bool(r["analysis_included"]) and int(r["laser_nm"])==config.rig.primary_laser_nm]
     override=mice[mouse_id].values.get("reference_session_or_folder","")
-    candidates=[r for r in rows if r["mouse_id"]==mouse_id and (r["session_id"]==override or r["acquisition_id"]==override or Path(r["source_path"]).name==override)] if override else sorted(primary,key=lambda r:(r["acquisition_date"],r["session_id"]))[:1]
+    candidates=[r for r in primary if (r["session_id"]==override or r["acquisition_id"]==override or r["source_path"]==override or Path(r["source_path"]).name==override)] if override else sorted(primary,key=lambda r:(r["acquisition_date"],r["session_id"]))[:1]
     if len(candidates)!=1: raise ValueError(f"Reference override {override!r} resolved to {len(candidates)} acquisitions")
     reference=candidates[0]; manifest_dir=validate_output_path(config.paths.derivatives_root/mouse_id/"longitudinal"/str(laser)/"manifests",config); manifest_dir.mkdir(parents=True,exist_ok=True)
     planned=[]; ready=True

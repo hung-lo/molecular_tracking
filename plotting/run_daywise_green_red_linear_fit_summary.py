@@ -30,7 +30,7 @@ for _import_dir in (
         sys.path.append(_import_dir_str)
 
 
-from analysis_paths import get_shape_qc_analysis_dir, resolve_dataset_dir
+from analysis_paths import get_shape_qc_analysis_dir
 from project_cli import add_project_selector, resolve_exact_analysis_dir, resolve_selection
 from roi_log_ratio_analysis import summarize_daily_green_red_linear_fits
 
@@ -54,7 +54,7 @@ def log_message(run_start_seconds: float, message: str) -> None:
 
 def make_day_date_labels(
     day_values: np.ndarray,
-    start_date: str = "20260511",
+    start_date: str | None = None,
     acquisition_dates: pd.Series | np.ndarray | list[str] | None = None,
 ) -> list[str]:
     """Convert integer day offsets or acquisition dates into date labels.
@@ -116,7 +116,7 @@ def _filter_green_artifacts(
 def _resolve_day_date_labels(
     roi_metrics: pd.DataFrame,
     day_values: np.ndarray,
-    start_date: str = "20260511",
+    start_date: str | None = None,
 ) -> list[str]:
     """Prefer actual acquisition dates when they are available."""
 
@@ -206,7 +206,7 @@ def plot_daywise_scatter_summary(
     roi_metrics: pd.DataFrame,
     fit_summary: pd.DataFrame,
     output_path: Path,
-    start_date: str = "20260511",
+    start_date: str | None = None,
     green_artifact_threshold: float = 1500.0,
 ) -> None:
     """Plot per-day red-vs-green scatters with fitted lines and CI bands.
@@ -377,7 +377,7 @@ def plot_fit_parameter_summary(
     fit_summary: pd.DataFrame,
     output_path: Path,
     roi_metrics: pd.DataFrame | None = None,
-    start_date: str = "20260511",
+    start_date: str | None = None,
     green_artifact_threshold: float = 1500.0,
 ) -> None:
     """Plot day-wise slope, intercept, fit quality, and ROI count summaries.
@@ -595,6 +595,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     add_project_selector(parser)
     parser.add_argument("--analysis-dir", default=None, help="Exact project run or analysis directory.")
+    parser.add_argument("--start-date", default=None, help="Reference acquisition date (YYYYMMDD) for legacy tables without dates.")
     return parser.parse_args()
 
 
@@ -606,7 +607,6 @@ def main() -> None:
     context=resolve_selection(dataset=args.dataset,project_config=args.project_config,mouse_id=args.mouse_id,laser_nm=args.laser_nm)
     exact_analysis=resolve_exact_analysis_dir(context,args.analysis_dir) if context.mode == "project" or args.analysis_dir else None
     log_message(run_start_seconds, f"Starting day-wise green-vs-red linear fit summary | dataset={args.dataset}")
-    base_dir = resolve_dataset_dir(args.dataset)
     shape_qc_dir = exact_analysis if exact_analysis else get_shape_qc_analysis_dir(args.dataset)
     input_metrics_path = (
         shape_qc_dir
@@ -633,11 +633,13 @@ def main() -> None:
         roi_metrics=roi_metrics,
         fit_summary=fit_summary,
         output_path=scatter_plot_path,
+        start_date=args.start_date,
     )
     plot_fit_parameter_summary(
         fit_summary=fit_summary,
         output_path=parameter_plot_path,
         roi_metrics=roi_metrics,
+        start_date=args.start_date,
     )
 
     shutil.copy2(__file__, output_dir / Path(__file__).name)

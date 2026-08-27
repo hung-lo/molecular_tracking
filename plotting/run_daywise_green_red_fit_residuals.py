@@ -61,7 +61,7 @@ from roi_log_ratio_analysis import (
 
 def make_day_labels(
     day_values: np.ndarray,
-    start_date: str = "20260511",
+    start_date: str | None = None,
 ) -> list[str]:
     """Convert day indices into date labels.
 
@@ -78,6 +78,8 @@ def make_day_labels(
         Date labels in ``YYYYMMDD`` format, one per input day value.
     """
 
+    if start_date is None:
+        raise ValueError("No acquisition date metadata was found; pass --start-date explicitly.")
     reference_date = pd.to_datetime(start_date, format="%Y%m%d")
     labels: list[str] = []
     for day_value in day_values:
@@ -93,7 +95,7 @@ def plot_directional_roi_trajectories_scatter(
     output_path: Path,
     title_prefix: str,
     direction_label: str,
-    start_date: str = "20260511",
+    start_date: str | None = None,
 ) -> None:
     """Plot ranked ROIs in corrected red-green space against the average fit.
 
@@ -229,7 +231,7 @@ def plot_directional_roi_residuals_vs_day(
     output_path: Path,
     title_prefix: str,
     direction_label: str,
-    start_date: str = "20260511",
+    start_date: str | None = None,
 ) -> None:
     """Plot signed green-fit residual trajectories for a ranked ROI subset.
 
@@ -433,6 +435,7 @@ def run_directional_residual_analysis(
     direction_label: str,
     output_dir_prefix: str,
     analysis_dir: str | Path | None = None,
+    start_date: str | None = None,
 ) -> Path:
     """Run the directional residual analysis for one ranked ROI set.
 
@@ -454,7 +457,6 @@ def run_directional_residual_analysis(
     """
     run_start_seconds = time.perf_counter()
     log_message(run_start_seconds, f"Starting {direction_label} green-fit residual analysis | dataset={dataset}")
-    base_dir = resolve_dataset_dir(dataset)
     shape_qc_dir = Path(analysis_dir).expanduser().resolve() if analysis_dir else get_shape_qc_analysis_dir(dataset)
     metrics_path = (
         shape_qc_dir
@@ -509,6 +511,7 @@ def run_directional_residual_analysis(
         output_path=scatter_plot_path,
         title_prefix="Sampled 30",
         direction_label=direction_label,
+        start_date=start_date,
     )
     residual_plot_path = output_dir / f"top30_{direction_label}_green_fit_residual_vs_day.png"
     plot_directional_roi_residuals_vs_day(
@@ -560,6 +563,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     add_project_selector(parser)
     parser.add_argument("--analysis-dir", default=None, help="Exact project run or analysis directory; never inferred.")
+    parser.add_argument("--start-date", default=None, help="Reference acquisition date (YYYYMMDD) for legacy tables without dates.")
     return parser.parse_args()
 
 
@@ -572,6 +576,7 @@ def main() -> None:
     run_directional_residual_analysis(
         dataset=args.dataset,
         direction_label="decreasing",
+        start_date=args.start_date,
         output_dir_prefix="daywise_green_red_fit_residuals",
         analysis_dir=analysis_dir,
     )

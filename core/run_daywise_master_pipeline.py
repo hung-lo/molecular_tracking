@@ -801,6 +801,9 @@ def _write_master_summary(
 
 
 def run_master_pipeline(config: MasterPipelineConfig) -> Path:
+    for name, value in (("xy_um_per_px", config.xy_um_per_px), ("z_um_per_plane", config.z_um_per_plane)):
+        if not math.isfinite(float(value)) or float(value) <= 0:
+            raise ValueError(f"{name} must be finite and positive")
     start_seconds = time.perf_counter()
     manifest_path = Path(config.manifest).expanduser().resolve()
     dataset_dir = resolve_dataset_dir(config.dataset)
@@ -1023,7 +1026,7 @@ def main(argv: list[str] | None = None) -> Path:
         selected_rows=selected_catalog_rows(context)
         source_catalog=catalog_path(context)
         companion=Path(args.manifest).with_name("manifest_metadata.json")
-        project_provenance={"mouse_id":context.mouse_id,"experimental_group":mouse_meta.get("experimental_group"),"cohort":mouse_meta.get("cohort"),"viral_constructs":mouse_meta.get("viral_constructs"),"laser_nm":context.laser_nm,"source_catalog_path":str(source_catalog),"source_catalog_sha256":file_sha256(source_catalog),"source_manifest_path":str(args.manifest),"manifest_metadata_path":str(companion),"selected_session_ids":[row["session_id"] for row in selected_rows],"selected_acquisition_ids":[row["acquisition_id"] for row in selected_rows],"catalog_spacing_um":{"x":catalog_x,"y":catalog_y,"z":catalog_z},"spacing_overrides_um":{"xy":requested_xy,"z":requested_z}}
+        project_provenance={"mouse_id":context.mouse_id,"experimental_group":mouse_meta.get("experimental_group"),"cohort":mouse_meta.get("cohort"),"viral_constructs":mouse_meta.get("viral_constructs"),"laser_nm":context.laser_nm,"source_catalog_path":str(source_catalog),"source_catalog_sha256":file_sha256(source_catalog),"source_catalog_version":json.loads((source_catalog.parent / "validation_report.json").read_text(encoding="utf-8")).get("catalog_version") if (source_catalog.parent / "validation_report.json").is_file() else None,"source_manifest_path":str(args.manifest),"manifest_metadata_path":str(companion),"selected_session_ids":[row["session_id"] for row in selected_rows],"selected_acquisition_ids":[row["acquisition_id"] for row in selected_rows],"catalog_spacing_um":{"x":catalog_x,"y":catalog_y,"z":catalog_z},"spacing_overrides_um":{"xy":requested_xy,"z":requested_z}}
         args.xy_um_per_px = catalog_xy if args.xy_um_per_px is None else args.xy_um_per_px
         args.z_um_per_plane = catalog_z if args.z_um_per_plane is None else args.z_um_per_plane
         project_provenance["effective_spacing_um"]={"x":args.xy_um_per_px,"y":args.xy_um_per_px,"z":args.z_um_per_plane}

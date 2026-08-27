@@ -23,6 +23,7 @@ for _import_dir in (
 
 
 from project_cli import add_project_selector, resolve_analysis_selection
+from project_config import validate_output_path, is_relative_to
 from roi_log_ratio_analysis import (
     select_ranked_roi_days,
     select_top_changing_rois,
@@ -123,10 +124,15 @@ def _filter_table_by_policy(table: pd.DataFrame, policy: str) -> pd.DataFrame:
     return filtered.reset_index(drop=True)
 
 
-def _resolve_output_dir(analysis_dir: Path, output_dir: str | Path | None, policy: str) -> Path:
+def _resolve_output_dir(analysis_dir: Path, output_dir: str | Path | None, policy: str, project_context=None) -> Path:
     """Resolve a policy-specific output directory for quick plots."""
 
     base_output_dir = Path(output_dir).resolve() if output_dir else (analysis_dir / "quick_plots")
+    if project_context is not None:
+        assert project_context.project_config is not None
+        base_output_dir = validate_output_path(base_output_dir, project_context.project_config)
+        if not is_relative_to(base_output_dir, project_context.analysis_dir):
+            raise ValueError("Project quick-plot output must stay under the selected analysis run directory")
     return base_output_dir / policy
 
 
@@ -136,6 +142,7 @@ def build_quick_plots(
     top_n: int = 30,
     policy: str = "high",
     output_dir: str | Path | None = None,
+    project_context=None,
 ) -> Path:
     """Render a small set of no-rerun QC plots from saved matched output tables."""
 
@@ -186,7 +193,7 @@ def build_quick_plots(
         f"Policy filter: {policy} | metric_rows={len(metrics_table)} | fit_rows={len(fit_summary)} | unique_days={unique_days}",
     )
 
-    output_dir = _resolve_output_dir(analysis_dir, output_dir, policy)
+    output_dir = _resolve_output_dir(analysis_dir, output_dir, policy, project_context)
     output_dir.mkdir(parents=True, exist_ok=True)
     log_message(run_start_seconds, f"Output directory: {output_dir}")
     log_message(run_start_seconds, "Rendering population and day-wise fit summary plots")
@@ -347,6 +354,7 @@ def main() -> None:
         top_n=args.top_n,
         policy=args.policy,
         output_dir=args.output_dir,
+        project_context=_context,
     )
     print(f"quick_plot_dir={output_dir}")
 

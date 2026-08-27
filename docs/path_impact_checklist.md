@@ -26,10 +26,13 @@
 - `plotting/raw_space_triplet_panels.py` and `plotting/shared_raw_space_group_panel.py`: updated;
   reusable dates are explicit/nullable.
 - `notebooks/weeklyRegister_20260531.ipynb`: setup/path cell now reads flat source TIFFs
-  from `registered/`, stages the compatibility product under `weekly_registered/.staging/`,
-  publishes a flat validated `weekly_registered/` product only when refresh is allowed, and
-  records stable cropped and uncropped filenames plus explicit crop metadata. ANTs calls
-  receive XML-derived ZYX spacing. Crop, `genericLabel`, and geometry logic is retained.
+  from `registered/`, stages the full weekly plus cross-week compatibility product under
+  `weekly_registered/.staging/`, publishes the flat validated `weekly_registered/` product only
+  once after complete validation, and records stable cropped and uncropped filenames plus explicit
+  crop metadata. The published metadata covers every allowlisted file, including cross-week
+  registered masks. ANTs calls receive XML-derived ZYX spacing. Crop, `genericLabel`, and
+  geometry logic is retained, and the workflow currently keeps weekly averages red-only unless a
+  separate green product is implemented explicitly.
 - `notebooks/cellposeSAM_batch_segmentation_20260712.ipynb`: setup/input/output cell now uses
   explicit project selection and derivative preprocessing/segmentation paths.
 - Four historical analysis notebooks: intentionally retained as legacy/reference notebooks with

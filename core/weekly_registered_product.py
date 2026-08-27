@@ -16,7 +16,9 @@ import tifffile
 PUBLISHED_WEEKLY_PRODUCT_GLOBS = (
     "*_SyN.tif",
     "*_average.tif",
+    "*_average_SyN.tif",
     "*_average_cp_masks.tif",
+    "*_average_cp_masks_SyN.tif",
 )
 PUBLISHED_WEEKLY_PRODUCT_FILES = (
     "weekly_product_metadata.json",
@@ -36,14 +38,34 @@ def stable_registered_stem(image_path: str | Path) -> str:
     return Path(image_path).stem.split("_crop", 1)[0]
 
 
+def _normalize_reference_week_name(
+    week_names: Sequence[str],
+    reference_week_name: str | None,
+) -> str:
+    if not week_names:
+        raise ValueError("week_names must contain at least one week.")
+
+    resolved_reference = reference_week_name or week_names[-1]
+    if resolved_reference not in week_names:
+        raise ValueError(
+            f"reference_week_name must be one of the provided week_names: {resolved_reference}"
+        )
+    return resolved_reference
+
+
 def build_expected_weekly_product_filenames(
     week_dict: Mapping[str, Sequence[str]],
     week_names: Sequence[str],
+    *,
+    reference_week_name: str | None = None,
 ) -> set[str]:
     """Derive the expected published file names from staged weekly inputs."""
 
+    resolved_reference_week_name = _normalize_reference_week_name(week_names, reference_week_name)
     expected_names: set[str] = set()
     for week_name in week_names:
+        if week_name not in week_dict:
+            raise ValueError(f"week_dict is missing expected week key: {week_name}")
         week_list = [path for path in week_dict[week_name] if "_R" in Path(path).name]
         for image_path in week_list:
             red_name = f"{stable_registered_stem(image_path)}_SyN.tif"
@@ -53,6 +75,9 @@ def build_expected_weekly_product_filenames(
             expected_names.add(green_name)
         expected_names.add(f"{week_name}_average.tif")
         expected_names.add(f"{week_name}_average_cp_masks.tif")
+        if week_name != resolved_reference_week_name:
+            expected_names.add(f"{week_name}_average_SyN.tif")
+            expected_names.add(f"{week_name}_average_cp_masks_SyN.tif")
     return expected_names
 
 
@@ -68,6 +93,7 @@ def build_weekly_product_metadata(
     staging_dir: str | Path,
     weekly_output_dir: str | Path,
     week_names: Sequence[str],
+    reference_week_name: str | None = None,
     published_at: str,
 ) -> dict[str, object]:
     """Build the notebook metadata payload for a published weekly product."""
@@ -83,6 +109,7 @@ def build_weekly_product_metadata(
         "staging_dir": Path(staging_dir).as_posix(),
         "weekly_output_dir": Path(weekly_output_dir).as_posix(),
         "week_names": list(week_names),
+        "reference_week_name": reference_week_name,
         "published_at": published_at,
     }
 

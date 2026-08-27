@@ -325,7 +325,8 @@ def test_weekly_runner_project_mode_uses_weekly_registered_and_runs_root(tmp_pat
 
 def test_weekly_notebook_uses_registered_source_and_weekly_registered_output():
     notebook = json.loads((Path(__file__).resolve().parent.parent / "notebooks" / "weeklyRegister_20260531.ipynb").read_text(encoding="utf-8"))
-    code = "\n".join("".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code")
+    code_cells = ["".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code"]
+    code = "\n".join(code_cells)
 
     assert "registered_input_dir = project_paths.registered_product_dir.as_posix()" in code
     assert "build_expected_weekly_product_filenames" in code
@@ -335,5 +336,17 @@ def test_weekly_notebook_uses_registered_source_and_weekly_registered_output():
     assert "REFRESH_WEEKLY_PRODUCT = False" in code
     assert "replace_existing=REFRESH_WEEKLY_PRODUCT" in code
     assert "cropping_enabled = DO_CROP_IMAGE" in code
-    assert "publish_staged_weekly_product" in code
+    assert code.count("publish_staged_weekly_product(") == 1
+    publish_cell_index = next(index for index, cell_source in enumerate(code_cells) if "publish_staged_weekly_product(" in cell_source)
+    assert publish_cell_index == len(code_cells) - 1
+    for later_cell in code_cells[publish_cell_index + 1:]:
+        assert "io.imsave(" not in later_cell
+        assert "tifffile.imwrite(" not in later_cell
+        assert "os.remove(" not in later_cell
+        assert "publish_staged_weekly_product(" not in later_cell
+    assert 'average_file_list = sorted(glob(f"{weekly_stage_dir}/*_average.tif"))' in code
+    assert 'reference_image = (weekly_stage_dir / f"{reference_week_name}_average.tif").as_posix()' in code
+    assert 'output_path_g = weekly_output_dir /' not in code
+    assert 'output_fname_mask = weekly_output_dir /' not in code
+    assert 'reference_week_name = week_names[-1]' in code
     assert "project_paths.preprocessing_dir.as_posix()" not in code

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -73,29 +74,60 @@ def _build_week1_stage(
     day1_date: str,
     crop_label: str | None,
     values_offset: int = 0,
+    include_crossweek_outputs: bool = True,
 ) -> tuple[dict[str, list[str]], set[str]]:
     staging_dir.mkdir(parents=True, exist_ok=True)
     suffix = f"_crop_{crop_label}" if crop_label else ""
-    source_file_names = [
+
+    day0_week2 = (datetime.strptime(day0_date, "%Y%m%d") + timedelta(days=7)).strftime("%Y%m%d")
+    day1_week2 = (datetime.strptime(day1_date, "%Y%m%d") + timedelta(days=7)).strftime("%Y%m%d")
+
+    week1_source_file_names = [
         f"{day0_date}_R{suffix}.tif",
         f"{day0_date}_G{suffix}.tif",
         f"{day1_date}_R{suffix}.tif",
         f"{day1_date}_G{suffix}.tif",
     ]
+    week2_source_file_names = [
+        f"{day0_week2}_R{suffix}.tif",
+        f"{day0_week2}_G{suffix}.tif",
+        f"{day1_week2}_R{suffix}.tif",
+        f"{day1_week2}_G{suffix}.tif",
+    ]
+    source_file_names = week1_source_file_names + week2_source_file_names
     stage_file_names = [f"{stable_registered_stem(name)}_SyN.tif" for name in source_file_names]
     for index, file_name in enumerate(stage_file_names):
         _write_stack(
             staging_dir / file_name,
             [values_offset + index * 3 + 1, values_offset + index * 3 + 2, values_offset + index * 3 + 3],
         )
+
     _write_stack(staging_dir / "week1_average.tif", [values_offset + 100, values_offset + 101, values_offset + 102])
     _write_stack(
         staging_dir / "week1_average_cp_masks.tif",
         [values_offset + 200, values_offset + 201, values_offset + 202],
     )
-    week_dict = {"week1": [str(staging_dir / file_name) for file_name in source_file_names]}
-    expected_names = build_expected_weekly_product_filenames(week_dict, ["week1"])
-    expected_names.update({"week1_average.tif", "week1_average_cp_masks.tif"})
+    if include_crossweek_outputs:
+        _write_stack(
+            staging_dir / "week1_average_SyN.tif",
+            [values_offset + 300, values_offset + 301, values_offset + 302],
+        )
+        _write_stack(
+            staging_dir / "week1_average_cp_masks_SyN.tif",
+            [values_offset + 400, values_offset + 401, values_offset + 402],
+        )
+
+    _write_stack(staging_dir / "week2_average.tif", [values_offset + 500, values_offset + 501, values_offset + 502])
+    _write_stack(
+        staging_dir / "week2_average_cp_masks.tif",
+        [values_offset + 600, values_offset + 601, values_offset + 602],
+    )
+
+    week_dict = {
+        "week1": [str(staging_dir / file_name) for file_name in week1_source_file_names],
+        "week2": [str(staging_dir / file_name) for file_name in week2_source_file_names],
+    }
+    expected_names = build_expected_weekly_product_filenames(week_dict, ["week1", "week2"], reference_week_name="week2")
     return week_dict, expected_names
 
 
@@ -126,15 +158,15 @@ def _publish_weekly_product(
         refresh_requested=replace_existing,
         registered_input_dir=registered_input_dir.as_posix(),
         source_registered_files=[
-            f"{day0_date}_R.tif",
-            f"{day0_date}_G.tif",
-            f"{day1_date}_R.tif",
-            f"{day1_date}_G.tif",
+            Path(path).name
+            for paths in week_dict.values()
+            for path in paths
         ],
         spacing_zyx=(5.0, 0.69, 0.69),
         staging_dir=staging_dir,
         weekly_output_dir=weekly_output_dir,
-        week_names=["week1"],
+        week_names=["week1", "week2"],
+        reference_week_name="week2",
         published_at="2026-08-27T00:00:00",
     )
     return publish_staged_weekly_product(
@@ -178,9 +210,15 @@ def test_stable_registered_stem_and_expected_filenames_handle_cropped_and_uncrop
             str(tmp_path / "20260511_G_crop_256x128.tif"),
             str(tmp_path / "20260512_R_crop_256x128.tif"),
             str(tmp_path / "20260512_G_crop_256x128.tif"),
-        ]
+        ],
+        "week2": [
+            str(tmp_path / "20260518_R_crop_256x128.tif"),
+            str(tmp_path / "20260518_G_crop_256x128.tif"),
+            str(tmp_path / "20260519_R_crop_256x128.tif"),
+            str(tmp_path / "20260519_G_crop_256x128.tif"),
+        ],
     }
-    expected = build_expected_weekly_product_filenames(week_dict, ["week1"])
+    expected = build_expected_weekly_product_filenames(week_dict, ["week1", "week2"])
     assert {
         "20260511_R_SyN.tif",
         "20260511_G_SyN.tif",
@@ -188,7 +226,13 @@ def test_stable_registered_stem_and_expected_filenames_handle_cropped_and_uncrop
         "20260512_G_SyN.tif",
         "week1_average.tif",
         "week1_average_cp_masks.tif",
+        "week1_average_SyN.tif",
+        "week1_average_cp_masks_SyN.tif",
+        "week2_average.tif",
+        "week2_average_cp_masks.tif",
     }.issubset(expected)
+    assert "20260518_average_SyN.tif" not in expected
+    assert "20260518_average_cp_masks_SyN.tif" not in expected
 
     raw_week_dict = {"week1": [str(tmp_path / "20260511_R.tif"), str(tmp_path / "20260511_G.tif")]}
     raw_expected = build_expected_weekly_product_filenames(raw_week_dict, ["week1"])
@@ -228,14 +272,28 @@ def test_uncropped_published_names_are_recognized_and_validate_without_crop_shap
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert metadata["crop_shape"] is None
     assert metadata["cropping_enabled"] is False
-    assert metadata["published_files"] == [
+    expected_published_files = [
         "20260511_G_SyN.tif",
         "20260511_R_SyN.tif",
         "20260512_G_SyN.tif",
         "20260512_R_SyN.tif",
+        "20260518_G_SyN.tif",
+        "20260518_R_SyN.tif",
+        "20260519_G_SyN.tif",
+        "20260519_R_SyN.tif",
         "week1_average.tif",
+        "week1_average_SyN.tif",
         "week1_average_cp_masks.tif",
+        "week1_average_cp_masks_SyN.tif",
+        "week2_average.tif",
+        "week2_average_cp_masks.tif",
     ]
+    validated = weekly_product.validate_published_weekly_product(weekly_output_dir, require_metadata=True)
+    assert validated is not None
+    assert validated["published_files"] == expected_published_files
+    assert sorted(validated["published_sha256"]) == expected_published_files
+    assert metadata["published_files"] == expected_published_files
+    assert sorted(metadata["published_sha256"]) == expected_published_files
     assert metadata["published_sha256"]["20260511_R_SyN.tif"]
 
 
@@ -265,7 +323,7 @@ def test_refresh_required_when_published_product_exists(tmp_path: Path) -> None:
     assert before.read_text(encoding="utf-8") == (weekly_output_dir / "weekly_product_metadata.json").read_text(encoding="utf-8")
 
 
-def test_refresh_preparation_preserves_previous_product_before_publish_failure(tmp_path: Path) -> None:
+def test_crossweek_registration_failure_leaves_previous_product_unchanged(tmp_path: Path) -> None:
     weekly_output_dir = tmp_path / "weekly_registered"
     siblings = _write_siblings(tmp_path)
     _publish_weekly_product(
@@ -287,10 +345,13 @@ def test_refresh_preparation_preserves_previous_product_before_publish_failure(t
         day1_date="20260519",
         crop_label="256x128",
         values_offset=100,
+        include_crossweek_outputs=False,
     )
 
-    with pytest.raises(RuntimeError, match="simulated failure before publish"):
-        raise RuntimeError("simulated failure before publish")
+    with pytest.raises(RuntimeError, match="simulated cross-week failure"):
+        _write_stack(staging_dir / "week1_average_SyN.tif", [700, 701, 702])
+        _write_stack(staging_dir / "week1_average_cp_masks_SyN.tif", [800, 801, 802])
+        raise RuntimeError("simulated cross-week failure")
 
     assert _snapshot_published_product(weekly_output_dir) == before
     assert (siblings["registered"] / "sentinel.txt").read_text(encoding="utf-8") == "registered"
@@ -315,7 +376,7 @@ def test_refresh_publish_rolls_back_exactly_when_mid_commit_fails(tmp_path: Path
     before = _snapshot_published_product(weekly_output_dir)
 
     staging_dir = prepare_weekly_product_workspace(weekly_output_dir, refresh=True)
-    _, expected_names = _build_week1_stage(
+    week_dict, expected_names = _build_week1_stage(
         staging_dir,
         day0_date="20260518",
         day1_date="20260519",
@@ -329,15 +390,15 @@ def test_refresh_publish_rolls_back_exactly_when_mid_commit_fails(tmp_path: Path
         refresh_requested=True,
         registered_input_dir=siblings["registered"].as_posix(),
         source_registered_files=[
-            "20260518_R.tif",
-            "20260518_G.tif",
-            "20260519_R.tif",
-            "20260519_G.tif",
+            Path(path).name
+            for paths in week_dict.values()
+            for path in paths
         ],
         spacing_zyx=(5.0, 0.69, 0.69),
         staging_dir=staging_dir,
         weekly_output_dir=weekly_output_dir,
-        week_names=["week1"],
+        week_names=["week1", "week2"],
+        reference_week_name="week2",
         published_at="2026-08-27T00:00:00",
     )
 
@@ -386,7 +447,7 @@ def test_successful_refresh_replaces_old_product_and_keeps_siblings(tmp_path: Pa
     old_snapshot = _snapshot_published_product(weekly_output_dir)
 
     staging_dir = prepare_weekly_product_workspace(weekly_output_dir, refresh=True)
-    _, expected_names = _build_week1_stage(
+    week_dict, expected_names = _build_week1_stage(
         staging_dir,
         day0_date="20260518",
         day1_date="20260519",
@@ -400,15 +461,15 @@ def test_successful_refresh_replaces_old_product_and_keeps_siblings(tmp_path: Pa
         refresh_requested=True,
         registered_input_dir=siblings["registered"].as_posix(),
         source_registered_files=[
-            "20260518_R.tif",
-            "20260518_G.tif",
-            "20260519_R.tif",
-            "20260519_G.tif",
+            Path(path).name
+            for paths in week_dict.values()
+            for path in paths
         ],
         spacing_zyx=(5.0, 0.69, 0.69),
         staging_dir=staging_dir,
         weekly_output_dir=weekly_output_dir,
-        week_names=["week1"],
+        week_names=["week1", "week2"],
+        reference_week_name="week2",
         published_at="2026-08-27T00:00:00",
     )
 
@@ -436,6 +497,9 @@ def test_successful_refresh_replaces_old_product_and_keeps_siblings(tmp_path: Pa
     assert not staging_dir.exists()
     assert replace_log[-1][1] == metadata_path.name
 
+    validated_metadata = weekly_product.validate_published_weekly_product(weekly_output_dir, require_metadata=True)
+    assert validated_metadata is not None
+
     metadata_on_disk = json.loads(metadata_path.read_text(encoding="utf-8"))
     content_names = metadata_on_disk["published_files"]
     assert content_names == [
@@ -443,9 +507,20 @@ def test_successful_refresh_replaces_old_product_and_keeps_siblings(tmp_path: Pa
         "20260518_R_SyN.tif",
         "20260519_G_SyN.tif",
         "20260519_R_SyN.tif",
+        "20260525_G_SyN.tif",
+        "20260525_R_SyN.tif",
+        "20260526_G_SyN.tif",
+        "20260526_R_SyN.tif",
         "week1_average.tif",
+        "week1_average_SyN.tif",
         "week1_average_cp_masks.tif",
+        "week1_average_cp_masks_SyN.tif",
+        "week2_average.tif",
+        "week2_average_cp_masks.tif",
     ]
+    assert metadata_on_disk["published_files"] == validated_metadata["published_files"]
+    assert sorted(metadata_on_disk["published_sha256"]) == content_names
+    assert sorted(validated_metadata["published_sha256"]) == content_names
     for name in content_names:
         assert metadata_on_disk["published_sha256"][name]
         assert weekly_output_dir.joinpath(name).exists()

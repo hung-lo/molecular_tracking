@@ -111,11 +111,13 @@ def main() -> None:
     if args.laser_nm is not None and args.laser_nm != 920: raise ValueError("This compatibility wrapper always uses laser_nm=920.")
     context = resolve_selection(dataset=args.dataset, project_config=args.project_config, mouse_id=args.mouse_id, laser_nm=920)
     args.dataset = str(resolve_processed_dataset(context, product_name="registered"))
+    output_root = None
     if context.mode == "project":
         catalog_x, catalog_y, catalog_z = catalog_spacing(context)
         if catalog_x != catalog_y: raise ValueError("Registered compatibility pipeline requires equal X/Y spacing")
         args.xy_um_per_px=catalog_x
         args.z_um_per_plane=catalog_z
+        output_root = str(context.analysis_dir)
     inverse_mask_channel = None if args.inverse_mask_channel == "auto" else args.inverse_mask_channel
     skip_raw_space_validation = True
     if args.enable_raw_space_validation:
@@ -124,6 +126,7 @@ def main() -> None:
         skip_raw_space_validation = True
     config = RegisteredPipelineConfig(
         dataset=args.dataset,
+        output_root=output_root,
         start_date=args.start_date,
         mask_name=args.mask_name,
         green_dark=args.green_dark,

@@ -18,3 +18,6 @@ Until mask, red, and green derivative files exist, this writes
 `session_manifest_plan.csv`, not a misleading analysis-ready manifest. Preprocessing and
 physical migration are intentionally deferred. Use explicit dataset, manifest, match, and
 output paths for legacy workflows.
+The weekly registration notebook writes its final compatibility files to `weekly_registered/`,
+and the weekly matcher consumes that directory directly. The 920 compatibility wrapper writes
+project-mode outputs under `<mouse>/longitudinal/920/runs/`.

@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import csv
-import json
+import os
 import re
+import tempfile
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from fnmatch import fnmatch
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from project_config import ProjectConfig, validate_output_path
 
@@ -18,25 +21,51 @@ SESSION_FILE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^(?P<date>\d{8})_(?P<channel>[RG])_SyN\.tif$", re.IGNORECASE),
     re.compile(r"^(?P<date>\d{8})_(?P<channel>[RG])_ROI_mask_SyN_inversed\.tif$", re.IGNORECASE),
 )
-RUN_TIMESTAMP_PATTERN = re.compile(r"(?<!\d)(?P<stamp>\d{8}_\d{6})(?!\d)")
-DATE_TOKEN_PATTERN = re.compile(r"(?<!\d)(?P<date>\d{8})(?!\d)")
-LASER_PATTERN = re.compile(r"(?<!\d)(?P<laser>920|1050)(?!\d)")
+RUN_TIMESTAMP_PATTERN = re.compile(r"(?<!\d)\d{8}_\d{6}(?!\d)")
+DATE_TOKEN_PATTERN = re.compile(r"(?<!\d)\d{8}(?!\d)")
 
-LONGITUDINAL_TREE_PREFIXES = (
-    "analysis",
-    "roi_matcher_qc_examples",
-    "roi_matcher_qc_plots",
-    "roi_matcher_qc",
-    "small_test",
+ALLOWED_EXACT_ROOTS = (
+    "1050_data",
+    "920_data",
+    "2wks_1050_data",
+    "1050_small_test_fireants",
 )
+ALLOWED_GLOB_ROOTS = ("roi_matcher_qc_examples_*",)
+DEFAULT_EXCLUDED_ROOTS = {"roi_matcher_qc_examples_syn_20260615_01_styled"}
 
-SESSION_LIKE_BASENAMES = {
-    "R": "raw_red_stack",
-    "G": "raw_green_stack",
-    "cp_masks": "session_mask",
-    "SyN": "session_registered_stack",
-    "ROI_mask_SyN_inversed": "session_registered_mask",
-}
+INVENTORY_FIELDNAMES = [
+    "relative_source_path",
+    "source_path",
+    "size_bytes",
+    "mtime_utc",
+    "extension",
+    "inferred_mouse_id",
+    "inferred_laser_nm",
+    "product_class",
+    "target_scope",
+    "inferred_session_date",
+    "date_token_role",
+    "catalog_session_match",
+    "inference_status",
+    "notes",
+]
+PLAN_FIELDNAMES = [
+    "source_path",
+    "proposed_target",
+    "inferred_mouse_id",
+    "inferred_laser_nm",
+    "product_class",
+    "target_scope",
+    "inferred_session_date",
+    "date_token_role",
+    "catalog_session_match",
+    "inference_status",
+    "action",
+    "collision_status",
+    "source_size_bytes",
+    "source_mtime_utc",
+    "reason_evidence",
+]
 
 
 @dataclass(frozen=True)
@@ -56,6 +85,12 @@ class TreeContext:
     evidence: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class LegacyScanSummary:
+    included_roots: tuple[str, ...]
+    ignored_top_level_entries: tuple[tuple[str, str], ...]
+
+
 def _normalize_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -71,8 +106,6 @@ def _read_csv_rows(path: str | Path) -> list[dict[str, str]]:
 
 
 def load_acquisition_catalog(path: str | Path) -> list[dict[str, str]]:
-    """Load the canonical acquisition catalog used for session matching."""
-
     rows = _read_csv_rows(path)
     required = {
         "mouse_id",
@@ -105,19 +138,93 @@ def build_catalog_sessions(rows: Iterable[dict[str, str]]) -> dict[tuple[str, st
     return sessions
 
 
-def iter_legacy_source_files(legacy_root: str | Path) -> list[Path]:
+def _iso_date(token: str) -> str:
+    return f"{token[:4]}-{token[4:6]}-{token[6:]}"
+
+
+def _is_hidden_name(name: str) -> bool:
+    return name.startswith(".") or name == "__pycache__"
+
+
+def _entry_type(entry: Path) -> str:
+    if entry.is_dir():
+        return "directory"
+    if entry.is_file():
+        return "file"
+    if entry.is_symlink():
+        return "symlink"
+    return "other"
+
+
+def _is_allowed_root_name(name: str) -> bool:
+    return (
+        name not in DEFAULT_EXCLUDED_ROOTS
+        and (name in ALLOWED_EXACT_ROOTS or any(fnmatch(name, pattern) for pattern in ALLOWED_GLOB_ROOTS))
+    )
+
+
+def _validate_include_root_name(name: str, legacy_root: Path) -> None:
+    candidate = Path(name)
+    if candidate.is_absolute() or any(part == ".." for part in candidate.parts):
+        raise ValueError(f"include-root must be a direct child name, not a path: {name}")
+    if candidate.name != name:
+        raise ValueError(f"include-root must be a direct child name, not a path: {name}")
+    if not (legacy_root / name).exists():
+        raise FileNotFoundError(f"Included root was not found under legacy_fucci_tri_root: {name}")
+
+
+def _resolve_include_root_names(legacy_root: Path, include_roots: Sequence[str] | None) -> list[str]:
+    children = {entry.name: entry for entry in sorted(legacy_root.iterdir(), key=lambda entry: entry.name)}
+    if include_roots is None:
+        selected = [name for name, entry in children.items() if entry.is_dir() and _is_allowed_root_name(name)]
+        if not selected:
+            raise ValueError(
+                f"No expected legacy product roots were found under {legacy_root}: "
+                f"{', '.join(ALLOWED_EXACT_ROOTS)}"
+            )
+        return selected
+
+    selected: list[str] = []
+    seen: set[str] = set()
+    for name in include_roots:
+        _validate_include_root_name(name, legacy_root)
+        if name in seen:
+            raise ValueError(f"Duplicate --include-root value: {name}")
+        seen.add(name)
+        if not (legacy_root / name).is_dir():
+            raise FileNotFoundError(f"Included root is not a directory: {name}")
+        selected.append(name)
+    return selected
+
+
+def discover_legacy_source_files(
+    legacy_root: str | Path,
+    *,
+    include_roots: Sequence[str] | None = None,
+) -> tuple[list[Path], LegacyScanSummary]:
     root = Path(legacy_root).expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"legacy_fucci_tri_root is unreadable: {root}")
 
+    include_root_names = _resolve_include_root_names(root, include_roots)
+    children = {entry.name: entry for entry in sorted(root.iterdir(), key=lambda entry: entry.name)}
+    ignored = tuple(
+        (name, _entry_type(entry))
+        for name, entry in children.items()
+        if name not in include_root_names
+    )
+
     files: list[Path] = []
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        if any(part.startswith(".") or part == "__pycache__" for part in path.relative_to(root).parts):
-            continue
-        files.append(path)
-    return files
+    for root_name in include_root_names:
+        top_level = root / root_name
+        for path in sorted(top_level.rglob("*"), key=lambda candidate: candidate.relative_to(root).as_posix()):
+            if not path.is_file():
+                continue
+            if any(_is_hidden_name(part) for part in path.relative_to(root).parts):
+                continue
+            files.append(path)
+
+    return files, LegacyScanSummary(tuple(include_root_names), ignored)
 
 
 def _top_level_name(source_path: Path, legacy_root: Path) -> str:
@@ -133,31 +240,47 @@ def _session_filename_match(name: str) -> dict[str, str] | None:
     return None
 
 
-def _run_timestamp_role(parts: Iterable[str]) -> str:
-    for part in parts:
-        if RUN_TIMESTAMP_PATTERN.search(part):
-            return "run_timestamp"
-        if part.startswith("roi_matcher_qc_examples_") and DATE_TOKEN_PATTERN.search(part):
-            return "run_timestamp"
-    return "none"
+def _root_laser_hint(root_name: str) -> int | None:
+    if "1050" in root_name:
+        return 1050
+    if "920" in root_name:
+        return 920
+    return None
 
 
-def _has_longitudinal_tree_context(relative_parts: tuple[str, ...]) -> bool:
-    top_level = relative_parts[0] if relative_parts else ""
-    if top_level.startswith(LONGITUDINAL_TREE_PREFIXES) or "small_test" in top_level:
-        return True
-    return any(part == "analysis" for part in relative_parts)
+def _is_longitudinal_root(root_name: str) -> bool:
+    return root_name == "1050_small_test_fireants" or root_name.startswith("roi_matcher_qc_examples_")
 
 
-def _product_class(path: Path, session_match: dict[str, str] | None) -> str:
+def _contains_run_timestamp(relative_parts: Iterable[str]) -> bool:
+    return any(RUN_TIMESTAMP_PATTERN.search(part) for part in relative_parts)
+
+
+def _target_scope(root_name: str, relative_parts: tuple[str, ...], session_match: dict[str, str] | None) -> str:
+    if _is_longitudinal_root(root_name):
+        return "longitudinal"
+    if any(part == "analysis" for part in relative_parts):
+        return "longitudinal"
+    if _contains_run_timestamp(relative_parts):
+        return "longitudinal"
+    if session_match is not None:
+        return "session"
+    if _is_allowed_root_name(root_name):
+        return "longitudinal"
+    return "unmapped"
+
+
+def _product_class(path: Path, root_name: str, session_match: dict[str, str] | None) -> str:
     name = path.name
     suffix = path.suffix.lower()
     lower = name.lower()
-    if session_match:
+
+    if session_match is not None:
         channel = session_match["channel"].upper()
-        if channel == "R" and name == f"{session_match['date']}_R.tif":
+        date = session_match["date"]
+        if channel == "R" and name == f"{date}_R.tif":
             return "raw_red_stack"
-        if channel == "G" and name == f"{session_match['date']}_G.tif":
+        if channel == "G" and name == f"{date}_G.tif":
             return "raw_green_stack"
         if "_cp_masks" in lower:
             return "session_mask"
@@ -166,103 +289,110 @@ def _product_class(path: Path, session_match: dict[str, str] | None) -> str:
         if lower.endswith("_roi_mask_syn_inversed.tif"):
             return "session_registered_mask"
         return "session_stack"
-    if "analysis" in path.parts:
-        return "analysis_output"
-    if lower.startswith("mean_image_") and suffix == ".tif":
-        return "mean_image"
-    if lower.startswith("roi_intensity_results") and suffix == ".csv":
-        return "roi_table"
-    if lower == "dark_values.tif":
-        return "dark_reference"
-    if lower == "run_log.json":
-        return "run_metadata"
-    if "roi_matcher_qc_examples" in "/".join(path.parts):
+
+    if root_name.startswith("roi_matcher_qc_examples_"):
         if suffix == ".png":
             return "qc_figure"
         if suffix == ".csv":
             return "qc_table"
-        if suffix == ".md":
-            return "qc_summary"
         if suffix == ".json":
             return "qc_metadata"
+        if suffix == ".md":
+            return "qc_summary"
+        return "qc_output"
+
+    if root_name == "1050_small_test_fireants":
+        if suffix == ".png":
+            return "test_figure"
+        if suffix == ".csv":
+            return "test_table"
+        if suffix == ".json":
+            return "test_metadata"
+        if suffix == ".md":
+            return "test_summary"
+        return "test_output"
+
     if suffix == ".png":
-        return "figure"
+        return "analysis_figure"
     if suffix == ".csv":
-        return "table"
+        return "analysis_table"
     if suffix == ".json":
-        return "json_metadata"
+        return "analysis_metadata"
     if suffix == ".md":
-        return "markdown"
-    if suffix == ".ipynb":
-        return "notebook"
-    if suffix == ".py":
-        return "script"
+        return "analysis_summary"
     if suffix == ".npy":
-        return "npy_array"
-    return "other"
+        return "analysis_array"
+    if suffix == ".tif":
+        return "analysis_output"
+    return "legacy_output"
 
 
-def _candidate_mouse_ids(
-    relative_parts: tuple[str, ...],
-    session_match: dict[str, str] | None,
-    catalog_sessions: dict[tuple[str, str, int], CatalogSession],
-    tree_laser_nm: int | None,
-) -> tuple[str, ...]:
-    if not session_match or tree_laser_nm is None:
-        return ()
-    acquisition_date = f"{session_match["date"][:4]}-{session_match["date"][4:6]}-{session_match["date"][6:]}"
-    candidates = tuple(
-        sorted(
-            session.mouse_id
-            for key, session in catalog_sessions.items()
-            if key[1] == acquisition_date and key[2] == tree_laser_nm
-        )
-    )
-    return candidates
+def _date_token_role(relative_parts: tuple[str, ...], root_name: str, session_match: dict[str, str] | None) -> str:
+    if session_match is not None:
+        return "acquisition_date"
+    if _contains_run_timestamp(relative_parts):
+        return "run_timestamp"
+    if root_name.startswith("roi_matcher_qc_examples_") and DATE_TOKEN_PATTERN.search(root_name):
+        return "run_timestamp"
+    if any(DATE_TOKEN_PATTERN.search(part) for part in relative_parts):
+        return "run_timestamp"
+    return "none"
 
 
-def infer_tree_context(
-    legacy_root: str | Path,
-    source_files: Iterable[Path],
+def _mouse_candidates_for_laser(catalog_sessions: dict[tuple[str, str, int], CatalogSession], laser_nm: int) -> list[str]:
+    return sorted({session.mouse_id for session in catalog_sessions.values() if session.laser_nm == laser_nm})
+
+
+def _infer_tree_contexts(
+    legacy_root: Path,
+    files: Iterable[Path],
     catalog_sessions: dict[tuple[str, str, int], CatalogSession],
 ) -> dict[str, TreeContext]:
-    root = Path(legacy_root).expanduser().resolve()
     grouped: dict[str, list[Path]] = {}
-    for path in source_files:
-        top_level = _top_level_name(path, root)
-        grouped.setdefault(top_level, []).append(path)
+    for path in files:
+        grouped.setdefault(_top_level_name(path, legacy_root), []).append(path)
 
     contexts: dict[str, TreeContext] = {}
-    for top_level, paths in grouped.items():
-        laser_hint = None
-        laser_match = LASER_PATTERN.search(top_level)
-        if laser_match:
-            laser_hint = int(laser_match.group("laser"))
-
-        session_mouse_candidates: set[str] = set()
-        for path in paths:
-            relative_parts = path.relative_to(root).parts
-            session_match = _session_filename_match(path.name)
-            if not session_match:
-                continue
-            if laser_hint is None:
-                laser_match = LASER_PATTERN.search(path.name)
-                if laser_match:
-                    laser_hint = int(laser_match.group("laser"))
-            if laser_hint is None:
-                continue
-            session_mouse_candidates.update(
-                _candidate_mouse_ids(relative_parts, session_match, catalog_sessions, laser_hint)
-            )
-
-        mouse_id = next(iter(session_mouse_candidates)) if len(session_mouse_candidates) == 1 else None
+    for root_name, root_files in grouped.items():
+        laser_hint = _root_laser_hint(root_name)
+        candidate_mice: set[str] = set()
         evidence: list[str] = []
+
         if laser_hint is not None:
             evidence.append(f"laser_hint={laser_hint}")
+
+        for path in root_files:
+            session_match = _session_filename_match(path.name)
+            if session_match is None or laser_hint is None:
+                continue
+            session_date = _iso_date(session_match["date"])
+            for session in catalog_sessions.values():
+                if session.acquisition_date == session_date and session.laser_nm == laser_hint:
+                    candidate_mice.add(session.mouse_id)
+
+        if not candidate_mice and laser_hint is not None:
+            mice_for_laser = _mouse_candidates_for_laser(catalog_sessions, laser_hint)
+            if len(mice_for_laser) == 1:
+                candidate_mice.add(mice_for_laser[0])
+                evidence.append(f"mouse_inferred_from_unique_laser={mice_for_laser[0]}")
+
+        mouse_id = next(iter(candidate_mice)) if len(candidate_mice) == 1 else None
         if mouse_id is not None:
             evidence.append(f"mouse_inferred={mouse_id}")
-        contexts[top_level] = TreeContext(mouse_id=mouse_id, laser_nm=laser_hint, evidence=tuple(evidence))
+
+        contexts[root_name] = TreeContext(mouse_id=mouse_id, laser_nm=laser_hint, evidence=tuple(evidence))
     return contexts
+
+
+def _catalog_session_match(
+    catalog_sessions: dict[tuple[str, str, int], CatalogSession],
+    mouse_id: str | None,
+    session_date: str | None,
+    laser_nm: int | None,
+) -> bool | str:
+    if session_date is None or mouse_id is None or laser_nm is None:
+        return "not_applicable"
+    return (mouse_id, session_date, laser_nm) in catalog_sessions
 
 
 def _session_target(
@@ -299,48 +429,27 @@ def _longitudinal_target(
     )
 
 
-def _catalog_match(
-    catalog_sessions: dict[tuple[str, str, int], CatalogSession],
-    mouse_id: str | None,
-    session_date: str | None,
-    laser_nm: int | None,
-) -> bool | str:
-    if mouse_id is None or session_date is None or laser_nm is None:
-        return "not_applicable"
-    return (mouse_id, session_date, laser_nm) in catalog_sessions
-
-
-def _collision_status(target: Path | None, existing_targets: set[Path], duplicate_targets: set[Path]) -> str:
+def _collision_status(target: Path | None, *, target_counts: Counter[Path]) -> str:
     if target is None:
         return "not_applicable"
-    if target in duplicate_targets:
+    if target_counts[target] > 1:
         return "duplicate_target"
     if target.exists():
         return "exists"
-    if target in existing_targets:
-        return "duplicate_target"
     return "clear"
 
-def _mtime_utc(path: Path) -> str:
-    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
 
-
-def _infer_scope(
-    relative_parts: tuple[str, ...],
-    session_match: dict[str, str] | None,
+def _resolve_inference_status(
+    target_scope: str,
+    mouse_id: str | None,
+    laser_nm: int | None,
+    proposed_target: Path | None,
+    catalog_session_match: bool | str,
 ) -> str:
-    if _has_longitudinal_tree_context(relative_parts):
-        return "longitudinal"
-    if session_match:
-        return "session"
-    return "unmapped"
-
-
-def _inference_status(mouse_id: str | None, laser_nm: int | None, target_scope: str) -> str:
     if target_scope == "session":
-        return "resolved" if mouse_id is not None and laser_nm is not None else "ambiguous"
+        return "resolved" if proposed_target is not None and catalog_session_match is True else "ambiguous"
     if target_scope == "longitudinal":
-        if mouse_id is not None and laser_nm is not None:
+        if proposed_target is not None and mouse_id is not None and laser_nm is not None:
             return "resolved"
         if mouse_id is not None or laser_nm is not None:
             return "ambiguous"
@@ -358,9 +467,13 @@ def _reason_evidence(
     date_token_role: str,
     catalog_session_match: bool | str,
 ) -> str:
-    pieces = [f"path={relative_source_path}", f"product_class={product_class}", f"target_scope={target_scope}"]
+    pieces = [
+        f"path={relative_source_path}",
+        f"product_class={product_class}",
+        f"target_scope={target_scope}",
+    ]
     if session_match is not None:
-        pieces.append(f"session_filename_date={session_match['date']}")
+        pieces.append(f"session_filename_date={_iso_date(session_match['date'])}")
         pieces.append(f"session_filename_channel={session_match['channel']}")
     if tree_context.mouse_id is not None:
         pieces.append(f"mouse={tree_context.mouse_id}")
@@ -373,15 +486,43 @@ def _reason_evidence(
     return "; ".join(pieces)
 
 
+def _atomic_write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def build_legacy_derivatives_audit(
     config: ProjectConfig,
     *,
     acquisition_catalog_path: str | Path | None = None,
     output_dir: str | Path | None = None,
+    include_roots: Sequence[str] | None = None,
     write_outputs: bool = True,
-) -> tuple[list[dict[str, object]], list[dict[str, object]], Path]:
-    """Build the inventory and review-only migration plan."""
-
+    return_summary: bool = False,
+):
     if config.paths.legacy_fucci_tri_root is None:
         raise ValueError("legacy_fucci_tri_root is required in the project configuration.")
 
@@ -396,8 +537,8 @@ def build_legacy_derivatives_audit(
     )
     catalog_rows = load_acquisition_catalog(catalog_path)
     catalog_sessions = build_catalog_sessions(catalog_rows)
-    source_files = iter_legacy_source_files(legacy_root)
-    tree_contexts = infer_tree_context(legacy_root, source_files, catalog_sessions)
+    source_files, summary = discover_legacy_source_files(legacy_root, include_roots=include_roots)
+    tree_contexts = _infer_tree_contexts(legacy_root, source_files, catalog_sessions)
 
     inventory_rows: list[dict[str, object]] = []
     plan_rows: list[dict[str, object]] = []
@@ -406,47 +547,54 @@ def build_legacy_derivatives_audit(
     for path in source_files:
         relative_source_path = path.relative_to(legacy_root).as_posix()
         relative_parts = path.relative_to(legacy_root).parts
+        root_name = relative_parts[0]
         session_match = _session_filename_match(path.name)
-        product_class = _product_class(path, session_match)
-        target_scope = _infer_scope(relative_parts, session_match)
-        tree_context = tree_contexts[_top_level_name(path, legacy_root)]
-        laser_nm = tree_context.laser_nm
+        target_scope = _target_scope(root_name, relative_parts, session_match)
+        product_class = _product_class(path, root_name, session_match)
+        date_token_role = _date_token_role(relative_parts, root_name, session_match)
+        tree_context = tree_contexts.get(root_name, TreeContext(None, None, ()))
         mouse_id = tree_context.mouse_id
-        session_date = (
-            f"{session_match["date"][:4]}-{session_match["date"][4:6]}-{session_match["date"][6:]}"
-            if target_scope == "session" and session_match
-            else None
-        )
-        if target_scope == "session" and session_date is not None and laser_nm is not None and mouse_id is None:
-            candidates = _candidate_mouse_ids(relative_parts, session_match, catalog_sessions, laser_nm)
-            mouse_id = candidates[0] if len(candidates) == 1 else None
+        laser_nm = tree_context.laser_nm
 
-        date_token_role = "acquisition_date" if target_scope == "session" and session_date is not None else _run_timestamp_role(relative_parts)
-        if target_scope != "session" and date_token_role == "acquisition_date":
-            date_token_role = "none"
+        session_date = _iso_date(session_match["date"]) if session_match is not None and target_scope == "session" else None
+        catalog_session_match = _catalog_session_match(catalog_sessions, mouse_id, session_date, laser_nm)
 
-        catalog_session_match = _catalog_match(catalog_sessions, mouse_id, session_date, laser_nm)
-        inference_status = _inference_status(mouse_id, laser_nm, target_scope)
-        if target_scope == "session":
-            inference_status = "resolved" if catalog_session_match is True and mouse_id is not None and laser_nm is not None else "ambiguous"
+        if target_scope == "session" and catalog_session_match is not True and session_date is not None and laser_nm is not None and mouse_id is None:
+            matching_mice = sorted(
+                {
+                    session.mouse_id
+                    for session in catalog_sessions.values()
+                    if session.acquisition_date == session_date and session.laser_nm == laser_nm
+                }
+            )
+            if len(matching_mice) == 1:
+                mouse_id = matching_mice[0]
+                catalog_session_match = _catalog_session_match(catalog_sessions, mouse_id, session_date, laser_nm)
+
+        if target_scope == "longitudinal" and mouse_id is None and laser_nm is not None:
+            matching_mice = _mouse_candidates_for_laser(catalog_sessions, laser_nm)
+            if len(matching_mice) == 1:
+                mouse_id = matching_mice[0]
+                catalog_session_match = "not_applicable"
 
         proposed_target: Path | None = None
-        if inference_status == "resolved":
-            if target_scope == "session" and session_date is not None and catalog_session_match is True:
-                proposed_target = _session_target(config, mouse_id or "", laser_nm or 0, session_date, relative_source_path)
-            elif target_scope == "longitudinal":
-                proposed_target = _longitudinal_target(config, mouse_id or "", laser_nm or 0, relative_source_path)
+        if target_scope == "session" and session_date is not None and catalog_session_match is True and mouse_id is not None and laser_nm is not None:
+            proposed_target = _session_target(config, mouse_id, laser_nm, session_date, relative_source_path)
+        elif target_scope == "longitudinal" and mouse_id is not None and laser_nm is not None:
+            proposed_target = _longitudinal_target(config, mouse_id, laser_nm, relative_source_path)
 
+        proposed_target = validate_output_path(proposed_target, config) if proposed_target is not None else None
         if proposed_target is not None:
-            proposed_target = validate_output_path(proposed_target, config)
             proposed_targets.append(proposed_target)
+
+        inference_status = _resolve_inference_status(target_scope, mouse_id, laser_nm, proposed_target, catalog_session_match)
 
         inventory_rows.append(
             {
                 "relative_source_path": relative_source_path,
                 "source_path": path.as_posix(),
                 "size_bytes": path.stat().st_size,
-                "mtime_utc": _mtime_utc(path),
+                "mtime_utc": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
                 "extension": path.suffix.lower(),
                 "inferred_mouse_id": mouse_id or "",
                 "inferred_laser_nm": laser_nm if laser_nm is not None else "",
@@ -481,9 +629,9 @@ def build_legacy_derivatives_audit(
                 "catalog_session_match": catalog_session_match,
                 "inference_status": inference_status,
                 "action": "review_required",
-                "collision_status": "clear" if proposed_target is not None else "not_applicable",
+                "collision_status": "not_applicable",
                 "source_size_bytes": path.stat().st_size,
-                "source_mtime_utc": _mtime_utc(path),
+                "source_mtime_utc": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
                 "reason_evidence": _reason_evidence(
                     relative_source_path=relative_source_path,
                     product_class=product_class,
@@ -496,14 +644,11 @@ def build_legacy_derivatives_audit(
             }
         )
 
-    duplicate_targets = {target for target in proposed_targets if proposed_targets.count(target) > 1}
-    target_lookup = {Path(row["proposed_target"]) for row in plan_rows if row["proposed_target"]}
+    target_counts = Counter(Path(row["proposed_target"]) for row in plan_rows if row["proposed_target"])
     for row in plan_rows:
         proposed_target = row["proposed_target"]
-        if not proposed_target:
-            continue
-        target_path = Path(proposed_target)
-        row["collision_status"] = _collision_status(target_path, target_lookup, duplicate_targets)
+        if proposed_target:
+            row["collision_status"] = _collision_status(Path(proposed_target), target_counts=target_counts)
 
     inventory_rows.sort(key=lambda row: row["relative_source_path"])
     plan_rows.sort(key=lambda row: row["source_path"])
@@ -514,55 +659,9 @@ def build_legacy_derivatives_audit(
         else validate_output_path(config.paths.derivatives_root / "_catalog" / "phase2a_audit", config)
     )
     if write_outputs:
-        audit_dir.mkdir(parents=True, exist_ok=True)
-        _write_csv(
-            audit_dir / "legacy_derivatives_inventory.csv",
-            inventory_rows,
-            [
-                "relative_source_path",
-                "source_path",
-                "size_bytes",
-                "mtime_utc",
-                "extension",
-                "inferred_mouse_id",
-                "inferred_laser_nm",
-                "product_class",
-                "target_scope",
-                "inferred_session_date",
-                "date_token_role",
-                "catalog_session_match",
-                "inference_status",
-                "notes",
-            ],
-        )
-        _write_csv(
-            audit_dir / "legacy_derivatives_migration_plan.csv",
-            plan_rows,
-            [
-                "source_path",
-                "proposed_target",
-                "inferred_mouse_id",
-                "inferred_laser_nm",
-                "product_class",
-                "target_scope",
-                "inferred_session_date",
-                "date_token_role",
-                "catalog_session_match",
-                "inference_status",
-                "action",
-                "collision_status",
-                "source_size_bytes",
-                "source_mtime_utc",
-                "reason_evidence",
-            ],
-        )
+        _atomic_write_csv(audit_dir / "legacy_derivatives_inventory.csv", inventory_rows, INVENTORY_FIELDNAMES)
+        _atomic_write_csv(audit_dir / "legacy_derivatives_migration_plan.csv", plan_rows, PLAN_FIELDNAMES)
+
+    if return_summary:
+        return inventory_rows, plan_rows, audit_dir, summary
     return inventory_rows, plan_rows, audit_dir
-
-
-def _write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-

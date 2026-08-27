@@ -18,6 +18,7 @@ def parse_args(argv=None):
     parser.add_argument("--project-config", required=True)
     parser.add_argument("--acquisition-catalog", default=None)
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--include-root", action="append", default=None, help="Direct child root name to include; may be repeated.")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -25,12 +26,19 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     config = load_project_config(args.project_config)
-    inventory_rows, plan_rows, audit_dir = build_legacy_derivatives_audit(
+    result = build_legacy_derivatives_audit(
         config,
         acquisition_catalog_path=args.acquisition_catalog,
         output_dir=args.output_dir,
+        include_roots=args.include_root,
         write_outputs=not args.dry_run,
+        return_summary=True,
     )
+    inventory_rows, plan_rows, audit_dir, summary = result
+    print(f"included_roots={', '.join(summary.included_roots)}")
+    if summary.ignored_top_level_entries:
+        ignored = ", ".join(f"{name}:{kind}" for name, kind in summary.ignored_top_level_entries)
+        print(f"ignored_top_level_entries={ignored}")
     print(f"inventory_rows={len(inventory_rows)} plan_rows={len(plan_rows)} audit_dir={audit_dir}")
     if args.dry_run:
         print("dry-run: no files written")

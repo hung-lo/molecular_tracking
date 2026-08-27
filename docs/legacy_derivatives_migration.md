@@ -10,9 +10,12 @@ data. Its only write outputs are the two audit CSVs beneath:
 
 - reads the project configuration
 - reads the canonical acquisition catalog
-- scans `legacy_fucci_tri_root`
+- scans only the allowlisted top-level product roots under `legacy_fucci_tri_root`
+  - exact roots: `1050_data`, `920_data`, `2wks_1050_data`, `1050_small_test_fireants`
+- default qc allowlist: `roi_matcher_qc_examples_*` except the later `roi_matcher_qc_examples_syn_20260615_01_styled` tree, which is intentionally excluded to preserve the original 2,920-row audit scope
+  - glob roots: `roi_matcher_qc_examples_*`
 - classifies each legacy source file as `session`, `longitudinal`, or `unmapped`
-- writes:
+- writes the two audit CSVs atomically beneath `<derivatives_root>/_catalog/phase2a_audit/` using a temporary file plus `os.replace()`:
   - `legacy_derivatives_inventory.csv`
   - `legacy_derivatives_migration_plan.csv`
 
@@ -27,7 +30,9 @@ recognized session filename such as:
 - `20260511_R_SyN.tif`
 
 The planner does not infer a session from an arbitrary ancestor directory. That is the key
-correction for Phase 2A.
+correction for Phase 2A. The CLI also reports the included top-level roots and the ignored
+entries by name/type so the scan scope is auditable. The default scan scope preserves the
+already-generated 2,920-row audit package exactly.
 
 ## Longitudinal rule
 
@@ -90,8 +95,11 @@ Every planned action remains `review_required`.
 ```bash
 python tools/build_legacy_derivatives_plan.py \
   --project-config config/project.local.toml \
-  --acquisition-catalog /path/to/acquisitions.generated.csv
+  --acquisition-catalog /path/to/acquisitions.generated.csv \
+  --include-root 1050_data \
+  --include-root 920_data
 ```
 
-Use `--dry-run` if you want the summary without writing the CSVs.
+Use `--dry-run` if you want the summary without writing the CSVs. Each `--include-root`
+value must be a direct child of `legacy_fucci_tri_root`.
 

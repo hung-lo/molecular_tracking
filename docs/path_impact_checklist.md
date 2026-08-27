@@ -20,6 +20,10 @@
   product and passes the project run root explicitly so outputs land under
   `<mouse>/longitudinal/920/runs`.
 - `core/roi_log_ratio_analysis.py`: updated; reusable reference dates are explicit/nullable.
+- `core/legacy_derivatives_plan.py` and `tools/build_legacy_derivatives_plan.py`: added a
+  read-only, allowlisted Phase 2A audit planner that scans only the legacy product roots,
+  prints included/ignored scan summaries, and writes audit CSVs atomically under the derivatives
+  catalog.
 - Residual, linear-summary, raw-space, and quick-plot CLIs under `plotting/`: updated for exact
   analysis/run selection; project inputs are validated against an explicit config/mouse/laser;
   no latest-run selection exists. Legacy exact inputs remain supported.

@@ -13,8 +13,8 @@
 - `core/run_registered_roi_pipeline.py`: updated; project mode resolves only a prepared
   `registered` product and writes under selected derivatives runs. Legacy explicit paths remain.
 - `core/run_weekly_matched_roi_pipeline.py`: updated; project mode resolves only a prepared
-  `weekly_registered` product and validates it before creating a run output directory. Legacy
-  explicit paths remain.
+  `weekly_registered` product, requires its published metadata, and validates it before creating
+  a run output directory. Legacy explicit paths remain.
 - `core/run_920_two_day_cp3nuclei_analysis.py`: updated; explicit legacy mode is valid even
   though the wrapper forces 920, while project mode validates a prepared 920 `registered`
   product and passes the project run root explicitly so outputs land under
@@ -27,9 +27,9 @@
   reusable dates are explicit/nullable.
 - `notebooks/weeklyRegister_20260531.ipynb`: setup/path cell now reads flat source TIFFs
   from `registered/`, stages the compatibility product under `weekly_registered/.staging/`,
-  publishes a flat validated `weekly_registered/` product only when refresh is allowed,
-  and ANTs calls receive XML-derived ZYX spacing. Crop, `genericLabel`, and geometry logic is
-  retained.
+  publishes a flat validated `weekly_registered/` product only when refresh is allowed, and
+  records stable cropped and uncropped filenames plus explicit crop metadata. ANTs calls
+  receive XML-derived ZYX spacing. Crop, `genericLabel`, and geometry logic is retained.
 - `notebooks/cellposeSAM_batch_segmentation_20260712.ipynb`: setup/input/output cell now uses
   explicit project selection and derivative preprocessing/segmentation paths.
 - Four historical analysis notebooks: intentionally retained as legacy/reference notebooks with

@@ -328,8 +328,12 @@ def test_weekly_notebook_uses_registered_source_and_weekly_registered_output():
     code = "\n".join("".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code")
 
     assert "registered_input_dir = project_paths.registered_product_dir.as_posix()" in code
+    assert "build_expected_weekly_product_filenames" in code
+    assert "build_weekly_product_metadata" in code
+    assert "stable_registered_stem" in code
     assert "weekly_stage_dir = prepare_weekly_product_workspace" in code
     assert "REFRESH_WEEKLY_PRODUCT = False" in code
+    assert "replace_existing=REFRESH_WEEKLY_PRODUCT" in code
+    assert "cropping_enabled = DO_CROP_IMAGE" in code
     assert "publish_staged_weekly_product" in code
-    assert "weekly_product_metadata.json" in code
     assert "project_paths.preprocessing_dir.as_posix()" not in code

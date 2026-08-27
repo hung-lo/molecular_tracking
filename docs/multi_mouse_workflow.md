@@ -19,8 +19,9 @@ Until mask, red, and green derivative files exist, this writes
 physical migration are intentionally deferred. Use explicit dataset, manifest, match, and
 output paths for legacy workflows.
 The weekly registration notebook reads flat source TIFFs from `registered/`, stages its
-compatibility outputs under `weekly_registered/.staging/`, and publishes the final flat
-compatibility product into `weekly_registered/` only after validation. The weekly matcher
-consumes that validated directory directly. Duplicate day/channel products are treated as
-errors. The 920 compatibility wrapper writes project-mode outputs under
-`<mouse>/longitudinal/920/runs/`.
+compatibility outputs under `weekly_registered/.staging/`, and commits the replacement only
+after the staged product validates. Refresh keeps the previous published product intact until
+that commit succeeds, and any failed refresh rolls back automatically. The notebook publishes
+stable cropped and uncropped daywise names, and duplicate day/channel products are treated as
+errors. The weekly matcher consumes the validated `weekly_registered/` directory directly. The
+920 compatibility wrapper writes project-mode outputs under `<mouse>/longitudinal/920/runs/`.

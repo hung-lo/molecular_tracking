@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -8,11 +9,15 @@ import pytest
 import tifffile
 
 import run_weekly_matched_roi_pipeline as run_weekly
+import weekly_registered_product as weekly_product
 from project_config import load_project_config
 from roi_log_ratio_analysis import build_registered_image_lookup
 from weekly_registered_product import (
+    build_expected_weekly_product_filenames,
+    build_weekly_product_metadata,
     prepare_weekly_product_workspace,
     publish_staged_weekly_product,
+    stable_registered_stem,
 )
 
 
@@ -61,150 +66,431 @@ def _write_match_csv(path: Path) -> None:
     path.write_text("cluster_id,week1_roi\n1,1\n", encoding="utf-8")
 
 
-def _write_project_weekly_product(
-    product_dir: Path,
+def _build_week1_stage(
+    staging_dir: Path,
     *,
-    duplicate_crop_variants: bool = False,
-    incomplete: bool = False,
-    inconsistent: bool = False,
-) -> None:
-    product_dir.mkdir(parents=True, exist_ok=True)
-    if duplicate_crop_variants:
-        _write_stack(product_dir / "20260511_R_crop_64x64_SyN.tif", [1, 2, 3])
-        _write_stack(product_dir / "20260511_R_crop_512x512_SyN.tif", [1, 2, 3])
-        _write_stack(product_dir / "20260511_G_crop_64x64_SyN.tif", [1, 2, 3])
-        _write_stack(product_dir / "20260511_G_crop_512x512_SyN.tif", [1, 2, 3])
-    elif incomplete:
-        _write_stack(product_dir / "20260511_R_SyN.tif", [1, 2, 3])
-        _write_stack(product_dir / "20260511_G_SyN.tif", [1, 2, 3])
-        _write_stack(product_dir / "20260512_R_SyN.tif", [1, 2, 3])
-    elif inconsistent:
-        _write_stack(product_dir / "20260511_R_SyN.tif", [1, 2, 3])
-        _write_stack(product_dir / "20260511_G_SyN.tif", [1, 2, 3])
-        _write_stack(product_dir / "20260512_R_SyN.tif", [1, 2, 3, 4], shape=(1, 1, 4))
-        _write_stack(product_dir / "20260512_G_SyN.tif", [1, 2, 3, 4], shape=(1, 1, 4))
-    else:
-        _write_stack(product_dir / "20260511_R_SyN.tif", [1, 2, 3])
-        _write_stack(product_dir / "20260511_G_SyN.tif", [1, 2, 3])
-        _write_stack(product_dir / "20260512_R_SyN.tif", [4, 5, 6])
-        _write_stack(product_dir / "20260512_G_SyN.tif", [4, 5, 6])
-        tifffile.imwrite(product_dir / "week1_average_cp_masks.tif", np.asarray([[[1, 2, 3]]], dtype=np.uint16))
-        (product_dir / "weekly_product_metadata.json").write_text(
-            '{"crop_shape": [1, 3], "published_files": ["20260511_R_SyN.tif"]}',
-            encoding="utf-8",
+    day0_date: str,
+    day1_date: str,
+    crop_label: str | None,
+    values_offset: int = 0,
+) -> tuple[dict[str, list[str]], set[str]]:
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f"_crop_{crop_label}" if crop_label else ""
+    source_file_names = [
+        f"{day0_date}_R{suffix}.tif",
+        f"{day0_date}_G{suffix}.tif",
+        f"{day1_date}_R{suffix}.tif",
+        f"{day1_date}_G{suffix}.tif",
+    ]
+    stage_file_names = [f"{stable_registered_stem(name)}_SyN.tif" for name in source_file_names]
+    for index, file_name in enumerate(stage_file_names):
+        _write_stack(
+            staging_dir / file_name,
+            [values_offset + index * 3 + 1, values_offset + index * 3 + 2, values_offset + index * 3 + 3],
         )
+    _write_stack(staging_dir / "week1_average.tif", [values_offset + 100, values_offset + 101, values_offset + 102])
+    _write_stack(
+        staging_dir / "week1_average_cp_masks.tif",
+        [values_offset + 200, values_offset + 201, values_offset + 202],
+    )
+    week_dict = {"week1": [str(staging_dir / file_name) for file_name in source_file_names]}
+    expected_names = build_expected_weekly_product_filenames(week_dict, ["week1"])
+    expected_names.update({"week1_average.tif", "week1_average_cp_masks.tif"})
+    return week_dict, expected_names
 
 
-def test_duplicate_selected_registered_candidates_raise_and_name_both_files(tmp_path: Path) -> None:
-    product_dir = tmp_path / "weekly_registered"
-    _write_project_weekly_product(product_dir, duplicate_crop_variants=True)
+def _publish_weekly_product(
+    weekly_output_dir: Path,
+    *,
+    registered_input_dir: Path,
+    day0_date: str,
+    day1_date: str,
+    crop_label: str | None,
+    cropping_enabled: bool,
+    values_offset: int = 0,
+    prepare_refresh: bool = False,
+    replace_existing: bool = False,
+) -> Path:
+    staging_dir = prepare_weekly_product_workspace(weekly_output_dir, refresh=prepare_refresh)
+    week_dict, expected_names = _build_week1_stage(
+        staging_dir,
+        day0_date=day0_date,
+        day1_date=day1_date,
+        crop_label=crop_label,
+        values_offset=values_offset,
+    )
+    metadata = build_weekly_product_metadata(
+        crop_shape=None if not cropping_enabled else [1, 3],
+        cropping_enabled=cropping_enabled,
+        crop_label=crop_label,
+        refresh_requested=replace_existing,
+        registered_input_dir=registered_input_dir.as_posix(),
+        source_registered_files=[
+            f"{day0_date}_R.tif",
+            f"{day0_date}_G.tif",
+            f"{day1_date}_R.tif",
+            f"{day1_date}_G.tif",
+        ],
+        spacing_zyx=(5.0, 0.69, 0.69),
+        staging_dir=staging_dir,
+        weekly_output_dir=weekly_output_dir,
+        week_names=["week1"],
+        published_at="2026-08-27T00:00:00",
+    )
+    return publish_staged_weekly_product(
+        staging_dir,
+        weekly_output_dir,
+        expected_filenames=sorted(expected_names),
+        metadata_filename="weekly_product_metadata.json",
+        replace_existing=replace_existing,
+        metadata=metadata,
+    )
 
-    with pytest.raises(ValueError) as excinfo:
-        build_registered_image_lookup(product_dir, start_date="20260511", day0_mode="syn")
 
-    message = str(excinfo.value)
-    assert "Duplicate registered image candidates" in message
-    assert "crop_64x64_SyN.tif" in message
-    assert "crop_512x512_SyN.tif" in message
-
-
-def test_raw_plus_syn_day0_variants_still_work_for_both_modes(tmp_path: Path) -> None:
-    product_dir = tmp_path / "weekly_registered"
-    product_dir.mkdir()
-    _write_stack(product_dir / "20260511_R.tif", [1, 2, 3])
-    _write_stack(product_dir / "20260511_G.tif", [4, 5, 6])
-    _write_stack(product_dir / "20260511_R_SyN.tif", [7, 8, 9])
-    _write_stack(product_dir / "20260511_G_SyN.tif", [10, 11, 12])
-    _write_stack(product_dir / "20260512_R_SyN.tif", [13, 14, 15])
-    _write_stack(product_dir / "20260512_G_SyN.tif", [16, 17, 18])
-
-    raw_lookup = build_registered_image_lookup(product_dir, start_date="20260511", day0_mode="raw")
-    syn_lookup = build_registered_image_lookup(product_dir, start_date="20260511", day0_mode="syn")
-
-    assert raw_lookup[(0, "red")].name == "20260511_R.tif"
-    assert raw_lookup[(0, "green")].name == "20260511_G.tif"
-    assert syn_lookup[(0, "red")].name == "20260511_R_SyN.tif"
-    assert syn_lookup[(0, "green")].name == "20260511_G_SyN.tif"
-    assert raw_lookup[(1, "red")].name == "20260512_R_SyN.tif"
-    assert syn_lookup[(1, "green")].name == "20260512_G_SyN.tif"
+def _snapshot_published_product(weekly_output_dir: Path) -> dict[str, bytes]:
+    return {
+        path.name: path.read_bytes()
+        for path in weekly_product.list_published_weekly_product_files(weekly_output_dir)
+    }
 
 
-def test_clean_single_crop_weekly_product_validates_successfully(tmp_path: Path) -> None:
-    _config_path, _config = _make_project(tmp_path)
-    product_dir = tmp_path / "weekly_registered"
-    _write_project_weekly_product(product_dir)
+def _write_siblings(tmp_path: Path) -> dict[str, Path]:
+    registered_dir = tmp_path / "registered"
+    raw_root = tmp_path / "raw"
+    other_mouse = tmp_path / "derivatives" / "other_mouse" / "longitudinal" / "920" / "weekly_registered"
+    registered_dir.mkdir(parents=True)
+    raw_root.mkdir(parents=True)
+    other_mouse.mkdir(parents=True)
+    (registered_dir / "sentinel.txt").write_text("registered", encoding="utf-8")
+    (raw_root / "sentinel.txt").write_text("raw", encoding="utf-8")
+    (other_mouse / "sentinel.txt").write_text("other", encoding="utf-8")
+    return {"registered": registered_dir, "raw": raw_root, "other_mouse": other_mouse}
+
+
+def test_stable_registered_stem_and_expected_filenames_handle_cropped_and_uncropped_names(tmp_path: Path) -> None:
+    assert stable_registered_stem("20260511_R.tif") == "20260511_R"
+    assert stable_registered_stem("20260511_R_crop_256x128.tif") == "20260511_R"
+    assert stable_registered_stem("20260511_G_crop_256x128_SyN.tif") == "20260511_G"
+
+    week_dict = {
+        "week1": [
+            str(tmp_path / "20260511_R_crop_256x128.tif"),
+            str(tmp_path / "20260511_G_crop_256x128.tif"),
+            str(tmp_path / "20260512_R_crop_256x128.tif"),
+            str(tmp_path / "20260512_G_crop_256x128.tif"),
+        ]
+    }
+    expected = build_expected_weekly_product_filenames(week_dict, ["week1"])
+    assert {
+        "20260511_R_SyN.tif",
+        "20260511_G_SyN.tif",
+        "20260512_R_SyN.tif",
+        "20260512_G_SyN.tif",
+        "week1_average.tif",
+        "week1_average_cp_masks.tif",
+    }.issubset(expected)
+
+    raw_week_dict = {"week1": [str(tmp_path / "20260511_R.tif"), str(tmp_path / "20260511_G.tif")]}
+    raw_expected = build_expected_weekly_product_filenames(raw_week_dict, ["week1"])
+    assert "20260511_R_SyN.tif" in raw_expected
+    assert "20260511_G_SyN.tif" in raw_expected
+
+
+def test_uncropped_published_names_are_recognized_and_validate_without_crop_shape_mismatch(tmp_path: Path) -> None:
+    weekly_output_dir = tmp_path / "weekly_registered"
+    metadata_path = _publish_weekly_product(
+        weekly_output_dir,
+        registered_input_dir=tmp_path / "registered",
+        day0_date="20260511",
+        day1_date="20260512",
+        crop_label=None,
+        cropping_enabled=False,
+        prepare_refresh=False,
+        replace_existing=False,
+    )
+
+    lookup = build_registered_image_lookup(weekly_output_dir, start_date="20260511", day0_mode="syn")
+    assert lookup[(0, "red")].name == "20260511_R_SyN.tif"
+    assert lookup[(0, "green")].name == "20260511_G_SyN.tif"
+    assert lookup[(1, "red")].name == "20260512_R_SyN.tif"
+    assert lookup[(1, "green")].name == "20260512_G_SyN.tif"
+
     match_csv = tmp_path / "matches.csv"
     _write_match_csv(match_csv)
-
-    match_table = run_weekly.validate_weekly_registered_product(product_dir, match_csv, start_date="20260511")
+    match_table = run_weekly.validate_weekly_registered_product(
+        weekly_output_dir,
+        match_csv,
+        start_date="20260511",
+        require_metadata=True,
+    )
     assert match_table["cluster_id"].tolist() == [1]
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["crop_shape"] is None
+    assert metadata["cropping_enabled"] is False
+    assert metadata["published_files"] == [
+        "20260511_G_SyN.tif",
+        "20260511_R_SyN.tif",
+        "20260512_G_SyN.tif",
+        "20260512_R_SyN.tif",
+        "week1_average.tif",
+        "week1_average_cp_masks.tif",
+    ]
+    assert metadata["published_sha256"]["20260511_R_SyN.tif"]
 
 
 def test_refresh_required_when_published_product_exists(tmp_path: Path) -> None:
     weekly_output_dir = tmp_path / "weekly_registered"
+    registered_dir = tmp_path / "registered"
+    raw_root = tmp_path / "raw"
     weekly_output_dir.mkdir()
-    (weekly_output_dir / "20260511_R_SyN.tif").write_text("old", encoding="utf-8")
-    (weekly_output_dir / "20260511_G_SyN.tif").write_text("old", encoding="utf-8")
+    registered_dir.mkdir()
+    raw_root.mkdir()
+    before = _publish_weekly_product(
+        weekly_output_dir,
+        registered_input_dir=registered_dir,
+        day0_date="20260511",
+        day1_date="20260512",
+        crop_label=None,
+        cropping_enabled=False,
+        prepare_refresh=False,
+        replace_existing=False,
+    )
+    snapshot = _snapshot_published_product(weekly_output_dir)
 
     with pytest.raises(FileExistsError, match="REFRESH_WEEKLY_PRODUCT=True"):
         prepare_weekly_product_workspace(weekly_output_dir, refresh=False)
 
-    assert (weekly_output_dir / "20260511_R_SyN.tif").exists()
-    assert (weekly_output_dir / "20260511_G_SyN.tif").exists()
+    assert _snapshot_published_product(weekly_output_dir) == snapshot
+    assert before.read_text(encoding="utf-8") == (weekly_output_dir / "weekly_product_metadata.json").read_text(encoding="utf-8")
 
 
-def test_refresh_removes_only_allowlisted_weekly_files(tmp_path: Path) -> None:
+def test_refresh_preparation_preserves_previous_product_before_publish_failure(tmp_path: Path) -> None:
     weekly_output_dir = tmp_path / "weekly_registered"
-    registered_dir = tmp_path / "registered"
-    raw_dir = tmp_path / "raw"
-    weekly_output_dir.mkdir()
-    registered_dir.mkdir()
-    raw_dir.mkdir()
-    (weekly_output_dir / "20260511_R_SyN.tif").write_text("old", encoding="utf-8")
-    (weekly_output_dir / "20260511_G_SyN.tif").write_text("old", encoding="utf-8")
-    (weekly_output_dir / "sentinel.txt").write_text("keep", encoding="utf-8")
-    (weekly_output_dir / "weekly_product_metadata.json").write_text("{}", encoding="utf-8")
-    (registered_dir / "source.tif").write_text("registered", encoding="utf-8")
-    (raw_dir / "source.tif").write_text("raw", encoding="utf-8")
+    siblings = _write_siblings(tmp_path)
+    _publish_weekly_product(
+        weekly_output_dir,
+        registered_input_dir=siblings["registered"],
+        day0_date="20260511",
+        day1_date="20260512",
+        crop_label=None,
+        cropping_enabled=False,
+        prepare_refresh=False,
+        replace_existing=False,
+    )
+    before = _snapshot_published_product(weekly_output_dir)
 
     staging_dir = prepare_weekly_product_workspace(weekly_output_dir, refresh=True)
+    _build_week1_stage(
+        staging_dir,
+        day0_date="20260518",
+        day1_date="20260519",
+        crop_label="256x128",
+        values_offset=100,
+    )
 
-    assert staging_dir.is_dir()
-    assert not (weekly_output_dir / "20260511_R_SyN.tif").exists()
-    assert not (weekly_output_dir / "20260511_G_SyN.tif").exists()
-    assert (weekly_output_dir / "sentinel.txt").exists()
-    assert (registered_dir / "source.tif").exists()
-    assert (raw_dir / "source.tif").exists()
+    with pytest.raises(RuntimeError, match="simulated failure before publish"):
+        raise RuntimeError("simulated failure before publish")
+
+    assert _snapshot_published_product(weekly_output_dir) == before
+    assert (siblings["registered"] / "sentinel.txt").read_text(encoding="utf-8") == "registered"
+    assert (siblings["raw"] / "sentinel.txt").read_text(encoding="utf-8") == "raw"
+    assert (siblings["other_mouse"] / "sentinel.txt").read_text(encoding="utf-8") == "other"
+    assert staging_dir.exists()
 
 
-def test_failed_staged_publish_leaves_previous_product_intact(tmp_path: Path) -> None:
+def test_refresh_publish_rolls_back_exactly_when_mid_commit_fails(tmp_path: Path, monkeypatch) -> None:
     weekly_output_dir = tmp_path / "weekly_registered"
-    weekly_output_dir.mkdir()
-    (weekly_output_dir / "20260511_R_SyN.tif").write_text("published", encoding="utf-8")
-    (weekly_output_dir / "20260511_G_SyN.tif").write_text("published", encoding="utf-8")
-    staging_dir = weekly_output_dir / ".staging" / "run_failed"
-    staging_dir.mkdir(parents=True)
-    (staging_dir / "20260511_R_SyN.tif").write_text("staged", encoding="utf-8")
+    siblings = _write_siblings(tmp_path)
+    _publish_weekly_product(
+        weekly_output_dir,
+        registered_input_dir=siblings["registered"],
+        day0_date="20260511",
+        day1_date="20260512",
+        crop_label=None,
+        cropping_enabled=False,
+        prepare_refresh=False,
+        replace_existing=False,
+    )
+    before = _snapshot_published_product(weekly_output_dir)
 
-    with pytest.raises(ValueError, match="expected published file set"):
+    staging_dir = prepare_weekly_product_workspace(weekly_output_dir, refresh=True)
+    _, expected_names = _build_week1_stage(
+        staging_dir,
+        day0_date="20260518",
+        day1_date="20260519",
+        crop_label="256x128",
+        values_offset=200,
+    )
+    metadata = build_weekly_product_metadata(
+        crop_shape=[1, 3],
+        cropping_enabled=True,
+        crop_label="256x128",
+        refresh_requested=True,
+        registered_input_dir=siblings["registered"].as_posix(),
+        source_registered_files=[
+            "20260518_R.tif",
+            "20260518_G.tif",
+            "20260519_R.tif",
+            "20260519_G.tif",
+        ],
+        spacing_zyx=(5.0, 0.69, 0.69),
+        staging_dir=staging_dir,
+        weekly_output_dir=weekly_output_dir,
+        week_names=["week1"],
+        published_at="2026-08-27T00:00:00",
+    )
+
+    real_replace = weekly_product.os.replace
+    staged_move_count = {"count": 0}
+
+    def flaky_replace(src, dst):
+        src_path = Path(src)
+        if src_path.parent == staging_dir:
+            staged_move_count["count"] += 1
+            if staged_move_count["count"] == 2:
+                raise RuntimeError("simulated mid-commit failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(weekly_product.os, "replace", flaky_replace)
+
+    with pytest.raises(RuntimeError, match="simulated mid-commit failure"):
         publish_staged_weekly_product(
             staging_dir,
             weekly_output_dir,
-            expected_filenames=["20260511_R_SyN.tif", "20260511_G_SyN.tif", "week1_average_cp_masks.tif"],
-            metadata={"crop_shape": [1, 3]},
+            expected_filenames=sorted(expected_names),
+            metadata_filename="weekly_product_metadata.json",
+            replace_existing=True,
+            metadata=metadata,
         )
 
-    assert (weekly_output_dir / "20260511_R_SyN.tif").read_text(encoding="utf-8") == "published"
-    assert (weekly_output_dir / "20260511_G_SyN.tif").read_text(encoding="utf-8") == "published"
+    assert _snapshot_published_product(weekly_output_dir) == before
+    assert (siblings["registered"] / "sentinel.txt").read_text(encoding="utf-8") == "registered"
+    assert (siblings["raw"] / "sentinel.txt").read_text(encoding="utf-8") == "raw"
+    assert (siblings["other_mouse"] / "sentinel.txt").read_text(encoding="utf-8") == "other"
 
 
-def test_project_weekly_runner_rejects_invalid_prepared_products_before_output_dir(tmp_path: Path, monkeypatch) -> None:
+def test_successful_refresh_replaces_old_product_and_keeps_siblings(tmp_path: Path, monkeypatch) -> None:
+    weekly_output_dir = tmp_path / "weekly_registered"
+    siblings = _write_siblings(tmp_path)
+    _publish_weekly_product(
+        weekly_output_dir,
+        registered_input_dir=siblings["registered"],
+        day0_date="20260511",
+        day1_date="20260512",
+        crop_label=None,
+        cropping_enabled=False,
+        prepare_refresh=False,
+        replace_existing=False,
+    )
+    old_snapshot = _snapshot_published_product(weekly_output_dir)
+
+    staging_dir = prepare_weekly_product_workspace(weekly_output_dir, refresh=True)
+    _, expected_names = _build_week1_stage(
+        staging_dir,
+        day0_date="20260518",
+        day1_date="20260519",
+        crop_label="256x128",
+        values_offset=300,
+    )
+    metadata = build_weekly_product_metadata(
+        crop_shape=[1, 3],
+        cropping_enabled=True,
+        crop_label="256x128",
+        refresh_requested=True,
+        registered_input_dir=siblings["registered"].as_posix(),
+        source_registered_files=[
+            "20260518_R.tif",
+            "20260518_G.tif",
+            "20260519_R.tif",
+            "20260519_G.tif",
+        ],
+        spacing_zyx=(5.0, 0.69, 0.69),
+        staging_dir=staging_dir,
+        weekly_output_dir=weekly_output_dir,
+        week_names=["week1"],
+        published_at="2026-08-27T00:00:00",
+    )
+
+    replace_log: list[tuple[str, str]] = []
+    real_replace = weekly_product.os.replace
+
+    def recording_replace(src, dst):
+        replace_log.append((Path(src).name, Path(dst).name))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(weekly_product.os, "replace", recording_replace)
+
+    metadata_path = publish_staged_weekly_product(
+        staging_dir,
+        weekly_output_dir,
+        expected_filenames=sorted(expected_names),
+        metadata_filename="weekly_product_metadata.json",
+        replace_existing=True,
+        metadata=metadata,
+    )
+
+    published_snapshot = _snapshot_published_product(weekly_output_dir)
+    assert published_snapshot != old_snapshot
+    assert old_snapshot["20260511_R_SyN.tif"] != published_snapshot["20260518_R_SyN.tif"]
+    assert not staging_dir.exists()
+    assert replace_log[-1][1] == metadata_path.name
+
+    metadata_on_disk = json.loads(metadata_path.read_text(encoding="utf-8"))
+    content_names = metadata_on_disk["published_files"]
+    assert content_names == [
+        "20260518_G_SyN.tif",
+        "20260518_R_SyN.tif",
+        "20260519_G_SyN.tif",
+        "20260519_R_SyN.tif",
+        "week1_average.tif",
+        "week1_average_cp_masks.tif",
+    ]
+    for name in content_names:
+        assert metadata_on_disk["published_sha256"][name]
+        assert weekly_output_dir.joinpath(name).exists()
+    assert (siblings["registered"] / "sentinel.txt").read_text(encoding="utf-8") == "registered"
+    assert (siblings["raw"] / "sentinel.txt").read_text(encoding="utf-8") == "raw"
+    assert (siblings["other_mouse"] / "sentinel.txt").read_text(encoding="utf-8") == "other"
+
+
+@pytest.mark.parametrize(
+    "duplicate_crop_variants,incomplete,inconsistent,expected_exception,expected_message",
+    [
+        (True, False, False, ValueError, "Duplicate registered image candidates"),
+        (False, True, False, FileNotFoundError, "Missing registered TIFFs"),
+        (False, False, True, ValueError, "inconsistent TIFF dimensions"),
+    ],
+)
+def test_project_weekly_runner_rejects_invalid_prepared_products_before_output_dir(
+    tmp_path: Path,
+    monkeypatch,
+    duplicate_crop_variants: bool,
+    incomplete: bool,
+    inconsistent: bool,
+    expected_exception,
+    expected_message: str,
+) -> None:
     config_path, _config = _make_project(tmp_path)
     match_csv = tmp_path / "matches.csv"
     _write_match_csv(match_csv)
-    weekly_product = tmp_path / "derivatives" / "m" / "longitudinal" / "920" / "weekly_registered"
-    weekly_product.mkdir(parents=True)
-    _write_project_weekly_product(weekly_product, duplicate_crop_variants=True)
+    weekly_product_dir = tmp_path / "derivatives" / "m" / "longitudinal" / "920" / "weekly_registered"
+    weekly_product_dir.mkdir(parents=True)
+
+    if duplicate_crop_variants:
+        _write_stack(weekly_product_dir / "20260511_R_crop_64x64_SyN.tif", [1, 2, 3])
+        _write_stack(weekly_product_dir / "20260511_R_crop_512x512_SyN.tif", [1, 2, 3])
+        _write_stack(weekly_product_dir / "20260511_G_crop_64x64_SyN.tif", [1, 2, 3])
+        _write_stack(weekly_product_dir / "20260511_G_crop_512x512_SyN.tif", [1, 2, 3])
+    elif incomplete:
+        _write_stack(weekly_product_dir / "20260511_R_SyN.tif", [1, 2, 3])
+        _write_stack(weekly_product_dir / "20260511_G_SyN.tif", [1, 2, 3])
+        _write_stack(weekly_product_dir / "20260512_R_SyN.tif", [1, 2, 3])
+    elif inconsistent:
+        _write_stack(weekly_product_dir / "20260511_R_SyN.tif", [1, 2, 3])
+        _write_stack(weekly_product_dir / "20260511_G_SyN.tif", [1, 2, 3])
+        _write_stack(weekly_product_dir / "20260512_R_SyN.tif", [1, 2, 3, 4], shape=(1, 1, 4))
+        _write_stack(weekly_product_dir / "20260512_G_SyN.tif", [1, 2, 3, 4], shape=(1, 1, 4))
 
     monkeypatch.setattr(
         run_weekly,
@@ -223,19 +509,23 @@ def test_project_weekly_runner_rejects_invalid_prepared_products_before_output_d
         ),
     )
 
-    with pytest.raises(ValueError, match="Duplicate registered image candidates"):
+    with pytest.raises(expected_exception, match=expected_message):
         run_weekly.main()
 
     assert not (tmp_path / "derivatives" / "m" / "longitudinal" / "920" / "runs").exists()
 
 
-def test_project_weekly_runner_rejects_incomplete_prepared_products_before_output_dir(tmp_path: Path, monkeypatch) -> None:
+def test_project_mode_requires_weekly_product_metadata(tmp_path: Path, monkeypatch) -> None:
     config_path, _config = _make_project(tmp_path)
     match_csv = tmp_path / "matches.csv"
     _write_match_csv(match_csv)
-    weekly_product = tmp_path / "derivatives" / "m" / "longitudinal" / "920" / "weekly_registered"
-    weekly_product.mkdir(parents=True)
-    _write_project_weekly_product(weekly_product, incomplete=True)
+    weekly_product_dir = tmp_path / "derivatives" / "m" / "longitudinal" / "920" / "weekly_registered"
+    weekly_product_dir.mkdir(parents=True)
+    _write_stack(weekly_product_dir / "20260511_R_SyN.tif", [1, 2, 3])
+    _write_stack(weekly_product_dir / "20260511_G_SyN.tif", [4, 5, 6])
+    _write_stack(weekly_product_dir / "20260512_R_SyN.tif", [7, 8, 9])
+    _write_stack(weekly_product_dir / "20260512_G_SyN.tif", [10, 11, 12])
+    tifffile.imwrite(weekly_product_dir / "week1_average_cp_masks.tif", np.asarray([[[1, 2, 3]]], dtype=np.uint16))
 
     monkeypatch.setattr(
         run_weekly,
@@ -254,38 +544,5 @@ def test_project_weekly_runner_rejects_incomplete_prepared_products_before_outpu
         ),
     )
 
-    with pytest.raises(FileNotFoundError, match="Missing registered TIFFs"):
+    with pytest.raises(FileNotFoundError, match="Weekly product metadata was not found"):
         run_weekly.main()
-
-    assert not (tmp_path / "derivatives" / "m" / "longitudinal" / "920" / "runs").exists()
-
-
-def test_project_weekly_runner_rejects_dimension_inconsistent_prepared_products_before_output_dir(tmp_path: Path, monkeypatch) -> None:
-    config_path, _config = _make_project(tmp_path)
-    match_csv = tmp_path / "matches.csv"
-    _write_match_csv(match_csv)
-    weekly_product = tmp_path / "derivatives" / "m" / "longitudinal" / "920" / "weekly_registered"
-    weekly_product.mkdir(parents=True)
-    _write_project_weekly_product(weekly_product, inconsistent=True)
-
-    monkeypatch.setattr(
-        run_weekly,
-        "parse_args",
-        lambda argv=None: argparse.Namespace(
-            dataset=None,
-            project_config=config_path,
-            mouse_id="m",
-            laser_nm=920,
-            match_csv=match_csv,
-            start_date=None,
-            week_mask_template="{week_name}_average_cp_masks.tif",
-            green_dark=319.0,
-            red_dark=534.0,
-            epsilon=1.0,
-        ),
-    )
-
-    with pytest.raises(ValueError, match="inconsistent TIFF dimensions"):
-        run_weekly.main()
-
-    assert not (tmp_path / "derivatives" / "m" / "longitudinal" / "920" / "runs").exists()

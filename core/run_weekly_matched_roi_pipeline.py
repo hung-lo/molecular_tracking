@@ -39,6 +39,8 @@ from roi_log_ratio_analysis import (
     wide_table_from_long_table,
 )
 
+from weekly_registered_product import read_tiff_shape, validate_published_weekly_product
+
 
 ANALYSIS_VERSION = "0.1.0"
 
@@ -55,6 +57,7 @@ class WeeklyMatchedPipelineConfig:
     green_dark: float = 319.0
     red_dark: float = 534.0
     epsilon: float = 1.0
+    require_metadata: bool = False
 
 
 def format_duration_seconds(duration_seconds: float) -> str:
@@ -218,6 +221,7 @@ def validate_weekly_registered_product(
     match_csv_path: str | Path,
     start_date: str,
     week_mask_template: str = "{week_name}_average_cp_masks.tif",
+    require_metadata: bool = False,
 ) -> pd.DataFrame:
     """Validate a prepared weekly_registered product before analysis starts."""
 
@@ -241,7 +245,7 @@ def validate_weekly_registered_product(
 
     shape_to_paths: dict[tuple[int, ...], list[Path]] = {}
     for path in sorted({path.resolve() for path in registered_lookup.values()}):
-        shape = tuple(int(value) for value in tifffile.imread(path).shape)
+        shape = read_tiff_shape(path)
         shape_to_paths.setdefault(shape, []).append(path)
 
     if len(shape_to_paths) != 1:
@@ -252,19 +256,23 @@ def validate_weekly_registered_product(
         raise ValueError(f"Prepared weekly product contains inconsistent TIFF dimensions: {detail}")
 
     selected_shape = next(iter(shape_to_paths))
-    metadata = None
-    for candidate_name in ("weekly_product_metadata.json", "crop_metadata.json"):
-        candidate_path = dataset_dir / candidate_name
-        if candidate_path.is_file():
-            metadata = json.loads(candidate_path.read_text(encoding="utf-8"))
-            break
-
-    if metadata and metadata.get("crop_shape") is not None:
-        crop_shape = tuple(int(value) for value in metadata["crop_shape"])
-        if tuple(int(value) for value in selected_shape[-2:]) != crop_shape:
-            raise ValueError(
-                f"Prepared weekly product crop_shape {crop_shape} does not match TIFF dimensions {selected_shape}"
-            )
+    metadata = validate_published_weekly_product(
+        dataset_dir,
+        require_metadata=require_metadata,
+    )
+    if metadata is not None:
+        cropping_enabled = bool(metadata.get("cropping_enabled", False))
+        crop_shape = metadata.get("crop_shape")
+        if cropping_enabled:
+            if crop_shape is None:
+                raise ValueError("Prepared weekly product metadata marked cropping_enabled=True but crop_shape is missing.")
+            crop_shape_tuple = tuple(int(value) for value in crop_shape)
+            if tuple(int(value) for value in selected_shape[-2:]) != crop_shape_tuple:
+                raise ValueError(
+                    f"Prepared weekly product crop_shape {crop_shape_tuple} does not match TIFF dimensions {selected_shape}"
+                )
+        elif crop_shape is not None:
+            raise ValueError("Prepared weekly product metadata must set crop_shape to null when cropping is disabled.")
 
     for week_name in extract_ordered_week_names(match_table):
         resolve_week_mask_path(dataset_dir, week_name, week_mask_template)
@@ -484,6 +492,7 @@ def run_weekly_matched_roi_pipeline(config: WeeklyMatchedPipelineConfig) -> Path
         match_csv_path=match_csv_path,
         start_date=config.start_date,
         week_mask_template=config.week_mask_template,
+        require_metadata=config.require_metadata,
     )
 
     analysis_root = Path(config.output_root).expanduser().resolve() if config.output_root else get_dataset_analysis_dir(config.dataset)
@@ -676,6 +685,7 @@ def main() -> None:
             match_csv_path=args.match_csv,
             start_date=effective_start_date,
             week_mask_template=args.week_mask_template,
+            require_metadata=context.mode == "project",
         )
     output_root=str(context.analysis_dir) if context.mode == "project" else None
     config = WeeklyMatchedPipelineConfig(
@@ -687,6 +697,7 @@ def main() -> None:
         green_dark=args.green_dark,
         red_dark=args.red_dark,
         epsilon=args.epsilon,
+        require_metadata=context.mode == "project",
     )
     run_weekly_matched_roi_pipeline(config)
 

@@ -97,7 +97,7 @@ COPY_RESULT_FIELDNAMES = [
 
 AT_FDCWD = -100
 RENAME_NOREPLACE = 1
-PROMOTION_STRATEGY = "exclusive_direct"
+PROMOTION_STRATEGY = "temp_sibling"
 
 
 class Phase2BMigrationError(RuntimeError):
@@ -223,10 +223,30 @@ def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline=chr(10), dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
             temp_path = Path(handle.name)
             json.dump(data, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+            handle.write(chr(10))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _write_json_existing_parent(path: Path, data: dict[str, Any]) -> None:
+    if not path.parent.exists():
+        raise FileNotFoundError(f"Parent directory does not exist for JSON write: {path.parent}")
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline=chr(10), dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
+            temp_path = Path(handle.name)
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write(chr(10))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, path)
@@ -263,7 +283,6 @@ def _tree_row(path: Path, root: Path) -> dict[str, Any]:
         "mtime_utc": datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc).isoformat(),
     }
 
-
 def build_tree_inventory(root: str | Path) -> list[dict[str, Any]]:
     root_path = Path(root).expanduser().resolve()
     if not root_path.is_dir():
@@ -281,7 +300,7 @@ def write_tree_inventory(root: str | Path, csv_path: str | Path) -> tuple[list[d
     return rows, _sha256_file(csv_path)
 
 
-def compare_tree_rows(before_rows: list[dict[str, Any]], after_rows: list[dict[str, Any]]) -> dict[str, Any]:
+def compare_tree_rows(before_rows: list[dict[str, Any]], after_rows: list[dict[str, Any]], *, unchanged_key: str = "raw_tree_unchanged") -> dict[str, Any]:
     before = {row["relative_path"]: row for row in before_rows}
     after = {row["relative_path"]: row for row in after_rows}
     before_paths = set(before)
@@ -289,13 +308,17 @@ def compare_tree_rows(before_rows: list[dict[str, Any]], after_rows: list[dict[s
     common = before_paths & after_paths
     changed_size_paths = sorted(path for path in common if before[path]["size_bytes"] != after[path]["size_bytes"])
     changed_modification_time_paths = sorted(path for path in common if before[path]["mtime_utc"] != after[path]["mtime_utc"])
-    return {
+    unchanged = not (after_paths - before_paths or before_paths - after_paths or changed_size_paths or changed_modification_time_paths)
+    comparison = {
         "added_paths": sorted(after_paths - before_paths),
         "removed_paths": sorted(before_paths - after_paths),
         "changed_size_paths": changed_size_paths,
         "changed_modification_time_paths": changed_modification_time_paths,
-        "raw_tree_unchanged": not (after_paths - before_paths or before_paths - after_paths or changed_size_paths or changed_modification_time_paths),
+        "raw_tree_unchanged": unchanged,
     }
+    if unchanged_key != "raw_tree_unchanged":
+        comparison[unchanged_key] = unchanged
+    return comparison
 
 
 def _load_phase2a_report(phase2a_plan_path: Path) -> dict[str, Any]:
@@ -371,6 +394,17 @@ def _validate_target_path(target_path: Path, config: ProjectConfig, legacy_root:
         raise Phase2BMigrationError(f"Target must not resolve inside legacy_fucci_tri_root: {resolved}")
 
 
+def _executor_temp_candidates(target_path: Path) -> list[Path]:
+    parent = target_path.parent
+    if not parent.exists():
+        return []
+    prefix = f".{target_path.name}."
+    suffix = ".phase2b.tmp"
+    return [
+        entry
+        for entry in sorted(parent.iterdir(), key=lambda item: item.name)
+        if entry.is_file() and not entry.is_symlink() and entry.name.startswith(prefix) and entry.name.endswith(suffix)
+    ]
 def _ensure_parent_chain(parent: Path, root: Path) -> None:
     resolved_root = root.resolve()
     resolved_parent = parent.resolve()
@@ -394,18 +428,8 @@ def _plan_snapshot(path: Path) -> tuple[int, int, str]:
 
 
 def _promote_temp_file(temp_path: Path, target_path: Path) -> None:
-    if not hasattr(os, "rename") and not hasattr(os, "replace"):
-        raise Phase2BMigrationError("No rename support available")
     if os.name != "posix":
         raise Phase2BMigrationError("Phase 2B executor requires a POSIX filesystem for atomic no-clobber promotion")
-    renameat2 = getattr(os, "renameat2", None)
-    if renameat2 is not None:
-        try:
-            renameat2(temp_path, target_path, src_dir_fd=None, dst_dir_fd=None, flags=RENAME_NOREPLACE)  # type: ignore[call-arg]
-            return
-        except TypeError:
-            # Older Python builds may expose renameat2 but not this call signature; fall through to ctypes.
-            pass
     import ctypes
 
     libc = ctypes.CDLL(None, use_errno=True)
@@ -421,7 +445,7 @@ def _promote_temp_file(temp_path: Path, target_path: Path) -> None:
         err = ctypes.get_errno()
         if err == errno.EEXIST:
             raise FileExistsError(target_path)
-        raise OSError(err, os.strerror(err), str(target_path))
+        raise Phase2BMigrationError(f"renameat2(RENAME_NOREPLACE) failed for {target_path}: {os.strerror(err)}")
 
 
 def _journal_records(journal_path: Path, expected_plan_sha256: str) -> dict[str, dict[str, Any]]:
@@ -514,114 +538,8 @@ def _split_plan_rows(rows: list[dict[str, str]], frozen: FrozenPhase2ABaseline, 
     return approved, deferred
 
 
-def _copy_direct_verified(row: dict[str, Any], *, config: ProjectConfig, legacy_root: Path, source_snapshot: dict[str, tuple[int, int]], journal_records: dict[str, dict[str, Any]], journal_path: Path, sequence: int, source_sha: str, source_size: int, source_mtime_ns: int) -> dict[str, Any]:
-    source_path = Path(row["source_path"]).expanduser().resolve()
-    target_path = Path(row["proposed_target"]).expanduser().resolve()
-    journal = journal_records.get(target_path.as_posix())
-    if journal is not None:
-        if journal.get("plan_sha256") != row["phase2a_plan_sha256"]:
-            raise Phase2BMigrationError(f"Journal plan hash mismatch for {target_path}")
-        if not target_path.exists():
-            raise Phase2BMigrationError(f"Journaled target is missing on resume: {target_path}")
-        target_sha, target_size = _sha256_stream(target_path)
-        if target_sha != journal.get("target_sha256") or target_size != int(journal.get("target_size_bytes", -1)):
-            raise Phase2BMigrationError(f"Journaled target no longer matches on resume: {target_path}")
-        return {
-            "sequence": sequence,
-            "source_path": source_path.as_posix(),
-            "target_path": target_path.as_posix(),
-            "status": "already_present_verified",
-            "source_sha256": source_sha,
-            "target_sha256": target_sha,
-            "source_size_bytes": source_size,
-            "target_size_bytes": target_size,
-            "source_mtime_ns": source_mtime_ns,
-            "temp_path": "",
-            "completed_utc": _utc_now(),
-            "journal_path": journal_path.as_posix(),
-            "reason": "journaled target verified on resume",
-        }
-
-    if target_path.exists():
-        target_sha, target_size = _sha256_stream(target_path)
-        if target_sha == source_sha and target_size == source_size:
-            return {
-                "sequence": sequence,
-                "source_path": source_path.as_posix(),
-                "target_path": target_path.as_posix(),
-                "status": "already_present_verified",
-                "source_sha256": source_sha,
-                "target_sha256": target_sha,
-                "source_size_bytes": source_size,
-                "target_size_bytes": target_size,
-                "source_mtime_ns": source_mtime_ns,
-                "temp_path": "",
-                "completed_utc": _utc_now(),
-                "journal_path": journal_path.as_posix(),
-                "reason": "identical target already present",
-            }
-        raise Phase2BMigrationError(f"Destination conflict for {target_path}")
-
-    _ensure_parent_chain(target_path.parent, config.paths.derivatives_root)
-    created_target = False
-    try:
-        with source_path.open("rb") as source_handle, target_path.open("xb") as target_handle:
-            created_target = True
-            for chunk in iter(lambda: source_handle.read(COPY_CHUNK_SIZE), b""):
-                target_handle.write(chunk)
-            target_handle.flush()
-            os.fsync(target_handle.fileno())
-        os.chmod(target_path, os.stat(source_path).st_mode & 0o777)
-        os.utime(target_path, ns=(source_path.stat().st_atime_ns, source_path.stat().st_mtime_ns))
-        final_sha, final_size = _sha256_stream(target_path)
-        if final_sha != source_sha or final_size != source_size:
-            raise Phase2BMigrationError(f"Final target verification failed for {target_path}")
-        dir_fd = os.open(str(target_path.parent), os.O_DIRECTORY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-        return {
-            "sequence": sequence,
-            "source_path": source_path.as_posix(),
-            "target_path": target_path.as_posix(),
-            "status": "copied_verified",
-            "source_sha256": source_sha,
-            "target_sha256": final_sha,
-            "source_size_bytes": source_size,
-            "target_size_bytes": final_size,
-            "source_mtime_ns": source_mtime_ns,
-            "temp_path": "",
-            "completed_utc": _utc_now(),
-            "journal_path": journal_path.as_posix(),
-            "reason": "copied via direct exclusive create",
-        }
-    except FileExistsError:
-        target_sha, target_size = _sha256_stream(target_path)
-        if target_sha == source_sha and target_size == source_size:
-            return {
-                "sequence": sequence,
-                "source_path": source_path.as_posix(),
-                "target_path": target_path.as_posix(),
-                "status": "already_present_verified",
-                "source_sha256": source_sha,
-                "target_sha256": target_sha,
-                "source_size_bytes": source_size,
-                "target_size_bytes": target_size,
-                "source_mtime_ns": source_mtime_ns,
-                "temp_path": "",
-                "completed_utc": _utc_now(),
-                "journal_path": journal_path.as_posix(),
-                "reason": "target appeared during exclusive create but matched source",
-            }
-        raise Phase2BMigrationError(f"Destination conflict during direct copy for {target_path}")
-    except Exception:
-        if created_target and target_path.exists():
-            try:
-                target_path.unlink()
-            except FileNotFoundError:
-                pass
-        raise
+def _copy_direct_verified(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    raise Phase2BMigrationError("Direct-final copy path has been removed from the executor")
 
 
 def _copy_verified(row: dict[str, Any], *, config: ProjectConfig, legacy_root: Path, source_snapshot: dict[str, tuple[int, int]], journal_records: dict[str, dict[str, Any]], journal_path: Path, sequence: int) -> dict[str, Any]:
@@ -695,68 +613,124 @@ def _copy_verified(row: dict[str, Any], *, config: ProjectConfig, legacy_root: P
         )
 
     _ensure_parent_chain(target_path.parent, config.paths.derivatives_root)
-    temp_path = target_path.parent / f".{target_path.name}.{os.getpid()}.{uuid.uuid4().hex}.phase2b.tmp"
-    try:
-        with source_path.open("rb") as source_handle, temp_path.open("wb") as temp_handle:
-            for chunk in iter(lambda: source_handle.read(COPY_CHUNK_SIZE), b""):
-                temp_handle.write(chunk)
-            temp_handle.flush()
-            os.fsync(temp_handle.fileno())
+    temp_candidates = _executor_temp_candidates(target_path)
+    if len(temp_candidates) > 1:
+        raise Phase2BMigrationError(f"Multiple executor temp siblings exist for {target_path.parent}: {temp_candidates}")
+    temp_path = temp_candidates[0] if temp_candidates else target_path.parent / f".{target_path.name}.{os.getpid()}.{uuid.uuid4().hex}.phase2b.tmp"
+    created_temp = not temp_candidates and not temp_path.exists()
+    if temp_candidates:
+        temp_sha, temp_size = _sha256_stream(temp_path)
+        if temp_sha != source_sha or temp_size != source_size:
+            raise Phase2BMigrationError(f"Recoverable temp sibling does not match source: {temp_path}")
+    else:
+        try:
+            with source_path.open("rb") as source_handle, temp_path.open("xb") as temp_handle:
+                for chunk in iter(lambda: source_handle.read(COPY_CHUNK_SIZE), b""):
+                    temp_handle.write(chunk)
+                temp_handle.flush()
+                os.fsync(temp_handle.fileno())
+        except Exception:
+            if created_temp and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
         os.chmod(temp_path, os.stat(source_path).st_mode & 0o777)
         os.utime(temp_path, ns=(source_path.stat().st_atime_ns, source_path.stat().st_mtime_ns))
         temp_sha, temp_size = _sha256_stream(temp_path)
         if temp_sha != source_sha or temp_size != source_size:
+            if created_temp and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
             raise Phase2BMigrationError(f"Temporary copy verification failed for {source_path}")
-        try:
-            _promote_temp_file(temp_path, target_path)
-        except FileExistsError:
-            target_sha, target_size = _sha256_stream(target_path)
-            if target_sha == source_sha and target_size == source_size:
-                return {
-                    "sequence": sequence,
-                    "source_path": source_path.as_posix(),
-                    "target_path": target_path.as_posix(),
-                    "status": "already_present_verified",
-                    "source_sha256": source_sha,
-                    "target_sha256": target_sha,
-                    "source_size_bytes": source_size,
-                    "target_size_bytes": target_size,
-                    "source_mtime_ns": source_mtime_ns,
-                    "temp_path": temp_path.as_posix(),
-                    "completed_utc": _utc_now(),
-                    "journal_path": journal_path.as_posix(),
-                    "reason": "target appeared during promotion but matched source",
-                }
-            raise Phase2BMigrationError(f"Destination conflict during promotion for {target_path}")
-        dir_fd = os.open(str(target_path.parent), os.O_DIRECTORY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-        final_sha, final_size = _sha256_stream(target_path)
-        if final_sha != source_sha or final_size != source_size:
-            raise Phase2BMigrationError(f"Final target verification failed for {target_path}")
-        return {
-            "sequence": sequence,
-            "source_path": source_path.as_posix(),
-            "target_path": target_path.as_posix(),
-            "status": "copied_verified",
-            "source_sha256": source_sha,
-            "target_sha256": final_sha,
-            "source_size_bytes": source_size,
-            "target_size_bytes": final_size,
-            "source_mtime_ns": source_mtime_ns,
-            "temp_path": temp_path.as_posix(),
-            "completed_utc": _utc_now(),
-            "journal_path": journal_path.as_posix(),
-            "reason": "copied via temp sibling and atomic no-clobber promotion",
-        }
-    finally:
-        if temp_path.exists():
+
+    post_size, post_mtime_ns, _post_mtime_utc = _plan_snapshot(source_path)
+    if post_size != snapshot_size or post_mtime_ns != snapshot_mtime_ns:
+        if created_temp and temp_path.exists():
             try:
                 temp_path.unlink()
             except FileNotFoundError:
                 pass
+        raise Phase2BMigrationError(f"Source changed or became invalid during copy: {source_path}")
+
+    try:
+        _promote_temp_file(temp_path, target_path)
+    except FileExistsError:
+        target_sha, target_size = _sha256_stream(target_path)
+        if target_sha == source_sha and target_size == source_size:
+            if created_temp and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
+            return {
+                "sequence": sequence,
+                "source_path": source_path.as_posix(),
+                "target_path": target_path.as_posix(),
+                "status": "already_present_verified",
+                "source_sha256": source_sha,
+                "target_sha256": target_sha,
+                "source_size_bytes": source_size,
+                "target_size_bytes": target_size,
+                "source_mtime_ns": source_mtime_ns,
+                "temp_path": temp_path.as_posix(),
+                "completed_utc": _utc_now(),
+                "journal_path": journal_path.as_posix(),
+                "reason": "target appeared during promotion but matched source",
+            }
+        if created_temp and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+        raise Phase2BMigrationError(f"Destination conflict during promotion for {target_path}")
+    except Exception:
+        if created_temp and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+
+    dir_fd = os.open(str(target_path.parent), os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+    final_sha, final_size = _sha256_stream(target_path)
+    if final_sha != source_sha or final_size != source_size:
+        if created_temp and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+        raise Phase2BMigrationError(f"Final target verification failed for {target_path}")
+
+    if created_temp and temp_path.exists():
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    return {
+        "sequence": sequence,
+        "source_path": source_path.as_posix(),
+        "target_path": target_path.as_posix(),
+        "status": "copied_verified",
+        "source_sha256": source_sha,
+        "target_sha256": final_sha,
+        "source_size_bytes": source_size,
+        "target_size_bytes": final_size,
+        "source_mtime_ns": source_mtime_ns,
+        "temp_path": temp_path.as_posix(),
+        "completed_utc": _utc_now(),
+        "journal_path": journal_path.as_posix(),
+        "reason": "copied via verified temp sibling and atomic no-clobber promotion",
+    }
 
 
 def _progress_message(completed: int, total: int, bytes_done: int, started: float) -> str:
@@ -805,7 +779,7 @@ def _phase2b_report(
     deferred_target_scope_counts = dict(Counter(row["target_scope"] for row in deferred_rows))
     copy_status_counts = dict(Counter(row["status"] for row in copy_results))
     raw_diff = compare_tree_rows(raw_before_rows, raw_after_rows)
-    legacy_diff = compare_tree_rows(legacy_before_rows, legacy_after_rows)
+    legacy_diff = compare_tree_rows(legacy_before_rows, legacy_after_rows, unchanged_key="legacy_tree_unchanged")
     return {
         "report_version": "phase2b_verified_copy_v1",
         "generated_utc": _utc_now(),
@@ -880,7 +854,7 @@ def _phase2b_report(
             "removed_paths": legacy_diff["removed_paths"],
             "changed_size_paths": legacy_diff["changed_size_paths"],
             "changed_modification_time_paths": legacy_diff["changed_modification_time_paths"],
-            "legacy_tree_unchanged": legacy_diff["raw_tree_unchanged"],
+            "legacy_tree_unchanged": legacy_diff.get("legacy_tree_unchanged", legacy_diff["raw_tree_unchanged"]),
         },
         "copy_execution": {
             "verified_copy_executed": verified_copy_executed,
@@ -908,6 +882,160 @@ def _phase2b_report(
             "zero_unmapped_copied": len(deferred_rows) == EXPECTED_PHASE2A_DEFERRED_ROWS,
         },
     }
+
+
+def verify_phase2b_bundle(
+    config: ProjectConfig,
+    *,
+    phase2a_plan_path: str | Path,
+    output_dir: str | Path | None = None,
+    frozen: FrozenPhase2ABaseline = FrozenPhase2ABaseline(),
+    repo_root: str | Path | None = None,
+    write_outputs: bool = True,
+) -> dict[str, Any]:
+    plan_path = Path(phase2a_plan_path).expanduser().resolve()
+    if not plan_path.is_file():
+        raise FileNotFoundError(f"Phase 2A migration-plan CSV was not found: {plan_path}")
+    phase2a_report = _load_phase2a_report(plan_path)
+    _validate_phase2a_report(phase2a_report, frozen)
+    plan_sha256 = _sha256_file(plan_path)
+    if plan_sha256 != frozen.migration_plan_sha256:
+        raise Phase2BMigrationError(f"Phase 2A plan hash mismatch: expected {frozen.migration_plan_sha256}, got {plan_sha256}")
+    plan_rows = _read_rows(plan_path)
+    if len(plan_rows) != frozen.migration_plan_row_count:
+        raise Phase2BMigrationError(f"Phase 2A plan row-count mismatch: expected {frozen.migration_plan_row_count}, got {len(plan_rows)}")
+
+    repo_root_path = Path(repo_root).expanduser().resolve() if repo_root is not None else Path(__file__).resolve().parents[1]
+    repo_commit = _git_commit(repo_root_path)
+    repo_status = _git_status(repo_root_path)
+    if repo_status:
+        raise Phase2BMigrationError(f"Repository must be clean before Phase 2B verification: {repo_status}")
+
+    output_dir_path = validate_output_path(output_dir if output_dir is not None else (config.paths.derivatives_root / "_catalog" / "phase2b_migration"), config)
+    if not output_dir_path.exists():
+        raise FileNotFoundError(f"Phase 2B output directory does not exist: {output_dir_path}")
+    paths = _phase2b_paths(output_dir_path)
+    verify_report_path = output_dir_path / "phase2b_verify_only_report.json"
+
+    required_paths = [
+        paths.approved_plan_csv,
+        paths.deferred_unmapped_csv,
+        paths.preflight_json,
+        paths.journal_jsonl,
+        paths.results_csv,
+        paths.report_json,
+        paths.legacy_tree_before_csv,
+        paths.legacy_tree_after_csv,
+        paths.raw_tree_before_csv,
+        paths.raw_tree_after_csv,
+        paths.legacy_tree_comparison_json,
+        paths.raw_tree_comparison_json,
+    ]
+    for artifact in required_paths:
+        if not artifact.is_file():
+            raise FileNotFoundError(f"Phase 2B artifact was not found: {artifact}")
+
+    report = json.loads(paths.report_json.read_text(encoding="utf-8"))
+    journal_records = _journal_records(paths.journal_jsonl, plan_sha256)
+    result_rows = _read_rows(paths.results_csv)
+    raw_before_rows = _read_rows(paths.raw_tree_before_csv)
+    raw_after_rows = _read_rows(paths.raw_tree_after_csv)
+    legacy_before_rows = _read_rows(paths.legacy_tree_before_csv)
+    legacy_after_rows = _read_rows(paths.legacy_tree_after_csv)
+    raw_diff = compare_tree_rows(raw_before_rows, raw_after_rows)
+    legacy_diff = compare_tree_rows(legacy_before_rows, legacy_after_rows, unchanged_key="legacy_tree_unchanged")
+    if not raw_diff["raw_tree_unchanged"] or not legacy_diff.get("legacy_tree_unchanged", False):
+        raise Phase2BMigrationError("Completed Phase 2B inventories are not unchanged")
+
+    current_raw_rows = build_tree_inventory(config.paths.raw_root)
+    legacy_root = Path(config.paths.legacy_fucci_tri_root).expanduser().resolve()
+    current_legacy_rows = build_tree_inventory(legacy_root)
+    if current_raw_rows != raw_after_rows or current_raw_rows != raw_before_rows:
+        raise Phase2BMigrationError("Raw tree no longer matches the completed Phase 2B inventories")
+    if current_legacy_rows != legacy_after_rows or current_legacy_rows != legacy_before_rows:
+        raise Phase2BMigrationError("Legacy tree no longer matches the completed Phase 2B inventories")
+
+    result_by_sequence = {int(row["sequence"]): row for row in result_rows}
+    if len(result_by_sequence) != frozen.resolved_rows_with_targets:
+        raise Phase2BMigrationError("Result row count mismatch during verification")
+    journal_by_sequence = {int(record["sequence"]): record for record in journal_records.values()}
+    if len(journal_by_sequence) != frozen.resolved_rows_with_targets:
+        raise Phase2BMigrationError("Journal row count mismatch during verification")
+    if set(result_by_sequence) != set(range(1, frozen.resolved_rows_with_targets + 1)):
+        raise Phase2BMigrationError("Result sequence coverage mismatch during verification")
+    if set(journal_by_sequence) != set(range(1, frozen.resolved_rows_with_targets + 1)):
+        raise Phase2BMigrationError("Journal sequence coverage mismatch during verification")
+
+    source_bytes_accounted = 0
+    copied_verified = 0
+    already_present_verified = 0
+    for sequence in range(1, frozen.resolved_rows_with_targets + 1):
+        result = result_by_sequence[sequence]
+        journal = journal_by_sequence[sequence]
+        if result["source_path"] != journal["source_path"] or result["target_path"] != journal["target_path"]:
+            raise Phase2BMigrationError(f"Result/journal path mismatch at sequence {sequence}")
+        if result["source_sha256"] != journal["source_sha256"] or result["target_sha256"] != journal["target_sha256"]:
+            raise Phase2BMigrationError(f"Result/journal hash mismatch at sequence {sequence}")
+        if int(result["source_size_bytes"]) != int(journal["source_size_bytes"]) or int(result["target_size_bytes"]) != int(journal["target_size_bytes"]):
+            raise Phase2BMigrationError(f"Result/journal size mismatch at sequence {sequence}")
+        source_path = Path(result["source_path"])
+        target_path = Path(result["target_path"])
+        if not source_path.is_file() or not target_path.is_file():
+            raise Phase2BMigrationError(f"Verified source or target missing at sequence {sequence}")
+        source_sha, source_size = _sha256_stream(source_path)
+        target_sha, target_size = _sha256_stream(target_path)
+        if source_sha != result["source_sha256"] or target_sha != result["target_sha256"]:
+            raise Phase2BMigrationError(f"Verified hashes changed at sequence {sequence}")
+        if source_size != int(result["source_size_bytes"]) or target_size != int(result["target_size_bytes"]):
+            raise Phase2BMigrationError(f"Verified sizes changed at sequence {sequence}")
+        if source_sha != target_sha or source_size != target_size:
+            raise Phase2BMigrationError(f"Verified source and target diverged at sequence {sequence}")
+        source_bytes_accounted += source_size
+        if result["status"] == "copied_verified":
+            copied_verified += 1
+        elif result["status"] == "already_present_verified":
+            already_present_verified += 1
+        else:
+            raise Phase2BMigrationError(f"Unexpected verification status at sequence {sequence}: {result['status']}")
+
+    if copied_verified + already_present_verified != frozen.resolved_rows_with_targets:
+        raise Phase2BMigrationError("Verification copy-status totals mismatch")
+
+    verification_report = {
+        "report_version": "phase2b_verify_only_v1",
+        "generated_utc": _utc_now(),
+        "verification_only": True,
+        "repository": {
+            "commit": repo_commit,
+            "path": repo_root_path.as_posix(),
+            "status": repo_status,
+            "baseline_phase2a_commit": EXPECTED_PHASE2A_COMMIT,
+        },
+        "phase2a_plan_path": plan_path.as_posix(),
+        "phase2a_plan_sha256": plan_sha256,
+        "output_dir": output_dir_path.as_posix(),
+        "report_path": paths.report_json.as_posix(),
+        "journal_path": paths.journal_jsonl.as_posix(),
+        "results_path": paths.results_csv.as_posix(),
+        "approved_rows": frozen.resolved_rows_with_targets,
+        "deferred_rows": frozen.deferred_unmapped_rows,
+        "journal_rows": len(journal_records),
+        "result_rows": len(result_rows),
+        "source_bytes_accounted": source_bytes_accounted,
+        "copied_verified": copied_verified,
+        "already_present_verified": already_present_verified,
+        "raw_tree_unchanged": raw_diff["raw_tree_unchanged"],
+        "legacy_tree_unchanged": legacy_diff.get("legacy_tree_unchanged", False),
+        "original_report_sha256": _sha256_file(paths.report_json),
+        "original_results_sha256": _sha256_file(paths.results_csv),
+        "original_journal_sha256": _sha256_file(paths.journal_jsonl),
+        "source_files_retained": True,
+        "move_or_delete_executed": False,
+    }
+    if write_outputs:
+        _write_json_existing_parent(verify_report_path, verification_report)
+        verification_report["verification_report_path"] = verify_report_path.as_posix()
+    return verification_report
 
 
 def run_phase2b_migration(
@@ -1060,7 +1188,7 @@ def run_phase2b_migration(
             _write_csv_atomic(raw_after_path, raw_after_rows, TREE_FIELDNAMES)
             _write_csv_atomic(legacy_after_path, legacy_after_rows, TREE_FIELDNAMES)
             _write_json_atomic(raw_comparison_path, compare_tree_rows(raw_before_rows, raw_after_rows))
-            _write_json_atomic(legacy_comparison_path, compare_tree_rows(legacy_before_rows, legacy_after_rows))
+            _write_json_atomic(legacy_comparison_path, compare_tree_rows(legacy_before_rows, legacy_after_rows, unchanged_key="legacy_tree_unchanged"))
             report = _phase2b_report(
                 repo_commit=repo_commit,
                 repo_status=repo_status,
@@ -1166,7 +1294,7 @@ def run_phase2b_migration(
     legacy_after_rows, _ = write_tree_inventory(legacy_root, legacy_after_path)
     if write_outputs:
         _write_json_atomic(raw_comparison_path, compare_tree_rows(raw_before_rows, raw_after_rows))
-        _write_json_atomic(legacy_comparison_path, compare_tree_rows(legacy_before_rows, legacy_after_rows))
+        _write_json_atomic(legacy_comparison_path, compare_tree_rows(legacy_before_rows, legacy_after_rows, unchanged_key="legacy_tree_unchanged"))
         _write_csv_atomic(results_path, copy_results, COPY_RESULT_FIELDNAMES)
     raw_after_sha = _sha256_file(raw_after_path)
     if raw_after_sha != raw_before_sha:
@@ -1227,7 +1355,7 @@ def run_phase2b_migration(
         legacy_tree_after_path=legacy_after_path,
         raw_tree_before_path=raw_before_path,
         raw_tree_after_path=raw_after_path,
-        legacy_tree_unchanged=compare_tree_rows(legacy_before_rows, legacy_after_rows)["raw_tree_unchanged"],
+        legacy_tree_unchanged=compare_tree_rows(legacy_before_rows, legacy_after_rows, unchanged_key="legacy_tree_unchanged").get("legacy_tree_unchanged", False),
         raw_tree_unchanged=compare_tree_rows(raw_before_rows, raw_after_rows)["raw_tree_unchanged"],
         verified_copy_executed=True,
         move_or_delete_executed=False,

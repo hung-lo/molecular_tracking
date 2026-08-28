@@ -781,7 +781,7 @@ def _phase2b_report(
             "all_approved_rows_completed": copied_verified + already_present_verified == len(approved_rows),
             "zero_destination_conflicts": copy_status_counts.get("destination_conflict", 0) == 0,
             "zero_overwrites": not move_or_delete_executed,
-            "zero_source_changes": legacy_diff["legacy_tree_unchanged"] and raw_diff["raw_tree_unchanged"],
+            "zero_source_changes": legacy_diff["raw_tree_unchanged"] and raw_diff["raw_tree_unchanged"],
             "zero_unmapped_copied": len(deferred_rows) == EXPECTED_PHASE2A_DEFERRED_ROWS,
         },
     }

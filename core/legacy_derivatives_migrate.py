@@ -398,15 +398,13 @@ def _promote_temp_file(temp_path: Path, target_path: Path) -> None:
     if os.name != "posix":
         raise Phase2BMigrationError("Phase 2B executor requires a POSIX filesystem for atomic no-clobber promotion")
     renameat2 = getattr(os, "renameat2", None)
-    if renameat2 is None:
-        raise Phase2BMigrationError("renameat2(RENAME_NOREPLACE) is required for safe no-clobber promotion on this platform")
-    try:
-        renameat2(temp_path, target_path, src_dir_fd=None, dst_dir_fd=None, flags=RENAME_NOREPLACE)  # type: ignore[call-arg]
-    except TypeError:
-        # Older Python builds expose renameat2 through os but without keyword args; fall back to ctypes below.
-        renameat2 = None
     if renameat2 is not None:
-        return
+        try:
+            renameat2(temp_path, target_path, src_dir_fd=None, dst_dir_fd=None, flags=RENAME_NOREPLACE)  # type: ignore[call-arg]
+            return
+        except TypeError:
+            # Older Python builds may expose renameat2 but not this call signature; fall through to ctypes.
+            pass
     import ctypes
 
     libc = ctypes.CDLL(None, use_errno=True)

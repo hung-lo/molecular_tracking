@@ -31,7 +31,6 @@ ALLOWED_EXACT_ROOTS = (
     "1050_small_test_fireants",
 )
 ALLOWED_GLOB_ROOTS = ("roi_matcher_qc_examples_*",)
-DEFAULT_EXCLUDED_ROOTS = {"roi_matcher_qc_examples_syn_20260615_01_styled"}
 
 INVENTORY_FIELDNAMES = [
     "relative_source_path",
@@ -157,10 +156,7 @@ def _entry_type(entry: Path) -> str:
 
 
 def _is_allowed_root_name(name: str) -> bool:
-    return (
-        name not in DEFAULT_EXCLUDED_ROOTS
-        and (name in ALLOWED_EXACT_ROOTS or any(fnmatch(name, pattern) for pattern in ALLOWED_GLOB_ROOTS))
-    )
+    return name in ALLOWED_EXACT_ROOTS or any(fnmatch(name, pattern) for pattern in ALLOWED_GLOB_ROOTS)
 
 
 def _validate_include_root_name(name: str, legacy_root: Path) -> None:
@@ -180,7 +176,7 @@ def _resolve_include_root_names(legacy_root: Path, include_roots: Sequence[str] 
         if not selected:
             raise ValueError(
                 f"No expected legacy product roots were found under {legacy_root}: "
-                f"{', '.join(ALLOWED_EXACT_ROOTS)}"
+                f"exact={', '.join(ALLOWED_EXACT_ROOTS)}; glob={', '.join(ALLOWED_GLOB_ROOTS)}"
             )
         return selected
 

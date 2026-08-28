@@ -12,8 +12,7 @@ data. Its only write outputs are the two audit CSVs beneath:
 - reads the canonical acquisition catalog
 - scans only the allowlisted top-level product roots under `legacy_fucci_tri_root`
   - exact roots: `1050_data`, `920_data`, `2wks_1050_data`, `1050_small_test_fireants`
-- default qc allowlist: `roi_matcher_qc_examples_*` except the later `roi_matcher_qc_examples_syn_20260615_01_styled` tree, which is intentionally excluded to preserve the original 2,920-row audit scope
-  - glob roots: `roi_matcher_qc_examples_*`
+- qc roots: every direct-child root matching `roi_matcher_qc_examples_*` is included when present
 - classifies each legacy source file as `session`, `longitudinal`, or `unmapped`
 - writes the two audit CSVs atomically beneath `<derivatives_root>/_catalog/phase2a_audit/` using a temporary file plus `os.replace()`:
   - `legacy_derivatives_inventory.csv`
@@ -30,9 +29,7 @@ recognized session filename such as:
 - `20260511_R_SyN.tif`
 
 The planner does not infer a session from an arbitrary ancestor directory. That is the key
-correction for Phase 2A. The CLI also reports the included top-level roots and the ignored
-entries by name/type so the scan scope is auditable. The default scan scope preserves the
-already-generated 2,920-row audit package exactly.
+correction for Phase 2A. The CLI also reports the included top-level roots and the ignored entries by name/type so the scan scope is auditable. The first audit recorded 2,920 rows from its effective implementation. The corrected declarative allowlist may produce 2,929 rows if the styled QC tree exists, and that difference is an explicit scope correction rather than a source-data change.
 
 ## Longitudinal rule
 

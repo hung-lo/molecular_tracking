@@ -118,6 +118,9 @@ def test_legacy_derivatives_plan_scans_allowlisted_roots_only_and_classifies_sco
     _touch(legacy_root / "2wks_1050_data" / "analysis" / "run" / "output.csv")
     _touch(legacy_root / "1050_small_test_fireants" / "output.tif")
     _touch(legacy_root / "roi_matcher_qc_examples_20260611_01" / "figure.png")
+    _touch(legacy_root / "roi_matcher_qc_examples_nonsyn_20260611_02_contours" / "summary.json")
+    _touch(legacy_root / "roi_matcher_qc_examples_syn_20260615_01_styled" / "20260615_R.tif")
+    _touch(legacy_root / "roi_matcher_qc_examples_syn_20260615_01_styled" / "style.png")
 
     _touch(legacy_root / "README.md")
     _touch(legacy_root / "core" / "script.py")
@@ -143,13 +146,15 @@ def test_legacy_derivatives_plan_scans_allowlisted_roots_only_and_classifies_sco
         "2wks_1050_data",
         "920_data",
         "roi_matcher_qc_examples_20260611_01",
+        "roi_matcher_qc_examples_nonsyn_20260611_02_contours",
+        "roi_matcher_qc_examples_syn_20260615_01_styled",
     )
     ignored_names = {name for name, _kind in summary.ignored_top_level_entries}
     assert {"README.md", "core", "docs", ".venv", "unrelated_data"}.issubset(ignored_names)
     assert not ignored_names & set(summary.included_roots)
 
-    assert len(inventory_rows) == 5
-    assert len(plan_rows) == 5
+    assert len(inventory_rows) == 8
+    assert len(plan_rows) == 8
     assert [row["relative_source_path"] for row in inventory_rows] == sorted(
         row["relative_source_path"] for row in inventory_rows
     )
@@ -193,11 +198,30 @@ def test_legacy_derivatives_plan_scans_allowlisted_roots_only_and_classifies_sco
     assert qc_row["catalog_session_match"] == "not_applicable"
     assert plan_lookup[qc_row["source_path"]]["collision_status"] == "not_applicable"
 
+    styled_sessionish = lookup["roi_matcher_qc_examples_syn_20260615_01_styled/20260615_R.tif"]
+    assert styled_sessionish["target_scope"] == "longitudinal"
+    assert styled_sessionish["inferred_session_date"] == ""
+    assert styled_sessionish["date_token_role"] == "acquisition_date"
+    assert styled_sessionish["catalog_session_match"] == "not_applicable"
+    assert styled_sessionish["inference_status"] == "unmapped"
+    assert plan_lookup[styled_sessionish["source_path"]]["collision_status"] == "not_applicable"
+
+    styled_qc = lookup["roi_matcher_qc_examples_syn_20260615_01_styled/style.png"]
+    assert styled_qc["target_scope"] == "longitudinal"
+    assert styled_qc["inferred_session_date"] == ""
+    assert styled_qc["catalog_session_match"] == "not_applicable"
+    assert styled_qc["inference_status"] == "unmapped"
+    assert plan_lookup[styled_qc["source_path"]]["collision_status"] == "not_applicable"
+
     assert all(row["collision_status"] == "clear" for row in plan_rows if row["proposed_target"])
     assert all(row["collision_status"] == "not_applicable" for row in plan_rows if not row["proposed_target"])
     assert not any(row["collision_status"] == "duplicate_target" for row in plan_rows)
     assert not any(row["collision_status"] == "exists" for row in plan_rows)
     assert all(row["target_scope"] != "session" or row["product_class"] != "analysis_output" for row in plan_rows)
+    assert not any(
+        row["source_path"].startswith((legacy_root / "roi_matcher_qc_examples_").as_posix()) and row["target_scope"] == "session"
+        for row in plan_rows
+    )
 
 
 def test_legacy_derivatives_plan_marks_timestamped_analysis_runs_as_longitudinal(tmp_path: Path) -> None:

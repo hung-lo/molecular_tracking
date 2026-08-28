@@ -97,6 +97,7 @@ COPY_RESULT_FIELDNAMES = [
 
 AT_FDCWD = -100
 RENAME_NOREPLACE = 1
+PROMOTION_STRATEGY = "exclusive_direct"
 
 
 class Phase2BMigrationError(RuntimeError):
@@ -513,6 +514,116 @@ def _split_plan_rows(rows: list[dict[str, str]], frozen: FrozenPhase2ABaseline, 
     return approved, deferred
 
 
+def _copy_direct_verified(row: dict[str, Any], *, config: ProjectConfig, legacy_root: Path, source_snapshot: dict[str, tuple[int, int]], journal_records: dict[str, dict[str, Any]], journal_path: Path, sequence: int, source_sha: str, source_size: int, source_mtime_ns: int) -> dict[str, Any]:
+    source_path = Path(row["source_path"]).expanduser().resolve()
+    target_path = Path(row["proposed_target"]).expanduser().resolve()
+    journal = journal_records.get(target_path.as_posix())
+    if journal is not None:
+        if journal.get("plan_sha256") != row["phase2a_plan_sha256"]:
+            raise Phase2BMigrationError(f"Journal plan hash mismatch for {target_path}")
+        if not target_path.exists():
+            raise Phase2BMigrationError(f"Journaled target is missing on resume: {target_path}")
+        target_sha, target_size = _sha256_stream(target_path)
+        if target_sha != journal.get("target_sha256") or target_size != int(journal.get("target_size_bytes", -1)):
+            raise Phase2BMigrationError(f"Journaled target no longer matches on resume: {target_path}")
+        return {
+            "sequence": sequence,
+            "source_path": source_path.as_posix(),
+            "target_path": target_path.as_posix(),
+            "status": "already_present_verified",
+            "source_sha256": source_sha,
+            "target_sha256": target_sha,
+            "source_size_bytes": source_size,
+            "target_size_bytes": target_size,
+            "source_mtime_ns": source_mtime_ns,
+            "temp_path": "",
+            "completed_utc": _utc_now(),
+            "journal_path": journal_path.as_posix(),
+            "reason": "journaled target verified on resume",
+        }
+
+    if target_path.exists():
+        target_sha, target_size = _sha256_stream(target_path)
+        if target_sha == source_sha and target_size == source_size:
+            return {
+                "sequence": sequence,
+                "source_path": source_path.as_posix(),
+                "target_path": target_path.as_posix(),
+                "status": "already_present_verified",
+                "source_sha256": source_sha,
+                "target_sha256": target_sha,
+                "source_size_bytes": source_size,
+                "target_size_bytes": target_size,
+                "source_mtime_ns": source_mtime_ns,
+                "temp_path": "",
+                "completed_utc": _utc_now(),
+                "journal_path": journal_path.as_posix(),
+                "reason": "identical target already present",
+            }
+        raise Phase2BMigrationError(f"Destination conflict for {target_path}")
+
+    _ensure_parent_chain(target_path.parent, config.paths.derivatives_root)
+    created_target = False
+    try:
+        with source_path.open("rb") as source_handle, target_path.open("xb") as target_handle:
+            created_target = True
+            for chunk in iter(lambda: source_handle.read(COPY_CHUNK_SIZE), b""):
+                target_handle.write(chunk)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+        os.chmod(target_path, os.stat(source_path).st_mode & 0o777)
+        os.utime(target_path, ns=(source_path.stat().st_atime_ns, source_path.stat().st_mtime_ns))
+        final_sha, final_size = _sha256_stream(target_path)
+        if final_sha != source_sha or final_size != source_size:
+            raise Phase2BMigrationError(f"Final target verification failed for {target_path}")
+        dir_fd = os.open(str(target_path.parent), os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        return {
+            "sequence": sequence,
+            "source_path": source_path.as_posix(),
+            "target_path": target_path.as_posix(),
+            "status": "copied_verified",
+            "source_sha256": source_sha,
+            "target_sha256": final_sha,
+            "source_size_bytes": source_size,
+            "target_size_bytes": final_size,
+            "source_mtime_ns": source_mtime_ns,
+            "temp_path": "",
+            "completed_utc": _utc_now(),
+            "journal_path": journal_path.as_posix(),
+            "reason": "copied via direct exclusive create",
+        }
+    except FileExistsError:
+        target_sha, target_size = _sha256_stream(target_path)
+        if target_sha == source_sha and target_size == source_size:
+            return {
+                "sequence": sequence,
+                "source_path": source_path.as_posix(),
+                "target_path": target_path.as_posix(),
+                "status": "already_present_verified",
+                "source_sha256": source_sha,
+                "target_sha256": target_sha,
+                "source_size_bytes": source_size,
+                "target_size_bytes": target_size,
+                "source_mtime_ns": source_mtime_ns,
+                "temp_path": "",
+                "completed_utc": _utc_now(),
+                "journal_path": journal_path.as_posix(),
+                "reason": "target appeared during exclusive create but matched source",
+            }
+        raise Phase2BMigrationError(f"Destination conflict during direct copy for {target_path}")
+    except Exception:
+        if created_target and target_path.exists():
+            try:
+                target_path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+
+
 def _copy_verified(row: dict[str, Any], *, config: ProjectConfig, legacy_root: Path, source_snapshot: dict[str, tuple[int, int]], journal_records: dict[str, dict[str, Any]], journal_path: Path, sequence: int) -> dict[str, Any]:
     source_path = Path(row["source_path"]).expanduser().resolve()
     target_path = Path(row["proposed_target"]).expanduser().resolve()
@@ -568,6 +679,20 @@ def _copy_verified(row: dict[str, Any], *, config: ProjectConfig, legacy_root: P
                 "reason": "identical target already present",
             }
         raise Phase2BMigrationError(f"Destination conflict for {target_path}")
+
+    if PROMOTION_STRATEGY == "exclusive_direct":
+        return _copy_direct_verified(
+            row,
+            config=config,
+            legacy_root=legacy_root,
+            source_snapshot=source_snapshot,
+            journal_records=journal_records,
+            journal_path=journal_path,
+            sequence=sequence,
+            source_sha=source_sha,
+            source_size=source_size,
+            source_mtime_ns=source_mtime_ns,
+        )
 
     _ensure_parent_chain(target_path.parent, config.paths.derivatives_root)
     temp_path = target_path.parent / f".{target_path.name}.{os.getpid()}.{uuid.uuid4().hex}.phase2b.tmp"

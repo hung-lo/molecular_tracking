@@ -38,6 +38,7 @@ for _import_dir in (
 
 
 from analysis_paths import get_dataset_analysis_dir, resolve_dataset_dir
+from longitudinal_session import resolve_plot_day_axis
 from project_cli import add_project_selector, catalog_spacing, resolve_processed_dataset, resolve_selection
 from roi_log_ratio_analysis import (
     add_day0_normalized_column,
@@ -530,10 +531,14 @@ def plot_population_summary(
         summaries.
     """
 
-    day_values = np.sort(roi_metrics["day"].unique())
-    date_labels = make_day_date_labels(day_values, start_date=start_date)
+    timing = resolve_plot_day_axis(roi_metrics, start_date=start_date)
+    day_values = timing["plot_day"].to_numpy(dtype=int)
+    date_labels = timing["date_label"].tolist()
+    source_to_plot = dict(zip(timing["source_day"], timing["plot_day"], strict=True))
+    plot_metrics = roi_metrics.copy()
+    plot_metrics["plot_day"] = plot_metrics["day"].map(source_to_plot)
     summary = (
-        roi_metrics.groupby("day")
+        plot_metrics.groupby("plot_day")
         .agg(
             raw_log2_median=("log2_green_over_red", "median"),
             raw_log2_q25=("log2_green_over_red", lambda values: np.quantile(values, 0.25)),
@@ -546,6 +551,7 @@ def plot_population_summary(
             green_fraction_q75=("green_fraction", lambda values: np.quantile(values, 0.75)),
         )
         .reset_index()
+        .rename(columns={"plot_day": "day"})
     )
 
     figure, axes = plt.subplots(1, 3, figsize=(13.8, 4.4), facecolor="white")
@@ -582,10 +588,10 @@ def plot_population_summary(
         strict=True,
     ):
         if include_traces:
-            for _, roi_table in roi_metrics.groupby("roi_id", sort=False):
-                roi_table = roi_table.sort_values("day")
+            for _, roi_table in plot_metrics.groupby("roi_id", sort=False):
+                roi_table = roi_table.sort_values("plot_day")
                 axis.plot(
-                    roi_table["day"].to_numpy(dtype=int),
+                    roi_table["plot_day"].to_numpy(dtype=int),
                     roi_table[value_column].to_numpy(dtype=float),
                     color=color,
                     alpha=0.12,

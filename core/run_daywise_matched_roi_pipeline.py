@@ -253,6 +253,7 @@ def _policy_observation_lookup(
                     "acquisition_date": record.acquisition_date.isoformat(),
                     "elapsed_days": int(elapsed_days_by_session[str(record.session_id)]),
                     "mask_label": int(label_value),
+                    "session_roi_label": int(label_value),
                     "required": bool(record.required),
                 }
             )
@@ -281,6 +282,7 @@ def _extract_policy_raw_table(
                 "acquisition_date",
                 "elapsed_days",
                 "mask_label",
+                "session_roi_label",
                 "required",
                 "channel",
                 "mean_intensity",
@@ -357,6 +359,7 @@ def _track_lookup(tracks_table: pd.DataFrame, policy: str, records: list[Session
                     "acquisition_date": record.acquisition_date.isoformat(),
                     "elapsed_days": int(elapsed_days_by_session[str(record.session_id)]),
                     "mask_label": int(label_value),
+                    "session_roi_label": int(label_value),
                     "required": bool(record.required),
                 }
             )

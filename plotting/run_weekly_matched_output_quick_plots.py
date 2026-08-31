@@ -238,8 +238,7 @@ def build_quick_plots(
             roi_summary=roi_summary,
             max_rois=top_n,
             direction=direction_label,
-            random_sample=True,
-            random_seed=0,
+            ranking_mode="final",
         )
         if top_rois.empty:
             log_message(run_start_seconds, f"No ranked {direction_label} clusters found; skipping directional plots")

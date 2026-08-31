@@ -1095,6 +1095,7 @@ def select_top_changing_rois(
     max_proj_area_px: float | None = None,
     random_sample: bool = False,
     random_seed: int = 0,
+    ranking_mode: str | None = None,
 ) -> pd.DataFrame:
     """Select ROIs with the strongest green loss or gain among red-stable cells.
 
@@ -1133,6 +1134,11 @@ def select_top_changing_rois(
         raise ValueError("max_rois must be positive.")
     if direction not in {"decreasing", "increasing"}:
         raise ValueError("direction must be either 'decreasing' or 'increasing'.")
+    if ranking_mode is None:
+        ranking_mode = "random" if random_sample else "excursion"
+    if ranking_mode not in {"final", "excursion", "random"}:
+        raise ValueError("ranking_mode must be 'final', 'excursion', or 'random'.")
+    random_sample = ranking_mode == "random"
 
     candidates, brightness_threshold, selection_metric_column = _build_changing_roi_candidates(
         roi_summary=roi_summary,
@@ -1143,6 +1149,14 @@ def select_top_changing_rois(
         max_proj_area_px=max_proj_area_px,
     )
 
+    if ranking_mode == "final":
+        selection_metric_column = "day_last_delta_log2_green_over_red"
+        if selection_metric_column not in candidates.columns:
+            raise ValueError(f"Missing required columns: {selection_metric_column}")
+        if direction == "increasing":
+            candidates = candidates[candidates[selection_metric_column] > 0]
+        else:
+            candidates = candidates[candidates[selection_metric_column] < 0]
     if candidates.empty:
         ranked = candidates.copy()
     elif random_sample:
@@ -1152,22 +1166,19 @@ def select_top_changing_rois(
         ranked = candidates.iloc[sampled_positions].copy().reset_index(drop=True)
         ranked = ranked.iloc[rng.permutation(len(ranked))].reset_index(drop=True)
     else:
-        if direction == "decreasing":
+        if ranking_mode == "final":
             ranked = candidates.sort_values(
-                [
-                    "min_delta_log2_green_over_red",
-                    "delta_log2_range",
-                    "day0_brightness",
-                ],
+                [selection_metric_column, "delta_log2_range", "day0_brightness"],
+                ascending=[direction == "decreasing", False, False],
+            ).head(max_rois)
+        elif direction == "decreasing":
+            ranked = candidates.sort_values(
+                ["min_delta_log2_green_over_red", "delta_log2_range", "day0_brightness"],
                 ascending=[True, False, False],
             ).head(max_rois)
         else:
             ranked = candidates.sort_values(
-                [
-                    "max_delta_log2_green_over_red",
-                    "delta_log2_range",
-                    "day0_brightness",
-                ],
+                ["max_delta_log2_green_over_red", "delta_log2_range", "day0_brightness"],
                 ascending=[False, False, False],
             ).head(max_rois)
 
@@ -1175,8 +1186,9 @@ def select_top_changing_rois(
     ranked["selection_rank"] = np.arange(1, len(ranked) + 1, dtype=int)
     ranked["brightness_threshold"] = brightness_threshold
     ranked["selection_direction"] = direction
+    ranked["selection_mode"] = ranking_mode
     ranked["selection_metric_column"] = (
-        "random_sample" if random_sample else selection_metric_column
+        "random_sample" if ranking_mode == "random" else selection_metric_column
     )
     ranked["selection_random_seed"] = np.nan if not random_sample else int(random_seed)
     ranked["min_proj_area_px_threshold"] = (

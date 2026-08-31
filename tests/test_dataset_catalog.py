@@ -33,3 +33,32 @@ def test_alignment_and_pairing_and_plan(tmp_path):
     plan,ready=build_manifest_plan(config,rows,"mouse_1")
     assert plan.name=="session_manifest_plan.csv" and not ready
     assert config.paths.derivatives_root in plan.parents and config.paths.raw_root not in plan.parents
+
+
+def test_discovery_supports_flat_incoming_sessions_and_alias(tmp_path):
+    config, raw = _project(tmp_path)
+    flat = raw / "WT_Fucci-Tri_corFront_20260824"
+    acq = flat / "filed_vol50"
+    acq.mkdir(parents=True)
+    shutil.copy(FIX / "rectangular_1050.xml", acq / "Experiment.xml")
+    rows, report = discover_catalog(config)
+    # This fixture project has only mouse_1 metadata, so the historical alias
+    # is correctly reported as unknown rather than creating a new mouse.
+    assert not rows
+    assert any(e["code"] == "unknown_flat_mouse" for e in report["errors"])
+
+
+def test_flat_session_date_is_anchored_and_calendar_valid(tmp_path):
+    config, raw = _project(tmp_path)
+    # Match the configured mouse and ensure unrelated date-like names are ignored.
+    flat = raw / "WT_mouse_1_20260820"
+    acq = flat / "filed_vol50"
+    acq.mkdir(parents=True)
+    shutil.copy(FIX / "rectangular_1050.xml", acq / "Experiment.xml")
+    (raw / "unrelated_20260820").mkdir()
+    (raw / "WT_mouse_1_20261301").mkdir()
+    rows, report = discover_catalog(config)
+    assert len(rows) == 1 and rows[0]["discovery_layout"] == "flat"
+    assert rows[0]["acquisition_date"] == "2026-08-20"
+    assert any(w["code"] == "ignored_raw_root_entry" for w in report["warnings"])
+    assert any(w["code"] == "invalid_flat_session_date" for w in report["warnings"])

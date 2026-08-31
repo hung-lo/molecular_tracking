@@ -16,6 +16,9 @@ from project_config import ProjectConfig,validate_output_path
 from thorimage_xml import ThorImageMetadata,ThorImageParseError,parse_experiment_xml
 
 NULL_COMPAT={"TBD","NA","N/A"}; CATALOG_VERSION="thorimage_catalog_v1"
+_FLAT_SESSION_RE = re.compile(r"^WT_(.+)_(\d{8})$")
+# Historical acquisition name mapped to the canonical project mouse.
+_FLAT_MOUSE_ALIASES = {"Fucci-Tri_corFront": "Fucci-Tri_1"}
 
 @dataclass(frozen=True)
 class Mouse:
@@ -65,28 +68,72 @@ def _classification(name:str,meta:ThorImageMetadata,config:ProjectConfig)->tuple
     if warnings: return "ambiguous",False,laser,warnings
     return "canonical",True,laser,warnings
 
-def _session_date(name:str)->str|None:
-    match=re.search(r"(\d{8})$",name)
-    if not match:return None
-    try:return date.fromisoformat(f"{match.group(1)[:4]}-{match.group(1)[4:6]}-{match.group(1)[6:]}").isoformat()
-    except ValueError:return None
+def _session_date(name:str, *, flat: bool = False)->str|None:
+    match = _FLAT_SESSION_RE.fullmatch(name) if flat else re.search(r"(\d{8})$", name)
+    if not match: return None
+    token = match.group(2) if flat else match.group(1)
+    try:
+        return date.fromisoformat(f"{token[:4]}-{token[4:6]}-{token[6:]}").isoformat()
+    except ValueError:
+        return None
+
+@dataclass(frozen=True)
+class DiscoveredSession:
+    mouse: Mouse
+    path: Path
+    session_date: str
+    discovery_layout: str
+
+def _flat_mouse_id(name: str) -> str | None:
+    match = _FLAT_SESSION_RE.fullmatch(name)
+    if not match: return None
+    return _FLAT_MOUSE_ALIASES.get(match.group(1), match.group(1))
+
+def _discover_sessions(raw_root: Path, mice: list[Mouse], errors: list[dict], warnings: list[dict]) -> list[DiscoveredSession]:
+    by_id = {mouse.mouse_id: mouse for mouse in mice}
+    discovered: list[DiscoveredSession] = []
+    for mouse in mice:
+        root = raw_root / mouse.raw_mouse_folder
+        if not root.is_dir(): continue
+        for session in sorted(p for p in root.iterdir() if p.is_dir() and _session_date(p.name)):
+            discovered.append(DiscoveredSession(mouse, session, _session_date(session.name), "grouped"))
+    if raw_root.is_dir():
+        grouped_names = {mouse.raw_mouse_folder for mouse in mice}
+        for session in sorted(p for p in raw_root.iterdir() if p.is_dir()):
+            match = _FLAT_SESSION_RE.fullmatch(session.name)
+            if not match:
+                if session.name not in grouped_names:
+                    warnings.append({"code": "ignored_raw_root_entry", "path": str(session)})
+                continue
+            session_date = _session_date(session.name, flat=True)
+            mouse_id = _flat_mouse_id(session.name)
+            if session_date is None:
+                warnings.append({"code": "invalid_flat_session_date", "path": str(session)})
+            elif mouse_id not in by_id:
+                errors.append({"code": "unknown_flat_mouse", "path": str(session), "mouse_name": match.group(1)})
+            else:
+                discovered.append(DiscoveredSession(by_id[mouse_id], session, session_date, "flat"))
+    return discovered
 
 def discover_catalog(config:ProjectConfig)->tuple[list[dict[str,Any]],dict[str,Any]]:
     rows=[]; errors=[]; warnings=[]; mice=load_mice(config.paths.mice_csv)
     for mouse in mice:
         for field in mouse.normalized_null_fields: warnings.append({"code":"compat_null_normalized","mouse_id":mouse.mouse_id,"field":field})
-        root=config.paths.raw_root/mouse.raw_mouse_folder
-        if not root.is_dir(): errors.append({"code":"missing_mouse_folder","mouse_id":mouse.mouse_id,"path":str(root)}); continue
-        for session in sorted(p for p in root.iterdir() if p.is_dir() and _session_date(p.name)):
-            session_date=_session_date(session.name)
-            for acq in sorted(p for p in session.iterdir() if p.is_dir() and (p/"Experiment.xml").is_file()):
+    discovered = _discover_sessions(config.paths.raw_root, mice, errors, warnings)
+    grouped_mouse_ids = {s.mouse.mouse_id for s in discovered if s.discovery_layout == "grouped"}
+    for mouse in mice:
+        if mouse.mouse_id not in grouped_mouse_ids and not any(s.mouse.mouse_id == mouse.mouse_id and s.discovery_layout == "flat" for s in discovered):
+            errors.append({"code":"missing_mouse_folder","mouse_id":mouse.mouse_id,"path":str(config.paths.raw_root / mouse.raw_mouse_folder)})
+    for found in sorted(discovered, key=lambda s: (s.mouse.mouse_id, s.session_date, s.path.name)):
+        mouse, session, session_date = found.mouse, found.path, found.session_date
+        for acq in sorted(p for p in session.iterdir() if p.is_dir() and (p/"Experiment.xml").is_file()):
                 xml=acq/"Experiment.xml"
                 try: meta=parse_experiment_xml(xml)
                 except ThorImageParseError as exc: errors.append({"code":"malformed_xml","path":str(xml),"message":str(exc)}); continue
                 role,included,laser,codes=_classification(acq.name,meta,config)
                 if meta.experiment_date!=session_date: codes.append("session_xml_date_mismatch")
                 p=list(meta.pockels)+[None,None]; raw=acq/"Image_001_001.raw"
-                row={"mouse_id":mouse.mouse_id,"experimental_group":mouse.values["experimental_group"],"cohort":mouse.values["cohort"],"session_id":session.name,"acquisition_date":session_date,"acquisition_id":acq.name,"source_path":str(acq.resolve()),"role":role,"analysis_included":included,"laser_nm":laser,"is_primary":laser==config.rig.primary_laser_nm and included,"xml_date":meta.experiment_date,"software_version":meta.software_version,"experiment_status":meta.experiment_status,"pixel_x":meta.pixel_x,"pixel_y":meta.pixel_y,"width_um":meta.width_um,"height_um":meta.height_um,"pixel_size_x_um":meta.pixel_width_um,"pixel_size_y_um":meta.pixel_height_um,"z_imaging_planes":meta.z_steps,"flyback_planes":meta.flyback_frames,"z_step_um":meta.z_step_um,"timepoints":meta.timepoints,"streaming_frames":meta.streaming_frames,"pockels_920_start_pct":p[0].start if p[0] else None,"pockels_920_stop_pct":p[0].stop if p[0] else None,"pockels_1050_start_pct":p[1].start if p[1] else None,"pockels_1050_stop_pct":p[1].stop if p[1] else None,"pockels_node_count":len(meta.pockels),"pmt_a_gain":meta.pmt_a_gain,"pmt_b_gain":meta.pmt_b_gain,"average_num":meta.average_num,"raw_image_path":str(raw.resolve()) if raw.exists() else "","warnings":";".join(sorted(set(codes)))}
+                row={"mouse_id":mouse.mouse_id,"experimental_group":mouse.values["experimental_group"],"cohort":mouse.values["cohort"],"session_id":session.name,"acquisition_date":session_date,"discovery_layout":found.discovery_layout,"acquisition_id":acq.name,"source_path":str(acq.resolve()),"role":role,"analysis_included":included,"laser_nm":laser,"is_primary":laser==config.rig.primary_laser_nm and included,"xml_date":meta.experiment_date,"software_version":meta.software_version,"experiment_status":meta.experiment_status,"pixel_x":meta.pixel_x,"pixel_y":meta.pixel_y,"width_um":meta.width_um,"height_um":meta.height_um,"pixel_size_x_um":meta.pixel_width_um,"pixel_size_y_um":meta.pixel_height_um,"z_imaging_planes":meta.z_steps,"flyback_planes":meta.flyback_frames,"z_step_um":meta.z_step_um,"timepoints":meta.timepoints,"streaming_frames":meta.streaming_frames,"pockels_920_start_pct":p[0].start if p[0] else None,"pockels_920_stop_pct":p[0].stop if p[0] else None,"pockels_1050_start_pct":p[1].start if p[1] else None,"pockels_1050_stop_pct":p[1].stop if p[1] else None,"pockels_node_count":len(meta.pockels),"pmt_a_gain":meta.pmt_a_gain,"pmt_b_gain":meta.pmt_b_gain,"average_num":meta.average_num,"raw_image_path":str(raw.resolve()) if raw.exists() else "","warnings":";".join(sorted(set(codes)))}
                 rows.append(row)
     rows.sort(key=lambda r:(r["mouse_id"],r["acquisition_date"],r["acquisition_id"]))
     for mouse in mice:

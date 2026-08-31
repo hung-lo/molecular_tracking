@@ -24,7 +24,11 @@ def main(argv=None):
     rows,report=discover_catalog(config)
     for mouse,summary in report["summary"].items():
         print(mouse, " ".join(f"{key}={value}" for key,value in summary.items()))
-    if args.dry_run: print("dry-run: no files written")
+    if args.dry_run:
+        print("dry-run: no files written")
+    elif args.strict and report["errors"]:
+        print(f"strict validation failed: {len(report['errors'])} error(s); no catalog written")
+        return 1
     else:
         output=write_catalog(config,rows,report); print(f"validation_report={output/'validation_report.json'}")
     return 1 if args.strict and report["errors"] else 0

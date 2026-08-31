@@ -120,6 +120,16 @@ def discover_catalog(config:ProjectConfig)->tuple[list[dict[str,Any]],dict[str,A
     for mouse in mice:
         for field in mouse.normalized_null_fields: warnings.append({"code":"compat_null_normalized","mouse_id":mouse.mouse_id,"field":field})
     discovered = _discover_sessions(config.paths.raw_root, mice, errors, warnings)
+    by_source_key: dict[tuple[str, str], list[DiscoveredSession]] = {}
+    for found in discovered:
+        by_source_key.setdefault((found.mouse.mouse_id, found.session_date), []).append(found)
+    conflicting_keys = set()
+    for (mouse_id, session_date), sources in sorted(by_source_key.items()):
+        paths = sorted({str(source.path.resolve()) for source in sources})
+        if len(paths) > 1:
+            conflicting_keys.add((mouse_id, session_date))
+            errors.append({"code": "duplicate_session_source", "mouse_id": mouse_id, "acquisition_date": session_date, "paths": paths})
+    discovered = [found for found in discovered if (found.mouse.mouse_id, found.session_date) not in conflicting_keys]
     grouped_mouse_ids = {s.mouse.mouse_id for s in discovered if s.discovery_layout == "grouped"}
     for mouse in mice:
         if mouse.mouse_id not in grouped_mouse_ids and not any(s.mouse.mouse_id == mouse.mouse_id and s.discovery_layout == "flat" for s in discovered):

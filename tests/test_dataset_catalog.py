@@ -37,15 +37,36 @@ def test_alignment_and_pairing_and_plan(tmp_path):
 
 def test_discovery_supports_flat_incoming_sessions_and_alias(tmp_path):
     config, raw = _project(tmp_path)
-    flat = raw / "WT_Fucci-Tri_corFront_20260824"
-    acq = flat / "filed_vol50"
+    config.paths.mice_csv.write_text("mouse_id,experimental_group,cohort,raw_mouse_folder,reference_session_or_folder\nFucci-Tri_1,group,cohort,Fucci-Tri_1,\n")
+    acq = raw / "WT_Fucci-Tri_corFront_20260824" / "filed_vol50"
     acq.mkdir(parents=True)
     shutil.copy(FIX / "rectangular_1050.xml", acq / "Experiment.xml")
     rows, report = discover_catalog(config)
-    # This fixture project has only mouse_1 metadata, so the historical alias
-    # is correctly reported as unknown rather than creating a new mouse.
-    assert not rows
+    assert rows[0]["mouse_id"] == "Fucci-Tri_1"
+    assert rows[0]["acquisition_date"] == "2026-08-24"
+    assert rows[0]["discovery_layout"] == "flat"
+    assert not any(e["code"] == "unknown_flat_mouse" for e in report["errors"])
+
+
+def test_unknown_flat_mouse_is_rejected(tmp_path):
+    config, raw = _project(tmp_path)
+    (raw / "WT_unknown_20260824").mkdir()
+    _, report = discover_catalog(config)
     assert any(e["code"] == "unknown_flat_mouse" for e in report["errors"])
+
+
+def test_duplicate_grouped_and_flat_session_sources_are_rejected(tmp_path):
+    config, raw = _project(tmp_path)
+    config.paths.mice_csv.write_text("mouse_id,experimental_group,cohort,raw_mouse_folder,reference_session_or_folder\nFucci-Tri_1,group,cohort,Fucci-Tri_1,\n")
+    for acq in (raw / "Fucci-Tri_1" / "session_20260824" / "filed_vol50", raw / "WT_Fucci-Tri_corFront_20260824" / "filed_vol50"):
+        acq.mkdir(parents=True)
+        shutil.copy(FIX / "rectangular_1050.xml", acq / "Experiment.xml")
+    rows, report = discover_catalog(config)
+    collisions = [e for e in report["errors"] if e["code"] == "duplicate_session_source"]
+    assert len(collisions) == 1
+    assert collisions[0]["mouse_id"] == "Fucci-Tri_1"
+    assert len(collisions[0]["paths"]) == 2
+    assert not rows
 
 
 def test_flat_session_date_is_anchored_and_calendar_valid(tmp_path):

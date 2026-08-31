@@ -3,7 +3,9 @@
 ## Multi-mouse project workflow (primary)
 
 Raw ThorImage folders are read-only inputs. Copy `config/project.example.toml` to the ignored
-`config/project.local.toml`, then edit the raw and derivatives roots.
+`config/project.local.toml`, then edit the raw and derivatives roots. The raw root may be either
+the historical grouped tree (`raw_data/<mouse>/<session>`) or the flat acquisition staging tree
+(`incoming_data/WT_<mouse>_<YYYYMMDD>`); both are discovered without copying acquisitions.
 
 ```bash
 python tools/build_data_catalog.py --project-config config/project.local.toml --dry-run

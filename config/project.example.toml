@@ -1,6 +1,6 @@
 # Copy to project.local.toml and edit. Windows equivalents begin D:\\_data\\_newAAV_2026.
 [paths]
-raw_root = "/mnt/d/_data/_newAAV_2026/raw_data"
+raw_root = "/mnt/d/_data/_newAAV_2026/incoming_data"
 derivatives_root = "/mnt/d/_data/_newAAV_2026/molecular_tracking_derivatives"
 mice_csv = "../metadata/mice.csv"
 legacy_fucci_tri_root = "/mnt/d/_data/_newAAV_2026/Fucci-Tri_avg_images"

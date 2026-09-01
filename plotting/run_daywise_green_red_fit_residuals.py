@@ -255,8 +255,10 @@ def plot_directional_roi_residuals_vs_day(
         Reference date in ``YYYYMMDD`` format used for day labels.
     """
 
-    day_values = np.sort(ranked_roi_table["day"].unique())
-    day_labels = make_day_labels(day_values, start_date=start_date)
+    timing = resolve_plot_day_axis(ranked_roi_table, start_date=start_date)
+    source_to_plot = dict(zip(timing["source_day"], timing["plot_day"], strict=True))
+    day_values = timing["plot_day"].to_numpy(dtype=int)
+    day_labels = timing["date_label"].tolist()
     roi_order = (
         ranked_roi_table.loc[:, ["roi_id", "selection_rank"]]
         .drop_duplicates(subset=["roi_id"])

@@ -243,6 +243,9 @@ def plot_daywise_scatter_summary(
     if filtered_metrics.empty:
         raise ValueError("No ROI metrics remained after filtering green artifacts.")
     plot_fit_summary = summarize_daily_green_red_linear_fits(filtered_metrics)
+    timing = resolve_plot_day_axis(roi_metrics, start_date=start_date)
+    source_to_plot = dict(zip(timing["source_day"], timing["plot_day"], strict=True))
+    source_to_date = dict(zip(timing["source_day"], timing["date_label"], strict=True))
     day_values = plot_fit_summary["day"].to_numpy(dtype=int)
     date_labels = _resolve_day_date_labels(
         roi_metrics,
@@ -321,7 +324,7 @@ def plot_daywise_scatter_summary(
             axis.fill_between(x_grid, y_low, y_high, color="#8ecae6", alpha=0.35, linewidth=0)
             axis.plot(x_grid, y_hat, color="#d62828", linewidth=2.0)
 
-        axis.set_title(f"Day {day_value}\n{date_label}", fontsize=11)
+        axis.set_title(f"Day {int(source_to_plot[int(day_value)])}\n{source_to_date[int(day_value)]}", fontsize=11)
         axis.set_xlabel("Corrected red intensity", fontsize=10)
         if day_value == int(day_values[0]):
             axis.set_ylabel("Corrected green intensity", fontsize=10)

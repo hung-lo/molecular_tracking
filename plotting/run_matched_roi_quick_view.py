@@ -86,7 +86,7 @@ def _tracks_from_raw_table(raw_table, policy):
 def main(argv=None):
     ap=argparse.ArgumentParser(); ap.add_argument('--analysis-dir',required=True)
     g=ap.add_mutually_exclusive_group(required=True); g.add_argument('--cluster-id'); g.add_argument('--track-uid')
-    ap.add_argument('--policy',choices=['high','balanced'],default='high'); ap.add_argument('--output'); ap.add_argument('--z-radius',type=int,default=3)
+    ap.add_argument('--policy',choices=['high','balanced','graph'],default='high'); ap.add_argument('--output'); ap.add_argument('--z-radius',type=int,default=3)
     a=ap.parse_args(argv); root=Path(a.analysis_dir); manifest=pd.read_csv(root/'session_manifest_resolved.csv'); raw=pd.read_csv(root/'matched_roi_intensity_results_raw.csv'); tracks=_tracks_from_raw_table(raw,a.policy)
     out=Path(a.output or root/f"raw_roi_{a.cluster_id or a.track_uid}.png"); plot_matched_roi_raw_slices(cluster_id=a.cluster_id,track_uid=a.track_uid,tracks_table=tracks,session_table=manifest,output_path=out,z_radius=a.z_radius)
 if __name__=='__main__': main()

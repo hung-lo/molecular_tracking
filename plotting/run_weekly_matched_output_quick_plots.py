@@ -336,7 +336,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--policy",
         default="high",
-        choices=["high", "balanced", "all"],
+        choices=["high", "balanced", "graph", "all"],
         help="When match_policy is present, choose which policy to plot. Use 'all' to keep both.",
     )
     return parser.parse_args(argv)

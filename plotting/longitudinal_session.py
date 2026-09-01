@@ -19,6 +19,9 @@ def resolve_plot_day_axis(table: pd.DataFrame, start_date: str | None = None) ->
                 raise ValueError(f"Conflicting {col} metadata for a source day")
     if "elapsed_days" in work.columns:
         work["plot_day"] = pd.to_numeric(work["elapsed_days"], errors="raise")
+    elif "acquisition_date" in work.columns:
+        dates = pd.to_datetime(work["acquisition_date"], errors="raise")
+        work["plot_day"] = (dates - dates.min()).dt.days
     else:
         work["plot_day"] = pd.to_numeric(work["source_day"], errors="raise")
     if "acquisition_date" in work.columns:

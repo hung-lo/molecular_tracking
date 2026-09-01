@@ -675,7 +675,10 @@ def plot_single_day_red_green_scatter(
     x_grid, y_hat, y_low, y_high = compute_regression_ci_band(x_values=x_values, y_values=y_values)
 
     fit_row = fit_summary.loc[fit_summary["day"] == int(day)].iloc[0]
-    date_label = make_day_date_labels(np.array([day], dtype=int), start_date=start_date)[0]
+    timing = resolve_plot_day_axis(roi_metrics, start_date=start_date)
+    timing_row = timing.loc[timing["source_day"].eq(int(day))]
+    if len(timing_row) != 1: raise ValueError(f"No unique timing metadata for day {day}")
+    plot_day = int(timing_row["plot_day"].iloc[0]); date_label = str(timing_row["date_label"].iloc[0])
 
     figure, axis = plt.subplots(figsize=(6.2, 5.4), facecolor="white")
     axis.scatter(
@@ -698,7 +701,7 @@ def plot_single_day_red_green_scatter(
     axis.set_xlabel("Corrected red intensity", fontsize=11)
     axis.set_ylabel("Corrected green intensity", fontsize=11)
     axis.set_title(
-        f"Day {day} corrected red vs green ROI values\n{date_label}",
+        f"Day {plot_day} corrected red vs green ROI values\n{date_label}",
         fontsize=13,
     )
     axis.text(

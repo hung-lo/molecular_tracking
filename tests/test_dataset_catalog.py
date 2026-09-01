@@ -1,5 +1,6 @@
 from pathlib import Path
 import shutil
+import pytest
 from dataset_catalog import build_manifest_plan, discover_catalog
 from project_config import load_project_config
 
@@ -83,3 +84,97 @@ def test_flat_session_date_is_anchored_and_calendar_valid(tmp_path):
     assert rows[0]["acquisition_date"] == "2026-08-20"
     assert any(w["code"] == "ignored_raw_root_entry" for w in report["warnings"])
     assert any(w["code"] == "invalid_flat_session_date" for w in report["warnings"])
+
+
+def _manifest_rows(config, count: int = 1) -> list[dict]:
+    return [
+        {
+            "mouse_id": "mouse_1",
+            "session_id": f"session_{index}",
+            "acquisition_date": f"2026-08-{19 + index:02d}",
+            "acquisition_id": f"acq_{index}",
+            "source_path": str(config.paths.raw_root / f"source_{index}"),
+            "analysis_included": True,
+            "laser_nm": 1050,
+        }
+        for index in range(count)
+    ]
+
+
+def _write_manifest_inputs(config, rows: list[dict], ready: set[int]) -> None:
+    for index, row in enumerate(rows):
+        base = (
+            config.paths.derivatives_root
+            / "mouse_1"
+            / "sessions"
+            / row["acquisition_date"].replace("-", "")
+            / "1050"
+        )
+        if index in ready:
+            (base / "preprocessing").mkdir(parents=True, exist_ok=True)
+            (base / "segmentation").mkdir(parents=True, exist_ok=True)
+            (base / "preprocessing" / "red.tif").touch()
+            (base / "preprocessing" / "green.tif").touch()
+            (base / "segmentation" / "mask.tif").touch()
+
+
+@pytest.mark.parametrize("missing_name", ["red.tif", "green.tif"])
+def test_manifest_plan_classifies_missing_preprocessing_as_preprocessing_required(
+    tmp_path, missing_name
+):
+    config, _ = _project(tmp_path)
+    rows = _manifest_rows(config)
+    _write_manifest_inputs(config, rows, {0})
+    (config.paths.derivatives_root / "mouse_1" / "sessions" / "20260819" / "1050" / "preprocessing" / missing_name).unlink()
+
+    plan, ready = build_manifest_plan(config, rows, "mouse_1")
+    assert not ready
+    assert plan.name == "session_manifest_plan.csv"
+    assert plan.read_text().splitlines()[-1].endswith("preprocessing_required")
+
+
+def test_manifest_plan_classifies_missing_mask_as_segmentation_required(tmp_path):
+    config, _ = _project(tmp_path)
+    rows = _manifest_rows(config)
+    base = config.paths.derivatives_root / "mouse_1" / "sessions" / "20260819" / "1050"
+    (base / "preprocessing").mkdir(parents=True)
+    (base / "preprocessing" / "red.tif").touch()
+    (base / "preprocessing" / "green.tif").touch()
+
+    plan, ready = build_manifest_plan(config, rows, "mouse_1")
+    assert not ready
+    assert plan.read_text().splitlines()[-1].endswith("segmentation_required")
+
+
+def test_manifest_plan_all_present_writes_ready_manifest(tmp_path):
+    config, _ = _project(tmp_path)
+    rows = _manifest_rows(config)
+    _write_manifest_inputs(config, rows, {0})
+
+    manifest, ready = build_manifest_plan(config, rows, "mouse_1")
+    assert ready
+    assert manifest.name == "daywise_session_manifest.csv"
+    assert "status" not in manifest.read_text().splitlines()[0]
+
+
+def test_manifest_plan_mixed_sessions_reports_each_status_and_not_ready(tmp_path):
+    config, _ = _project(tmp_path)
+    rows = _manifest_rows(config, count=3)
+    _write_manifest_inputs(config, rows, {0})
+    second_base = config.paths.derivatives_root / "mouse_1" / "sessions" / "20260820" / "1050"
+    (second_base / "preprocessing").mkdir(parents=True)
+    (second_base / "preprocessing" / "red.tif").touch()
+    (second_base / "preprocessing" / "green.tif").touch()
+
+    plan, ready = build_manifest_plan(config, rows, "mouse_1")
+    assert not ready
+    assert plan.name == "session_manifest_plan.csv"
+    statuses = {
+        row["session_id"]: row["status"]
+        for row in __import__("csv").DictReader(plan.open(newline=""))
+    }
+    assert statuses == {
+        "session_0": "ready",
+        "session_1": "segmentation_required",
+        "session_2": "preprocessing_required",
+    }

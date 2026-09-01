@@ -191,3 +191,93 @@ def test_large_z_renderer_uses_two_by_seven_centroid_planes(tmp_path: Path, monk
     assert axes.shape == (2, 7)
     assert [axes[0, i].get_title().split("dz ")[-1] for i in range(7)] == ["+3", "+2", "+1", "0", "-1", "-2", "-3"]
     plt.close(fig)
+
+
+def test_axial_scatter_histogram_and_medians_share_high_confidence_population(
+    tmp_path: Path, monkeypatch
+) -> None:
+    match_dir = tmp_path / "match"
+    output_dir = tmp_path / "qc"
+    (output_dir / "tables").mkdir(parents=True)
+    match_dir.mkdir()
+    mask_path = tmp_path / "mask.tif"
+    red_path = tmp_path / "red.tif"
+    tifffile.imwrite(mask_path, np.zeros((1, 10, 10), dtype=np.uint16))
+    tifffile.imwrite(red_path, np.ones((1, 10, 10), dtype=np.uint16))
+
+    pd.DataFrame(
+        {
+            "session_index": [0, 1],
+            "session_id": ["a", "b"],
+            "acquisition_date": ["2026-05-11", "2026-05-12"],
+            "mask_path": [str(mask_path)] * 2,
+            "red_image_path": [str(red_path)] * 2,
+        }
+    ).to_csv(match_dir / "session_manifest_resolved.csv", index=False)
+    pd.DataFrame(
+        {
+            "session_id": ["a", "a", "a", "b", "b", "b"],
+            "label": [1, 2, 3, 11, 12, 13],
+            "centroid_x": [1, 2, 3, 1, 2, 3],
+            "centroid_y": [1, 2, 3, 1, 2, 3],
+            "centroid_z": [1, 1, 1, 3, 100, 5],
+        }
+    ).to_csv(match_dir / "roi_features.csv", index=False)
+    (match_dir / "run_log.json").write_text("{}", encoding="utf-8")
+
+    candidates = pd.DataFrame(
+        {
+            "day_a": ["a", "a", "a"],
+            "day_b": ["b", "b", "b"],
+            "label_a": [1, 2, 3],
+            "label_b": [11, 12, 13],
+            "score": [0.9, 0.8, 0.7],
+            "dice": [0.9, 0.8, 0.7],
+            "distance_um": [1.0, 1.0, 1.0],
+            "ambiguity": [0.1, 0.1, 0.1],
+            "high_rule": [True, False, True],
+            "pair_gap": [1, 1, 1],
+        }
+    )
+    high = candidates.iloc[[0]].copy()
+    balanced = candidates.iloc[[0]].copy()
+    graph = candidates.iloc[[0, 1]].copy()
+
+    scatter_values: list[tuple[np.ndarray, np.ndarray]] = []
+    histogram_values: list[np.ndarray] = []
+    original_scatter = qc.plt.Axes.scatter
+    original_hist = qc.plt.Axes.hist
+
+    def capture_scatter(axis, x, y, *args, **kwargs):
+        scatter_values.append((np.asarray(x), np.asarray(y)))
+        return original_scatter(axis, x, y, *args, **kwargs)
+
+    def capture_hist(axis, values, *args, **kwargs):
+        histogram_values.append(np.asarray(values))
+        return original_hist(axis, values, *args, **kwargs)
+
+    monkeypatch.setattr(qc.plt.Axes, "scatter", capture_scatter)
+    monkeypatch.setattr(qc.plt.Axes, "hist", capture_hist)
+    monkeypatch.setattr(qc, "_render_match_contact_sheet", lambda *args, **kwargs: None)
+    monkeypatch.setattr(qc, "_render_large_z_examples", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        qc,
+        "_save_figure",
+        lambda path, figure, *, dpi: (plt.close(figure) or path),
+    )
+
+    qc._generate_spatial_pair_qc(
+        match_dir,
+        output_dir,
+        candidates,
+        [high, balanced, graph],
+        dpi=72,
+    )
+
+    assert len(scatter_values) == 2
+    assert all(np.array_equal(values[1], np.array([2.0])) for values in scatter_values)
+    assert len(histogram_values) == 2
+    assert all(np.array_equal(values, np.array([2.0])) for values in histogram_values)
+    medians = pd.read_csv(output_dir / "tables" / "a_b_axial_shift_bins.csv")
+    assert medians["n_matches"].tolist() == [1]
+    assert medians["median_delta_z_planes"].tolist() == [2.0]

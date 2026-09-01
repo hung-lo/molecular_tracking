@@ -382,6 +382,8 @@ def _build_roi_day_table(corrected_table: pd.DataFrame, track_lookup: pd.DataFra
             "session_id",
             "acquisition_date",
             "elapsed_days",
+            "session_roi_label",
+            "mask_label",
             "required",
         ]
     ].drop_duplicates()

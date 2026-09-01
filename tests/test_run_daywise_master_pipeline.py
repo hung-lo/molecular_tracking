@@ -38,6 +38,8 @@ def test_run_daywise_master_pipeline_parse_args_and_defaults() -> None:
     assert args.overwrite is False
     assert args.resume is False
     assert args.sessions is None
+    assert args.skip_ranked_roi_views is False
+    assert args.ranked_roi_z_radius == 3
 
 
 def test_run_daywise_master_pipeline_config_defaults() -> None:
@@ -48,6 +50,8 @@ def test_run_daywise_master_pipeline_config_defaults() -> None:
     assert config.plot_columns == 7
     assert config.top_n == 30
     assert config.segmentation_qc_mode == "all_required"
+    assert config.skip_ranked_roi_views is False
+    assert config.ranked_roi_z_radius == 3
 
 
 def _build_records(tmp_path: Path, count: int = 6) -> list[SessionRecord]:
@@ -72,6 +76,33 @@ def _build_records(tmp_path: Path, count: int = 6) -> list[SessionRecord]:
             )
         )
     return records
+
+
+def test_run_daywise_master_pipeline_parser_accepts_ranked_roi_options() -> None:
+    args = parse_args(
+        [
+            "--dataset",
+            "/tmp/dataset",
+            "--manifest",
+            "/tmp/manifest.csv",
+            "--skip-ranked-roi-views",
+            "--ranked-roi-z-radius",
+            "0",
+        ]
+    )
+    assert args.skip_ranked_roi_views is True
+    assert args.ranked_roi_z_radius == 0
+
+
+def test_run_daywise_master_pipeline_rejects_negative_ranked_roi_z_radius() -> None:
+    with pytest.raises(ValueError, match="ranked_roi_z_radius"):
+        master.run_master_pipeline(
+            MasterPipelineConfig(
+                dataset="/tmp/dataset",
+                manifest="/tmp/manifest.csv",
+                ranked_roi_z_radius=-1,
+            )
+        )
 
 
 def test_run_daywise_master_pipeline_parser_accepts_sessions() -> None:
@@ -236,6 +267,7 @@ def test_master_pipeline_passes_same_effective_manifest_to_matching_and_extracti
             run_name="subset-test",
             sessions="last:3",
             skip_quick_plots=True,
+            skip_ranked_roi_views=True,
         )
     )
 

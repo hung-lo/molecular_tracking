@@ -8,7 +8,14 @@ import pandas as pd
 import tifffile
 
 from affine_overlap_matcher import AffineOverlapParams, VoxelSpacing
-from daywise_roi_matcher_qc_plots import DaywiseQCPlotConfig, generate_daywise_qc_plots
+from daywise_roi_matcher_qc_plots import (
+    DaywiseQCPlotConfig,
+    add_spatial_and_z_qc_columns,
+    detect_long_axis,
+    generate_daywise_qc_plots,
+    select_spatial_examples,
+    source_roi_match_fraction,
+)
 from run_daywise_roi_matching import run_daywise_roi_matching
 
 
@@ -77,3 +84,19 @@ def test_generate_daywise_qc_plots_writes_review_sample(tmp_path: Path) -> None:
     assert (output_dir / "cycle_agreement.png").exists()
     assert run_log["review_sample_rows"] == len(review_sample)
     assert run_log["saved_plots"]
+
+
+def test_spatial_qc_helpers_preserve_selection_and_zero_source_rois() -> None:
+    features = pd.DataFrame({"label": [1, 2, 3], "centroid_z": [1, 2, 3], "centroid_y": [2, 5, 8], "centroid_x": [2, 5, 8]})
+    candidates = pd.DataFrame({"session_a": ["a", "a"], "session_b": ["b", "b"], "label_a": [1, 2], "label_b": [1, 2], "score": [.9, .8], "dice": [.9, .8], "distance_um": [1., 2.], "ambiguity": [.1, .2], "accepted_for_track": [True, False], "high_rule": [True, False]})
+    enriched = add_spatial_and_z_qc_columns(candidates, features, target_features=features, image_shape_yx=(10, 12))
+    selected = select_spatial_examples(enriched, accepted=True, limit=8)
+    assert detect_long_axis((10, 12)) == "x"
+    assert enriched.loc[selected.index, "raw_delta_z_planes"].iloc[0] == 0
+    all_sources = enriched.iloc[:0].copy()
+    all_sources["label_a"] = [1, 2, 3]
+    all_sources["long_axis_position_normalized"] = [0.1, 0.5, 0.9]
+    all_sources["accepted_for_track"] = [True, False, False]
+    fraction = source_roi_match_fraction(enriched.iloc[:0], all_source_rois=all_sources)
+    assert int(fraction["n_source_rois"].sum()) == 3
+    assert int(fraction["n_accepted_source_rois"].sum()) == 1

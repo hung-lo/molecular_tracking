@@ -176,7 +176,7 @@ def select_spatial_examples(candidates: pd.DataFrame, *, accepted: bool, limit: 
 
 def source_roi_match_fraction(table: pd.DataFrame, *, bins: int = 5, all_source_rois: pd.DataFrame | None = None) -> pd.DataFrame:
     """Summarize acceptance using unique source ROIs, never candidate rows."""
-    if table.empty:
+    if all_source_rois is None and table.empty:
         return pd.DataFrame(columns=["bin", "n_source_rois", "n_accepted_source_rois", "accepted_fraction"])
     work = all_source_rois.copy() if all_source_rois is not None else table.copy()
     work["bin"] = np.minimum((pd.to_numeric(work["long_axis_position_normalized"], errors="coerce").clip(0, 0.999999) * bins).astype(int), bins - 1)
@@ -456,7 +456,7 @@ def _render_match_contact_sheet(table: pd.DataFrame, manifest: pd.DataFrame, out
             ax=axes[i,j]; ax.imshow(crop, cmap="magma", vmin=0, vmax=np.percentile(crop, 99.5) if np.any(crop) else 1); ax.contour(roi, levels=[.5], colors="cyan", linewidths=.7); ax.set_xticks([]); ax.set_yticks([])
             ax.set_title(f"{session} label {label} z={z0}", fontsize=8)
         accepted = bool(item["accepted_for_track"]); reason = "accepted" if accepted else str(item.get("rejection_reason", "rejected"))
-        fig.text(.5, (n-i-.98)/n, f"{item['session_a']} -> {item['session_b']} | {item['label_a']} -> {item['label_b']} | {reason} | score={float(item['score']):.3g} dice={float(item['dice']):.3g} dz={float(item['raw_delta_z_planes']):+.2f}", ha="center", fontsize=8)
+        fig.text(.5, (n-i-.98)/n, f"{item['session_a']} {item.get('acquisition_date_a','')} -> {item['session_b']} {item.get('acquisition_date_b','')} | {item['label_a']} -> {item['label_b']} | {reason} | score={float(item['score']):.3g} dice={float(item['dice']):.3g} dist={float(item['distance_um']):.3g} amb={float(item['ambiguity']):.3g} long={float(item['long_axis_position_normalized']):.2f} dz={float(item['raw_delta_z_planes']):+.2f}", ha="center", fontsize=8)
     fig.suptitle(title); _save_figure(output_path, fig, dpi=dpi)
 
 
@@ -470,7 +470,7 @@ def _render_large_z_examples(table: pd.DataFrame, manifest: pd.DataFrame, output
         return []
     for category, subset in (("accepted", table.loc[table.accepted_for_track].sort_values("raw_abs_delta_z_planes", ascending=False).head(2)), ("rejected", table.loc[~table.accepted_for_track].sort_values("raw_abs_delta_z_planes", ascending=False).head(2))):
         for number, (_, item) in enumerate(subset.iterrows(), 1):
-            fig, axes = plt.subplots(2, 2 * 7, figsize=(18, 5), squeeze=False)
+            fig, axes = plt.subplots(2, 7, figsize=(14, 5), squeeze=False)
             for side, label_col in enumerate(("label_a", "label_b")):
                 session = str(item["session_a"] if side == 0 else item["session_b"]); label = int(item[label_col]); row = sessions.loc[session]
                 mask, image = tifffile.imread(row["mask_path"]), tifffile.imread(row["red_image_path"]); coords=np.where(mask == label); z0=int(round(float(coords[0].mean()))); yc=int(round(float(coords[1].mean()))); xc=int(round(float(coords[2].mean())))
@@ -489,11 +489,13 @@ def _render_large_z_examples(table: pd.DataFrame, manifest: pd.DataFrame, output
 def _generate_spatial_pair_qc(match_dir: Path, output_dir: Path, candidates: pd.DataFrame, accepted_tables: list[pd.DataFrame], *, dpi: int, include_skip_pairs: bool = False) -> list[Path]:
     manifest = _load_csv(match_dir, "session_manifest_resolved.csv")
     features_by_session = _load_pair_features(match_dir)
-    if candidates.empty or manifest.empty or not features_by_session:
+    if manifest.empty or not features_by_session:
         return []
     accepted_by_policy = [_accepted_keys(t) for t in accepted_tables]
     accepted_high, accepted_balanced, accepted_graph = accepted_by_policy
     rows = candidates.copy()
+    if rows.empty:
+        rows = pd.DataFrame(columns=["day_a", "day_b", "label_a", "label_b", "score", "dice", "distance_um", "ambiguity", "high_rule"])
     rows["session_a"] = rows["day_a"].astype(str); rows["session_b"] = rows["day_b"].astype(str)
     keys = list(zip(rows.session_a, rows.session_b, rows.label_a.astype(str), rows.label_b.astype(str)))
     rows["accepted_high"] = [key in accepted_high for key in keys]
@@ -548,6 +550,13 @@ def _generate_spatial_pair_qc(match_dir: Path, output_dir: Path, candidates: pd.
         for ax in axes: ax.grid(alpha=.2); ax.set_xlabel("normalized long-axis position")
         path=axial_dir/f"{sa}_{sb}_axial_shift_qc.png"; _save_figure(path,fig,dpi=dpi); paths.append(path)
         fig, axes=plt.subplots(1,2,figsize=(9,3.5)); axes[0].hist(accepted_high.raw_delta_z_planes.dropna(), bins=15); axes[0].set_title("Signed raw dz (planes)"); axes[1].hist(accepted_high.raw_abs_delta_z_planes.dropna(), bins=15); axes[1].set_title("Absolute raw dz (planes)"); path=axial_dir/f"{sa}_{sb}_delta_z_distribution.png"; _save_figure(path,fig,dpi=dpi); paths.append(path)
+    seen_pairs = {(str(row["session_a"]), str(row["session_b"])) for row in summaries}
+    ordered = manifest.sort_values("session_index") if "session_index" in manifest.columns else manifest
+    for first, second in zip(ordered.iloc[:-1].itertuples(), ordered.iloc[1:].itertuples()):
+        sa, sb = str(first.session_id), str(second.session_id)
+        if (sa, sb) not in seen_pairs:
+            n_source = len(features_by_session.get(sa, []))
+            summaries.append({"session_a": sa, "session_b": sb, "n_source_rois": n_source, "n_accepted_source_rois": 0, "accepted_fraction": 0.0 if n_source else np.nan, "n_high_confidence": 0, "median_raw_delta_z_planes": np.nan, "median_abs_raw_delta_z_planes": np.nan, "p90_abs_raw_delta_z_planes": np.nan, "long_axis": detect_long_axis((tifffile.imread(first.mask_path).shape[1], tifffile.imread(first.mask_path).shape[2]))})
     pd.DataFrame(summaries).to_csv(tables_dir / "matching_qc_pair_summary.csv", index=False)
     return paths
 

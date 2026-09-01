@@ -38,12 +38,11 @@ def _first_existing(root: Path, names: tuple[str, ...]) -> Path:
 def _resolve_run_inputs(run_dir: Path) -> tuple[Path, Path, Path]:
     """Resolve current master-run inputs, with support for legacy flat runs."""
     extraction = run_dir / "extraction"
-    matching = run_dir / "matching"
     if extraction.is_dir():
         return (
             _first_existing(extraction, METRIC_NAMES),
             _first_existing(extraction, RAW_NAMES),
-            _first_existing(extraction, ("session_manifest_resolved.csv",)),
+            _first_existing(extraction, ("session_manifest_resolved.csv",)) if (extraction / "session_manifest_resolved.csv").is_file() else _first_existing(run_dir / "matching", ("session_manifest_resolved.csv",)),
         )
     return (
         _first_existing(run_dir, METRIC_NAMES),

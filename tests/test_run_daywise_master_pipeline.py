@@ -278,3 +278,112 @@ def test_master_pipeline_passes_same_effective_manifest_to_matching_and_extracti
     run_manifest = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
     assert run_manifest["session_selection"]["selected_source_session_indices"] == [3, 4, 5]
     assert run_manifest["manifest_path"] == str(expected_manifest.resolve())
+
+
+def _run_mocked_master_for_ranked_views(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    skip_ranked_roi_views: bool,
+    skip_quick_plots: bool = True,
+) -> tuple[Path, dict[str, object]]:
+    records = _build_records(tmp_path / "source")
+    source_manifest = tmp_path / "source_manifest.csv"
+    source_manifest.write_text(
+        "session_index,session_id,acquisition_date,mask_path,red_image_path,green_image_path,required\n"
+        + "\n".join(
+            f"{record.session_index},{record.session_id},{record.acquisition_date.isoformat()},"
+            f"{record.mask_path},{record.red_image_path},{record.green_image_path},true"
+            for record in records
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    dataset_dir = tmp_path / "dataset"
+    dataset_dir.mkdir()
+    output_root = tmp_path / "runs"
+    seen: dict[str, object] = {}
+
+    def fake_matching(**kwargs: object) -> Path:
+        return Path(kwargs["output_dir"])
+
+    def fake_extraction(_config: object) -> Path:
+        return tmp_path / "temporary_extraction"
+
+    def fake_ranked_views(**kwargs: object) -> Path:
+        seen["ranked_kwargs"] = kwargs
+        return (
+            Path(str(kwargs["run_dir"]))
+            / "plots"
+            / "graph"
+            / "single_roi_raw_validation"
+        )
+
+    monkeypatch.setattr(master, "run_daywise_graph_matching", fake_matching)
+    monkeypatch.setattr(
+        master,
+        "annotate_graph_affine_agreement",
+        lambda _path: {"n_consensus_accepted_edges": 0, "n_graph_only_accepted_edges": 0},
+    )
+    monkeypatch.setattr(master, "run_daywise_matched_roi_pipeline", fake_extraction)
+    monkeypatch.setattr(master, "_relocate_extraction_output", lambda _source, target: target)
+    monkeypatch.setattr(
+        master,
+        "annotate_extraction_outputs",
+        lambda _path, _tracks: {"n_consensus_tracks": 0, "n_graph_only_tracks": 0},
+    )
+    monkeypatch.setattr(master, "plot_wrapped_daywise_linear_relationships", lambda **_kwargs: None)
+    monkeypatch.setattr(master, "build_ranked_roi_views", fake_ranked_views)
+
+    config = MasterPipelineConfig(
+        dataset=str(dataset_dir),
+        manifest=str(source_manifest),
+        output_root=str(output_root),
+        run_name="ranked-test",
+        top_n=4,
+        ranked_roi_z_radius=2,
+        skip_quick_plots=skip_quick_plots,
+        skip_ranked_roi_views=skip_ranked_roi_views,
+    )
+    run_dir = master.run_master_pipeline(config)
+    return run_dir, seen
+
+
+def test_master_pipeline_integrates_ranked_roi_views_and_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, seen = _run_mocked_master_for_ranked_views(
+        tmp_path, monkeypatch, skip_ranked_roi_views=False, skip_quick_plots=True
+    )
+
+    assert seen["ranked_kwargs"] == {
+        "run_dir": run_dir,
+        "policy": "graph",
+        "top_n": 4,
+        "directions": ("increasing", "decreasing"),
+        "z_radius": 2,
+    }
+    manifest = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    expected_dir = run_dir / "plots" / "graph" / "single_roi_raw_validation"
+    assert manifest["outputs"]["ranked_roi_views_dir"] == str(expected_dir)
+    assert manifest["outputs"]["ranked_roi_batch_index"] == str(
+        expected_dir / "ranked_roi_batch_index.csv"
+    )
+    summary = (run_dir / "SUMMARY.md").read_text(encoding="utf-8")
+    assert str(expected_dir) in summary
+
+
+def test_master_pipeline_skips_ranked_roi_views_and_records_null_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, seen = _run_mocked_master_for_ranked_views(
+        tmp_path, monkeypatch, skip_ranked_roi_views=True
+    )
+
+    assert "ranked_kwargs" not in seen
+    manifest = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["outputs"]["ranked_roi_views_dir"] is None
+    assert manifest["outputs"]["ranked_roi_batch_index"] is None
+    summary = (run_dir / "SUMMARY.md").read_text(encoding="utf-8")
+    assert "Ranked individual ROI views:" in summary
+    assert "skipped" in summary

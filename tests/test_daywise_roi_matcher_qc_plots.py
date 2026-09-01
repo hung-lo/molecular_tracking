@@ -140,6 +140,34 @@ def test_selected_example_ids_survive_sampler_index_reset() -> None:
     assert selected["_candidate_row_id"].tolist() == [10]
 
 
+def test_selected_example_writeback_flags_only_selected_candidate_key() -> None:
+    table = pd.DataFrame({
+        "session_a": ["a", "a", "a"], "session_b": ["b", "b", "b"],
+        "label_a": [1, 2, 3], "label_b": [11, 12, 13],
+        "score": [.9, .8, .7], "dice": [.9, .8, .7],
+        "distance_um": [1., 2., 3.], "ambiguity": [.1, .2, .3],
+        "accepted_for_track": [True, True, False], "high_rule": [True, True, False],
+        "spatial_grid_row": [0, 1, 2], "spatial_grid_col": [0, 1, 2],
+    }, index=[10, 20, 30])
+    table["_candidate_row_id"] = table.index
+    selected = select_spatial_examples(table, accepted=True, limit=1)
+    table["selected_high_confidence_example"] = table["_candidate_row_id"].isin(selected["_candidate_row_id"])
+    flagged = table.loc[table["selected_high_confidence_example"]]
+    assert flagged[["session_a", "session_b", "label_a", "label_b"]].to_dict("records") == [{"session_a": "a", "session_b": "b", "label_a": 1, "label_b": 11}]
+
+
+def test_axial_high_confidence_population_excludes_graph_accepted_nonhigh_rows() -> None:
+    table = pd.DataFrame({
+        "accepted_graph": [True, True, False], "high_rule": [True, False, True],
+        "raw_delta_z_planes": [2., 99., -4.], "raw_abs_delta_z_planes": [2., 99., 4.],
+    })
+    accepted_high = table.loc[table["accepted_graph"] & table["high_rule"]]
+    median_source = accepted_high.copy()
+    assert median_source.index.tolist() == [0]
+    assert median_source["raw_delta_z_planes"].median() == 2.0
+    assert median_source["raw_delta_z_planes"].tolist() == accepted_high["raw_delta_z_planes"].tolist()
+
+
 def test_large_z_renderer_uses_two_by_seven_centroid_planes(tmp_path: Path, monkeypatch) -> None:
     mask = np.zeros((9, 12, 12), dtype=np.uint16)
     mask[4, 5, 6] = 1

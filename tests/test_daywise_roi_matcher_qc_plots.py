@@ -108,3 +108,31 @@ def test_source_fraction_with_empty_candidates_reports_zero_acceptance() -> None
     assert int(result["n_source_rois"].sum()) == 2
     assert int(result["n_accepted_source_rois"].sum()) == 0
     assert float(result["accepted_fraction"].sum()) == 0.0
+
+
+def test_graph_truth_and_high_confidence_pool_are_distinct() -> None:
+    table = pd.DataFrame({
+        "session_a": ["a", "a", "a"], "session_b": ["b"] * 3,
+        "label_a": [1, 2, 3], "label_b": [11, 12, 13],
+        "score": [.9, .8, .7], "dice": [.9, .8, .7],
+        "distance_um": [1., 1., 1.], "ambiguity": [.1, .1, .1],
+        "accepted_graph": [False, True, True], "accepted_for_track": [False, True, True],
+        "high_rule": [True, False, True],
+    })
+    high_pool = table.loc[table.accepted_graph & table.high_rule]
+    assert high_pool["label_a"].tolist() == [3]
+    assert not bool(table.loc[0, "accepted_for_track"])
+
+
+def test_selected_example_ids_survive_sampler_index_reset() -> None:
+    table = pd.DataFrame({
+        "session_a": ["a"] * 3, "session_b": ["b"] * 3,
+        "label_a": [1, 2, 3], "label_b": [11, 12, 13],
+        "score": [.5, .9, .7], "dice": [.5, .9, .7],
+        "distance_um": [3., 1., 2.], "ambiguity": [.3, .1, .2],
+        "accepted_for_track": [True, True, False], "high_rule": [True, True, False],
+        "spatial_grid_row": [0, 2, 1], "spatial_grid_col": [0, 2, 1],
+    }, index=[10, 20, 30])
+    selected = select_spatial_examples(table, accepted=True, limit=1)
+    assert selected["label_a"].tolist() == [1]
+    assert selected["_candidate_row_id"].tolist() == [10]

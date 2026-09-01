@@ -40,7 +40,7 @@ def test_resolve_output_dir_separates_policies() -> None:
     custom_balanced = _resolve_output_dir(analysis_dir, Path('/tmp/custom_quick_plots'), 'balanced')
 
     assert default_high == analysis_dir / 'quick_plots' / 'high'
-    assert custom_balanced == Path('/tmp/custom_quick_plots') / 'balanced'
+    assert custom_balanced == Path('/tmp/custom_quick_plots').resolve() / 'balanced'
 
 
 def test_ranked_view_resolves_nested_master_run_and_manifest_fallback(tmp_path: Path) -> None:

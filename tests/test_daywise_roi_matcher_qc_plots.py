@@ -193,6 +193,7 @@ def test_large_z_renderer_uses_two_by_seven_centroid_planes(tmp_path: Path, monk
     plt.close(fig)
 
 
+
 def test_axial_scatter_histogram_and_medians_share_high_confidence_population(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -281,6 +282,7 @@ def test_axial_scatter_histogram_and_medians_share_high_confidence_population(
     medians = pd.read_csv(output_dir / "tables" / "a_b_axial_shift_bins.csv")
     assert medians["n_matches"].tolist() == [1]
     assert medians["median_delta_z_planes"].tolist() == [2.0]
+
 
 
 def test_exported_qc_flags_use_candidate_key_for_accepted_and_rejected(

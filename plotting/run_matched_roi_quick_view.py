@@ -65,7 +65,7 @@ def plot_matched_roi_raw_slices(*, cluster_id=None, track_uid=None, tracks_table
             if i < len(prepared[col]):
                 rc,gc,mc,_,out_of_stack=prepared[col][i];
                 requested_z = (info[1] + off) if info else np.nan
-                metadata_rows.append({"match_policy": track.get("match_policy", ""), "roi_id": track.get("roi_id", cluster_id if cluster_id is not None else ""), "cluster_id": track.get("cluster_id", ""), "track_uid": track.get("track_uid", ""), "session_index": s.session_index, "session_id": s.session_id, "elapsed_days": s.elapsed_days, "acquisition_date": s.acquisition_date.strftime("%Y-%m-%d"), "session_roi_label": info[0] if info else np.nan, "z_offset": off, "z_center_abs": info[1] if info else np.nan, "requested_z_abs": requested_z, "displayed_z_abs": requested_z if not out_of_stack else np.nan, "z_out_of_bounds": out_of_stack, "y_center": info[2] if info else np.nan, "x_center": info[3] if info else np.nan, "crop_height": height, "crop_width": width, "mask_path": s.mask_path, "red_image_path": s.red_image_path, "green_image_path": s.green_image_path})
+                metadata_rows.append({"match_policy": track.get("match_policy", ""), "roi_id": track.get("roi_id", cluster_id if cluster_id is not None else ""), "cluster_id": track.get("cluster_id", ""), "track_uid": track.get("track_uid", ""), "session_index": s.session_index, "session_id": s.session_id, "elapsed_days": s.elapsed_days, "acquisition_date": s.acquisition_date.strftime("%Y-%m-%d"), "session_roi_label": info[0] if info else np.nan, "z_offset": off, "z_center_abs": info[1] if info else np.nan, "requested_z_abs": requested_z, "displayed_z_abs": requested_z if not out_of_stack else np.nan, "z_out_of_bounds": out_of_stack, "y_center": info[2] if info else np.nan, "x_center": info[3] if info else np.nan, "crop_height": height, "crop_width": width, "mask_path": s.mask_path, "red_image_path": s.red_image_path, "green_image_path": s.green_image_path, "matched": True})
                 axes[i,col].imshow(rc,cmap=red_cmap,vmin=0,vmax=rv); axes[i+len(offsets),col].imshow(gc,cmap=green_cmap,vmin=0,vmax=gv)
                 if out_of_stack:
                     axes[i,col].text(.5,.5,'out of stack',ha='center',va='center',color='white'); axes[i+len(offsets),col].text(.5,.5,'out of stack',ha='center',va='center',color='white')
@@ -73,6 +73,7 @@ def plot_matched_roi_raw_slices(*, cluster_id=None, track_uid=None, tracks_table
                     if mc.any(): ax.contour(mc,levels=[.5],colors='white',linewidths=.6)
             else:
                 axes[i,col].text(.5,.5,'not matched',ha='center',va='center'); axes[i+len(offsets),col].text(.5,.5,'not matched',ha='center',va='center')
+                metadata_rows.append({"match_policy": track.get("match_policy", ""), "roi_id": track.get("roi_id", cluster_id if cluster_id is not None else ""), "cluster_id": track.get("cluster_id", ""), "track_uid": track.get("track_uid", ""), "session_index": s.session_index, "session_id": s.session_id, "elapsed_days": s.elapsed_days, "acquisition_date": s.acquisition_date.strftime("%Y-%m-%d"), "session_roi_label": np.nan, "z_offset": off, "z_center_abs": np.nan, "requested_z_abs": np.nan, "displayed_z_abs": np.nan, "z_out_of_bounds": np.nan, "y_center": np.nan, "x_center": np.nan, "crop_height": height, "crop_width": width, "mask_path": s.mask_path, "red_image_path": s.red_image_path, "green_image_path": s.green_image_path, "matched": False})
             if col == 0:
                 axes[i,col].set_ylabel(f'Red\nz={off:+d}'); axes[i+len(offsets),col].set_ylabel(f'Green\nz={off:+d}')
         label=f"Day {int(s.elapsed_days)}\n{s.acquisition_date.strftime('%Y-%m-%d')}"; axes[0,col].set_title(label)
@@ -95,6 +96,7 @@ def _tracks_from_raw_table(raw_table, policy):
     for _, row in tracks.iterrows():
         values = rows[(rows[key] == row[key]) & (rows["track_uid"] == row["track_uid"])]
         for _, value in values.iterrows(): tracks.loc[tracks.index[tracks[key] == row[key]][0], f"{value.session_id}_roi"] = value.session_roi_label
+    tracks["match_policy"] = policy
     return tracks
 
 def main(argv=None):

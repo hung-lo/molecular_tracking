@@ -29,7 +29,7 @@ def _track(tracks, cluster_id, track_uid):
     if len(rows)>1: raise ValueError('Selected longitudinal track is not unique')
     return rows.iloc[0]
 
-def plot_matched_roi_raw_slices(*, cluster_id=None, track_uid=None, tracks_table, session_table, output_path=None, crop_padding_px=20, min_crop_size_px=48, z_radius=3, lut_low_percentile=1.0, lut_high_percentile=99.0):
+def plot_matched_roi_raw_slices(*, cluster_id=None, track_uid=None, tracks_table, session_table, output_path=None, crop_padding_px=20, min_crop_size_px=48, z_radius=3, lut_low_percentile=2.0, lut_high_percentile=98.0):
     if (cluster_id is None)==(track_uid is None): raise ValueError('Provide exactly one of cluster_id or track_uid')
     if z_radius<0: raise ValueError('z_radius must be >= 0')
     if not (0.0 <= lut_low_percentile < lut_high_percentile <= 100.0): raise ValueError('LUT percentiles must satisfy 0 <= low < high <= 100')
@@ -44,8 +44,8 @@ def plot_matched_roi_raw_slices(*, cluster_id=None, track_uid=None, tracks_table
         z0=int(round(coords[0].mean())); yc=int(round(coords[1].mean())); xc=int(round(coords[2].mean()))
         h=int(coords[1].max()-coords[1].min()+1+2*crop_padding_px); w=int(coords[2].max()-coords[2].min()+1+2*crop_padding_px); max_h=max(max_h,h); max_w=max(max_w,w)
         loaded.append((s,mask,red,green,(int(label),z0,yc,xc)))
-    height=max(min_crop_size_px,max_h); width=max(min_crop_size_px,max_w); offsets=tuple(range(z_radius,-z_radius-1,-1)); nrows=2*len(offsets); fig,axes=plt.subplots(nrows,max(1,len(loaded)),figsize=(2.2*max(1,len(loaded)),1.8*nrows),squeeze=False)
-    red_cmap=LinearSegmentedColormap.from_list('raw_red',['black','magenta']); green_cmap=LinearSegmentedColormap.from_list('raw_green',['black','green'])
+    height=max(min_crop_size_px,max_h); width=max(min_crop_size_px,max_w); offsets=tuple(range(z_radius,-z_radius-1,-1)); nrows=2*len(offsets); fig,axes=plt.subplots(nrows,max(1,len(loaded)),figsize=(2.2*max(1,len(loaded)),1.8*nrows),squeeze=False,constrained_layout=True)
+    red_cmap=LinearSegmentedColormap.from_list('raw_red',['black','#FF00FF']); green_cmap=LinearSegmentedColormap.from_list('raw_green',['black','#00FF00'])
     reds=[]; greens=[]; prepared=[]
     for s,mask,red,green,info in loaded:
         day=[]
@@ -85,12 +85,11 @@ def plot_matched_roi_raw_slices(*, cluster_id=None, track_uid=None, tracks_table
                 axes[i,col].set_ylabel(f'Red\nz={off:+d}'); axes[i+len(offsets),col].set_ylabel(f'Green\nz={off:+d}')
         label=f"Day {int(s.elapsed_days)}\n{s.acquisition_date.strftime('%Y-%m-%d')}"; axes[0,col].set_title(label)
     for ax in axes.ravel(): ax.set_xticks([]); ax.set_yticks([])
-    fig.tight_layout()
     red_axes=axes[:len(offsets),:].ravel().tolist(); green_axes=axes[len(offsets):,:].ravel().tolist()
     fig.colorbar(ScalarMappable(norm=red_norm,cmap=red_cmap), ax=red_axes, fraction=.02, pad=.02, label="Red intensity")
     fig.colorbar(ScalarMappable(norm=green_norm,cmap=green_cmap), ax=green_axes, fraction=.02, pad=.02, label="Green intensity")
     if output_path is not None:
-        fig.savefig(output_path,dpi=180); plt.close(fig)
+        fig.savefig(output_path,dpi=180,bbox_inches="tight",pad_inches=0.12); plt.close(fig)
         pd.DataFrame(metadata_rows).to_csv(Path(output_path).with_name(Path(output_path).stem + "_metadata.csv"), index=False)
     return fig
 
@@ -112,7 +111,7 @@ def _tracks_from_raw_table(raw_table, policy):
 def main(argv=None):
     ap=argparse.ArgumentParser(); ap.add_argument('--analysis-dir',required=True)
     g=ap.add_mutually_exclusive_group(required=True); g.add_argument('--cluster-id'); g.add_argument('--track-uid')
-    ap.add_argument('--policy',choices=['high','balanced','graph'],default='high'); ap.add_argument('--output'); ap.add_argument('--z-radius',type=int,default=3); ap.add_argument('--lut-low-percentile',type=float,default=1.0); ap.add_argument('--lut-high-percentile',type=float,default=99.0)
+    ap.add_argument('--policy',choices=['high','balanced','graph'],default='high'); ap.add_argument('--output'); ap.add_argument('--z-radius',type=int,default=3); ap.add_argument('--lut-low-percentile',type=float,default=2.0); ap.add_argument('--lut-high-percentile',type=float,default=98.0)
     a=ap.parse_args(argv); root=Path(a.analysis_dir); manifest=pd.read_csv(root/'session_manifest_resolved.csv'); raw=pd.read_csv(root/'matched_roi_intensity_results_raw.csv'); tracks=_tracks_from_raw_table(raw,a.policy)
     out=Path(a.output or root/f"raw_roi_{a.policy}_{a.cluster_id or a.track_uid}.png"); plot_matched_roi_raw_slices(cluster_id=a.cluster_id,track_uid=a.track_uid,tracks_table=tracks,session_table=manifest,output_path=out,z_radius=a.z_radius,lut_low_percentile=a.lut_low_percentile,lut_high_percentile=a.lut_high_percentile)
 if __name__=='__main__': main()

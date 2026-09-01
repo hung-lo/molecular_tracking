@@ -466,7 +466,7 @@ def _render_large_z_examples(table: pd.DataFrame, manifest: pd.DataFrame, output
         return []
     sessions = manifest.set_index(manifest["session_id"].astype(str)); paths=[]
     required_sessions = set(table["session_a"].astype(str)) | set(table["session_b"].astype(str))
-    if any(session not in sessions.index or not Path(str(sessions.loc[session, "red_image_path"])).is_file() for session in required_sessions):
+    if any(session not in sessions.index or not Path(str(sessions.loc[session, "red_image_path"])).is_file() or not Path(str(sessions.loc[session, "mask_path"])).is_file() for session in required_sessions):
         return []
     for category, subset in (("accepted", table.loc[table.accepted_for_track].sort_values("raw_abs_delta_z_planes", ascending=False).head(2)), ("rejected", table.loc[~table.accepted_for_track].sort_values("raw_abs_delta_z_planes", ascending=False).head(2))):
         for number, (_, item) in enumerate(subset.iterrows(), 1):
@@ -542,7 +542,7 @@ def _generate_spatial_pair_qc(match_dir: Path, output_dir: Path, candidates: pd.
         summaries.append({"session_a": sa, "session_b": sb, "n_source_rois": n_source, "n_accepted_source_rois": n_accepted, "accepted_fraction": n_accepted / n_source if n_source else np.nan, "n_high_confidence": int(len(accepted_high)), "median_raw_delta_z_planes": accepted_high["raw_delta_z_planes"].median(), "median_abs_raw_delta_z_planes": accepted_high["raw_abs_delta_z_planes"].median(), "p90_abs_raw_delta_z_planes": accepted_high["raw_abs_delta_z_planes"].quantile(.9), "long_axis": enriched["long_axis"].iloc[0]})
         frac=source_roi_match_fraction(enriched, all_source_rois=source_base.rename(columns={"source_x": "source_x"}))
         frac.to_csv(tables_dir/f"{sa}_{sb}_match_fraction_by_long_axis.csv", index=False)
-        medians = enriched.loc[enriched.accepted_graph].copy(); medians["bin"] = np.minimum((medians.long_axis_position_normalized * 5).astype(int), 4)
+        medians = accepted_high.copy(); medians["bin"] = np.minimum((medians.long_axis_position_normalized * 5).astype(int), 4)
         medians = medians.groupby("bin").agg(bin_center=("long_axis_position_normalized", "mean"), n_matches=("raw_delta_z_planes", "count"), median_delta_z_planes=("raw_delta_z_planes", "median"), median_abs_delta_z_planes=("raw_abs_delta_z_planes", "median")).reset_index()
         medians.insert(0, "session_a", sa); medians.insert(1, "session_b", sb); medians.to_csv(tables_dir/f"{sa}_{sb}_axial_shift_bins.csv", index=False)
         fig, axes=plt.subplots(1,3,figsize=(14,4));

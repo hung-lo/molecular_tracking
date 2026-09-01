@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 
 from run_weekly_matched_output_quick_plots import _filter_table_by_policy, _resolve_output_dir
+from run_ranked_roi_quick_views import _resolve_run_inputs
 
 
 def test_filter_table_by_policy_filters_suffixed_policy_columns() -> None:
@@ -41,3 +42,18 @@ def test_resolve_output_dir_separates_policies() -> None:
     assert default_high == analysis_dir / 'quick_plots' / 'high'
     assert custom_balanced == Path('/tmp/custom_quick_plots') / 'balanced'
 
+
+def test_ranked_view_resolves_nested_master_run_and_manifest_fallback(tmp_path: Path) -> None:
+    extraction = tmp_path / "extraction"
+    matching = tmp_path / "matching"
+    extraction.mkdir()
+    matching.mkdir()
+    for name in ("matched_roi_log_ratio_metrics_complete.csv", "matched_roi_intensity_results_raw.csv"):
+        (extraction / name).touch()
+    (matching / "session_manifest_resolved.csv").touch()
+    metrics, raw, manifest = _resolve_run_inputs(tmp_path)
+    assert metrics.parent == extraction
+    assert raw.parent == extraction
+    assert manifest.parent == matching
+    (extraction / "session_manifest_resolved.csv").touch()
+    assert _resolve_run_inputs(tmp_path)[2].parent == extraction

@@ -100,3 +100,11 @@ def test_spatial_qc_helpers_preserve_selection_and_zero_source_rois() -> None:
     fraction = source_roi_match_fraction(enriched.iloc[:0], all_source_rois=all_sources)
     assert int(fraction["n_source_rois"].sum()) == 3
     assert int(fraction["n_accepted_source_rois"].sum()) == 1
+
+
+def test_source_fraction_with_empty_candidates_reports_zero_acceptance() -> None:
+    sources = pd.DataFrame({"label_a": [1, 2], "long_axis_position_normalized": [0.1, 0.9], "accepted_for_track": [False, False]})
+    result = source_roi_match_fraction(pd.DataFrame(), all_source_rois=sources)
+    assert int(result["n_source_rois"].sum()) == 2
+    assert int(result["n_accepted_source_rois"].sum()) == 0
+    assert float(result["accepted_fraction"].sum()) == 0.0

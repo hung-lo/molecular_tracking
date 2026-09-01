@@ -49,6 +49,7 @@ def log_message(run_start_seconds: float, message: str) -> None:
     elapsed_seconds = time.perf_counter() - run_start_seconds
     print(f"[{format_duration_seconds(elapsed_seconds)}] {message}", flush=True)
 
+from longitudinal_session import resolve_plot_day_axis
 from roi_log_ratio_analysis import (
     compute_green_red_fit_residuals,
     select_ranked_roi_days,
@@ -121,8 +122,10 @@ def plot_directional_roi_trajectories_scatter(
     average_slope = float(fit_summary["slope"].mean())
     average_intercept = float(fit_summary["intercept"].mean())
 
-    day_values = np.sort(ranked_roi_table["day"].unique())
-    day_labels = make_day_labels(day_values, start_date=start_date)
+    timing = resolve_plot_day_axis(ranked_roi_table, start_date=start_date)
+    source_to_plot = dict(zip(timing["source_day"], timing["plot_day"], strict=True))
+    day_values = timing["plot_day"].to_numpy(dtype=int)
+    day_labels = timing["date_label"].tolist()
     color_values = plt.cm.viridis(np.linspace(0.0, 1.0, len(day_values)))
 
     figure, axis = plt.subplots(figsize=(10.0, 8.0), facecolor="white")
@@ -271,8 +274,10 @@ def plot_directional_roi_residuals_vs_day(
     axis.axhline(0.0, color="#d62828", linewidth=1.8, linestyle="--", alpha=0.9, zorder=1)
 
     for roi_id, roi_table in ranked_roi_table.groupby("roi_id", sort=True):
-        roi_table = roi_table.sort_values("day").reset_index(drop=True)
-        x_values = roi_table["day"].to_numpy(dtype=int)
+        roi_table = roi_table.copy()
+        roi_table["plot_day"] = roi_table["day"].map(source_to_plot)
+        roi_table = roi_table.sort_values("plot_day").reset_index(drop=True)
+        x_values = roi_table["plot_day"].to_numpy(dtype=int)
         residual_values = roi_table["green_fit_residual"].to_numpy(dtype=float)
         rank_value = int(roi_table["selection_rank"].iloc[0])
         roi_color = roi_color_map.get(int(roi_id), "0.35")

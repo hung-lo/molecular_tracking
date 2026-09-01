@@ -18,6 +18,11 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import sys
+from pathlib import Path as _Path
+_REPO_ROOT = _Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT / "plotting") not in sys.path: sys.path.append(str(_REPO_ROOT / "plotting"))
+from longitudinal_session import resolve_plot_day_axis
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 for _import_dir in (
@@ -417,7 +422,9 @@ def plot_fit_parameter_summary(
         day_values,
         start_date=start_date,
     )
-    x_positions = np.arange(len(day_values))
+    timing = resolve_plot_day_axis(roi_metrics if roi_metrics is not None else plot_fit_summary, start_date=start_date)
+    source_to_plot = dict(zip(timing["source_day"], timing["plot_day"], strict=True))
+    x_positions = np.asarray([source_to_plot[int(day)] for day in day_values], dtype=float)
 
     figure, axes = plt.subplots(2, 2, figsize=(11, 7.5), facecolor="white")
     slope_axis, intercept_axis, r2_axis, n_axis = axes.ravel()

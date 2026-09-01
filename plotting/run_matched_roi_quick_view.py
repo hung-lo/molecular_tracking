@@ -49,7 +49,12 @@ def plot_matched_roi_raw_slices(*, cluster_id=None, track_uid=None, tracks_table
         if info:
             label,z0,yc,xc=info
             for off in offsets:
-                z=int(np.clip(z0+off,0,mask.shape[0]-1)); rc=extract_centered_crop_with_padding(red[z],center_y=yc,center_x=xc,height=height,width=width); gc=extract_centered_crop_with_padding(green[z],center_y=yc,center_x=xc,height=height,width=width); mc=extract_centered_crop_with_padding((mask[z]==label).astype(np.uint8),center_y=yc,center_x=xc,height=height,width=width); reds.append(rc.ravel()); greens.append(gc.ravel()); day.append((rc,gc,mc,off))
+                requested_z = z0 + off
+                if requested_z < 0 or requested_z >= mask.shape[0]:
+                    rc=np.zeros((height,width),dtype=red.dtype); gc=np.zeros((height,width),dtype=green.dtype); mc=np.zeros((height,width),dtype=np.uint8)
+                else:
+                    z=requested_z; rc=extract_centered_crop_with_padding(red[z],center_y=yc,center_x=xc,height=height,width=width); gc=extract_centered_crop_with_padding(green[z],center_y=yc,center_x=xc,height=height,width=width); mc=extract_centered_crop_with_padding((mask[z]==label).astype(np.uint8),center_y=yc,center_x=xc,height=height,width=width)
+                reds.append(rc.ravel()); greens.append(gc.ravel()); day.append((rc,gc,mc,off))
         prepared.append(day)
     rv=max(float(np.percentile(np.concatenate(reds),99.5)) if reds else 0.0,1.0); gv=max(float(np.percentile(np.concatenate(greens),99.5)) if greens else 0.0,1.0)
     for col,(s,_,_,_,info) in enumerate(loaded):
@@ -67,6 +72,21 @@ def plot_matched_roi_raw_slices(*, cluster_id=None, track_uid=None, tracks_table
     if output_path is not None: fig.savefig(output_path,dpi=180); plt.close(fig)
     return fig
 
+def _tracks_from_raw_table(raw_table, policy):
+    selected = raw_table.loc[raw_table["match_policy"].eq(policy)].copy()
+    if selected.empty: raise ValueError(f"No rows found for policy {policy!r}")
+    key = "cluster_id" if "cluster_id" in selected.columns else "roi_id"
+    rows = selected[[key, "roi_id", "track_uid", "session_id", "session_roi_label"]].drop_duplicates()
+    tracks = rows.groupby([key, "roi_id", "track_uid"], as_index=False).first()
+    for _, row in tracks.iterrows():
+        values = rows[(rows[key] == row[key]) & (rows["track_uid"] == row["track_uid"])]
+        for _, value in values.iterrows(): tracks.loc[tracks.index[tracks[key] == row[key]][0], f"{value.session_id}_roi"] = value.session_roi_label
+    return tracks
+
 def main(argv=None):
-    ap=argparse.ArgumentParser(); ap.add_argument('--analysis-dir',required=True); g=ap.add_mutually_exclusive_group(required=True); g.add_argument('--cluster-id'); g.add_argument('--track-uid'); ap.add_argument('--output'); ap.add_argument('--z-radius',type=int,default=3); a=ap.parse_args(argv); root=Path(a.analysis_dir); tracks=pd.read_csv(root/'tracks_graph.csv'); manifest=pd.read_csv(root/'session_manifest_resolved.csv'); out=Path(a.output or root/f"raw_roi_{a.cluster_id or a.track_uid}.png"); plot_matched_roi_raw_slices(cluster_id=a.cluster_id,track_uid=a.track_uid,tracks_table=tracks,session_table=manifest,output_path=out,z_radius=a.z_radius)
+    ap=argparse.ArgumentParser(); ap.add_argument('--analysis-dir',required=True)
+    g=ap.add_mutually_exclusive_group(required=True); g.add_argument('--cluster-id'); g.add_argument('--track-uid')
+    ap.add_argument('--policy',choices=['high','balanced'],default='high'); ap.add_argument('--output'); ap.add_argument('--z-radius',type=int,default=3)
+    a=ap.parse_args(argv); root=Path(a.analysis_dir); manifest=pd.read_csv(root/'session_manifest_resolved.csv'); raw=pd.read_csv(root/'matched_roi_intensity_results_raw.csv'); tracks=_tracks_from_raw_table(raw,a.policy)
+    out=Path(a.output or root/f"raw_roi_{a.cluster_id or a.track_uid}.png"); plot_matched_roi_raw_slices(cluster_id=a.cluster_id,track_uid=a.track_uid,tracks_table=tracks,session_table=manifest,output_path=out,z_radius=a.z_radius)
 if __name__=='__main__': main()

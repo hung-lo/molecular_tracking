@@ -791,8 +791,12 @@ def plot_ranked_heatmap(
         )
         .sort_index()
     )
-    day_values = wide_table.columns.to_numpy(dtype=int)
-    date_labels = make_day_date_labels(day_values, start_date=start_date)
+    source_days = wide_table.columns.to_numpy(dtype=int)
+    timing = resolve_plot_day_axis(ranked_roi_days, start_date=start_date)
+    source_to_plot = dict(zip(timing["source_day"], timing["plot_day"], strict=True))
+    source_to_date = dict(zip(timing["source_day"], timing["date_label"], strict=True))
+    day_values = np.asarray([source_to_plot[int(day)] for day in source_days], dtype=int)
+    date_labels = [source_to_date[int(day)] for day in source_days]
 
     matrix = wide_table.to_numpy(dtype=float)
     figure_height = max(5.0, 0.25 * len(wide_table))
@@ -804,7 +808,7 @@ def plot_ranked_heatmap(
         norm = None
 
     image = axis.imshow(matrix, aspect="auto", cmap=cmap, norm=norm, interpolation="nearest")
-    axis.set_xticks(np.arange(len(day_values)), [f"Day {int(day)}\n{label}" for day, label in zip(day_values, date_labels, strict=True)])
+    axis.set_xticks(np.arange(len(source_days)), [f"Day {int(day)}\n{label}" for day, label in zip(day_values, date_labels, strict=True)])
     axis.set_yticks(np.arange(len(wide_table)), wide_table.index.tolist())
     axis.set_title(title, fontsize=12)
     axis.tick_params(labelsize=8)
@@ -1761,6 +1765,7 @@ def run_registered_roi_pipeline(config: RegisteredPipelineConfig) -> Path:
     plot_fit_parameter_summary(
         fit_summary=fit_summary,
         output_path=output_dir / 'daywise_green_red_linear_fit_parameters.png',
+        roi_metrics=metrics_size_shape_filtered,
         start_date=config.start_date,
     )
     plot_single_day_red_green_scatter(

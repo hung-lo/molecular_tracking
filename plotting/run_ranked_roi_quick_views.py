@@ -35,6 +35,23 @@ def _first_existing(root: Path, names: tuple[str, ...]) -> Path:
     raise FileNotFoundError(f"None of {names} was found in {root}")
 
 
+def _resolve_run_inputs(run_dir: Path) -> tuple[Path, Path, Path]:
+    """Resolve current master-run inputs, with support for legacy flat runs."""
+    extraction = run_dir / "extraction"
+    matching = run_dir / "matching"
+    if extraction.is_dir():
+        return (
+            _first_existing(extraction, METRIC_NAMES),
+            _first_existing(extraction, RAW_NAMES),
+            _first_existing(extraction, ("session_manifest_resolved.csv",)),
+        )
+    return (
+        _first_existing(run_dir, METRIC_NAMES),
+        _first_existing(run_dir, RAW_NAMES),
+        _first_existing(run_dir, ("session_manifest_resolved.csv",)),
+    )
+
+
 def _filter_policy(table: pd.DataFrame, policy: str) -> pd.DataFrame:
     if policy == "all" or "match_policy" not in table.columns:
         return table
@@ -57,9 +74,10 @@ def build_ranked_roi_views(
     root = Path(run_dir).resolve()
     if top_n <= 0:
         raise ValueError("top_n must be positive")
-    metrics = _filter_policy(pd.read_csv(_first_existing(root, METRIC_NAMES)), policy)
-    raw = _filter_policy(pd.read_csv(_first_existing(root, RAW_NAMES)), policy)
-    manifest = pd.read_csv(root / "session_manifest_resolved.csv")
+    metrics_path, raw_path, manifest_path = _resolve_run_inputs(root)
+    metrics = _filter_policy(pd.read_csv(metrics_path), policy)
+    raw = _filter_policy(pd.read_csv(raw_path), policy)
+    manifest = pd.read_csv(manifest_path)
     tracks = _tracks_from_raw_table(raw, policy)
     output_root = Path(output_dir).resolve() if output_dir else root / "plots" / policy / "single_roi_raw_validation"
     output_root.mkdir(parents=True, exist_ok=True)

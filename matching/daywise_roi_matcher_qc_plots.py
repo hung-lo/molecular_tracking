@@ -144,7 +144,10 @@ def select_spatial_examples(candidates: pd.DataFrame, *, accepted: bool, limit: 
     """Select deterministic, non-duplicate examples across populated 3x3 bins."""
     if limit <= 0 or candidates.empty:
         return candidates.iloc[0:0].copy()
-    work = candidates.loc[candidates["accepted_for_track"].fillna(False).astype(bool).eq(bool(accepted))].copy()
+    work = candidates.copy()
+    if "_candidate_row_id" not in work.columns:
+        work["_candidate_row_id"] = work.index
+    work = work.loc[work["accepted_for_track"].fillna(False).astype(bool).eq(bool(accepted))].copy()
     if not accepted:
         work = work.loc[work[["score", "dice", "distance_um"]].apply(pd.to_numeric, errors="coerce").notna().all(axis=1)]
     sort_cols = ["score", "dice", "ambiguity", "distance_um"] if accepted else ["score", "dice", "distance_um", "ambiguity"]
@@ -171,11 +174,11 @@ def select_spatial_examples(candidates: pd.DataFrame, *, accepted: bool, limit: 
     return pd.DataFrame(chosen, columns=work.columns).reset_index(drop=True)
 
 
-def source_roi_match_fraction(table: pd.DataFrame, *, bins: int = 5) -> pd.DataFrame:
+def source_roi_match_fraction(table: pd.DataFrame, *, bins: int = 5, all_source_rois: pd.DataFrame | None = None) -> pd.DataFrame:
     """Summarize acceptance using unique source ROIs, never candidate rows."""
     if table.empty:
         return pd.DataFrame(columns=["bin", "n_source_rois", "n_accepted_source_rois", "accepted_fraction"])
-    work = table.copy()
+    work = all_source_rois.copy() if all_source_rois is not None else table.copy()
     work["bin"] = np.minimum((pd.to_numeric(work["long_axis_position_normalized"], errors="coerce").clip(0, 0.999999) * bins).astype(int), bins - 1)
     source = work.groupby(["bin", "label_a"], as_index=False)["accepted_for_track"].max()
     out = source.groupby("bin").agg(n_source_rois=("label_a", "size"), n_accepted_source_rois=("accepted_for_track", "sum")).reset_index()
@@ -457,37 +460,91 @@ def _render_match_contact_sheet(table: pd.DataFrame, manifest: pd.DataFrame, out
     fig.suptitle(title); _save_figure(output_path, fig, dpi=dpi)
 
 
-def _generate_spatial_pair_qc(match_dir: Path, output_dir: Path, candidates: pd.DataFrame, accepted_tables: list[pd.DataFrame], *, dpi: int) -> list[Path]:
+def _render_large_z_examples(table: pd.DataFrame, manifest: pd.DataFrame, output_dir: Path, *, pair_name: str, dpi: int) -> list[Path]:
+    """Render up to two accepted and two rejected native z-neighborhood examples."""
+    if table.empty:
+        return []
+    sessions = manifest.set_index(manifest["session_id"].astype(str)); paths=[]
+    required_sessions = set(table["session_a"].astype(str)) | set(table["session_b"].astype(str))
+    if any(session not in sessions.index or not Path(str(sessions.loc[session, "red_image_path"])).is_file() for session in required_sessions):
+        return []
+    for category, subset in (("accepted", table.loc[table.accepted_for_track].sort_values("raw_abs_delta_z_planes", ascending=False).head(2)), ("rejected", table.loc[~table.accepted_for_track].sort_values("raw_abs_delta_z_planes", ascending=False).head(2))):
+        for number, (_, item) in enumerate(subset.iterrows(), 1):
+            fig, axes = plt.subplots(2, 2 * 7, figsize=(18, 5), squeeze=False)
+            for side, label_col in enumerate(("label_a", "label_b")):
+                session = str(item["session_a"] if side == 0 else item["session_b"]); label = int(item[label_col]); row = sessions.loc[session]
+                mask, image = tifffile.imread(row["mask_path"]), tifffile.imread(row["red_image_path"]); coords=np.where(mask == label); z0=int(round(float(coords[0].mean()))); yc=int(round(float(coords[1].mean()))); xc=int(round(float(coords[2].mean())))
+                size=max(48, int(max(np.ptp(coords[1]), np.ptp(coords[2]))+24));
+                for col, offset in enumerate(range(3, -4, -1)):
+                    z=z0+offset; ax=axes[side, col]; ax.set_xticks([]); ax.set_yticks([])
+                    if 0 <= z < image.shape[0]:
+                        y0=max(0,yc-size//2); x0=max(0,xc-size//2); crop=image[z,y0:min(image.shape[1],y0+size),x0:min(image.shape[2],x0+size)]; ax.imshow(crop,cmap="magma"); ax.contour(mask[z,y0:min(mask.shape[1],y0+size),x0:min(mask.shape[2],x0+size)]==label,levels=[.5],colors="cyan",linewidths=.5)
+                    else: ax.text(.5,.5,"out",ha="center",va="center")
+                    ax.set_title(f"{session} dz {offset:+d}",fontsize=7)
+            fig.suptitle(f"{pair_name} {category} | labels {item['label_a']} -> {item['label_b']} | raw dz={item['raw_delta_z_planes']:+.2f}")
+            path=output_dir/f"{pair_name}_{category}_large_z_{number}.png"; _save_figure(path,fig,dpi=dpi); paths.append(path)
+    return paths
+
+
+def _generate_spatial_pair_qc(match_dir: Path, output_dir: Path, candidates: pd.DataFrame, accepted_tables: list[pd.DataFrame], *, dpi: int, include_skip_pairs: bool = False) -> list[Path]:
     manifest = _load_csv(match_dir, "session_manifest_resolved.csv")
     features_by_session = _load_pair_features(match_dir)
     if candidates.empty or manifest.empty or not features_by_session:
         return []
-    accepted = set().union(*(_accepted_keys(t) for t in accepted_tables))
+    accepted_by_policy = [_accepted_keys(t) for t in accepted_tables]
+    accepted_high, accepted_balanced, accepted_graph = accepted_by_policy
     rows = candidates.copy()
     rows["session_a"] = rows["day_a"].astype(str); rows["session_b"] = rows["day_b"].astype(str)
-    rows["accepted_for_track"] = [key in accepted for key in zip(rows.session_a, rows.session_b, rows.label_a.astype(str), rows.label_b.astype(str))]
+    keys = list(zip(rows.session_a, rows.session_b, rows.label_a.astype(str), rows.label_b.astype(str)))
+    rows["accepted_high"] = [key in accepted_high for key in keys]
+    rows["accepted_balanced"] = [key in accepted_balanced for key in keys]
+    rows["accepted_graph"] = [key in accepted_graph for key in keys]
+    rows["accepted_for_track"] = rows["accepted_graph"]
     rows["rejection_reason"] = rows.apply(lambda r: "" if r.accepted_for_track else _candidate_rejection_reason(r), axis=1)
-    paths=[]; summaries=[]; examples_dir=output_dir / "pair_examples"; axial_dir=output_dir / "axial_shift"; tables_dir=output_dir / "tables"
+    paths=[]; summaries=[]; examples_dir=output_dir / "pair_examples"; (examples_dir / "large_z_shift").mkdir(parents=True, exist_ok=True); axial_dir=output_dir / "axial_shift"; tables_dir=output_dir / "tables"
     for pair, pair_rows in rows.groupby(["session_a", "session_b"], sort=True):
         sa, sb = pair; ma = manifest.loc[manifest.session_id.astype(str).eq(sa)];
         if ma.empty: continue
+        if not include_skip_pairs and "pair_gap" in pair_rows and int(pair_rows["pair_gap"].iloc[0]) != 1: continue
         mask = tifffile.imread(ma.iloc[0]["mask_path"]); shape=(mask.shape[1], mask.shape[2])
-        enriched=add_spatial_and_z_qc_columns(pair_rows, features_by_session[sa], target_features=features_by_session[sb], image_shape_yx=shape)
-        high=select_spatial_examples(enriched, accepted=True); rejected=select_spatial_examples(enriched, accepted=False)
+        run_log = _load_json(match_dir, "run_log.json")
+        z_spacing = run_log.get("spacing", {}).get("z_um") if isinstance(run_log.get("spacing"), dict) else None
+        enriched=add_spatial_and_z_qc_columns(pair_rows, features_by_session[sa], target_features=features_by_session[sb], image_shape_yx=shape, z_spacing_um=z_spacing)
+        dates = manifest.set_index(manifest.session_id.astype(str))["acquisition_date"]
+        enriched["acquisition_date_a"] = dates.get(sa, "")
+        enriched["acquisition_date_b"] = dates.get(sb, "")
+        enriched["rejection_reason"] = enriched.apply(lambda r: "" if bool(r.accepted_graph) else _candidate_rejection_reason(r), axis=1)
+        source_features = features_by_session[sa].copy()
+        source_base = source_features.rename(columns={"label": "label_a", "centroid_x": "source_x", "centroid_y": "source_y"})
+        source_base["accepted_for_track"] = source_base["label_a"].map(lambda label: any(k[0] == sa and k[1] == sb and k[2] == str(label) for k in accepted_graph))
+        source_base["long_axis_position_normalized"] = np.clip((source_base["source_x"] / max(shape[1]-1, 1)) if detect_long_axis(shape) == "x" else (source_base["source_y"] / max(shape[0]-1, 1)), 0, 1)
+        source_base["bin"] = np.minimum((source_base["long_axis_position_normalized"] * 5).astype(int), 4)
+        source_base["spatial_grid_row"] = np.minimum((source_base["source_y"] / max(shape[0], 1) * 3).astype(int), 2)
+        source_base["spatial_grid_col"] = np.minimum((source_base["source_x"] / max(shape[1], 1) * 3).astype(int), 2)
+        source_base["short_axis_position_normalized"] = np.clip((source_base["source_y"] / max(shape[0]-1, 1)) if detect_long_axis(shape) == "x" else (source_base["source_x"] / max(shape[1]-1, 1)), 0, 1)
+        high_pool = enriched.loc[enriched["accepted_graph"].fillna(False).astype(bool) & enriched.get("high_rule", pd.Series(False, index=enriched.index)).fillna(False).astype(bool)]
+        high = select_spatial_examples(high_pool, accepted=True)
+        rejected = select_spatial_examples(enriched, accepted=False)
         for selected, column in ((high, "selected_high_confidence_example"), (rejected, "selected_rejected_example")):
             enriched[column]=False
-            if not selected.empty: enriched.loc[selected.index, column]=True
-        large=enriched.sort_values("raw_abs_delta_z_planes", ascending=False).head(4); enriched["selected_large_z_example"]=enriched.index.isin(large.index)
+            if not selected.empty: enriched[column] = enriched.get("_candidate_row_id", enriched.index).isin(selected["_candidate_row_id"])
+        large=pd.concat([enriched.loc[enriched.accepted_for_track].sort_values("raw_abs_delta_z_planes", ascending=False).head(2), enriched.loc[~enriched.accepted_for_track].sort_values("raw_abs_delta_z_planes", ascending=False).head(2)])
+        enriched["selected_large_z_example"] = enriched.get("_candidate_row_id", enriched.index).isin(large.get("_candidate_row_id", large.index))
         for selected, name, title in ((high, "high_confidence_accepted", "High-confidence accepted"), (rejected, "informative_rejected", "Informative rejected")):
             path=examples_dir/f"{sa}_{sb}_{name}.png"; _render_match_contact_sheet(selected, manifest, path, title=f"{title}: {sa} -> {sb}", dpi=dpi); paths.append(path)
+        paths.extend(_render_large_z_examples(large, manifest, examples_dir / "large_z_shift", pair_name=f"{sa}_{sb}", dpi=dpi))
         enriched.to_csv(tables_dir/f"{sa}_{sb}_matching_qc_examples.csv", index=False)
         accepted_high=enriched.loc[enriched.accepted_for_track & enriched.high_rule.astype(bool)]
-        n_source = int(enriched["label_a"].nunique())
-        n_accepted = int(enriched.loc[enriched.accepted_for_track, "label_a"].nunique())
+        n_source = int(source_base["label_a"].nunique())
+        n_accepted = int(source_base["accepted_for_track"].sum())
         summaries.append({"session_a": sa, "session_b": sb, "n_source_rois": n_source, "n_accepted_source_rois": n_accepted, "accepted_fraction": n_accepted / n_source if n_source else np.nan, "n_high_confidence": int(len(accepted_high)), "median_raw_delta_z_planes": accepted_high["raw_delta_z_planes"].median(), "median_abs_raw_delta_z_planes": accepted_high["raw_abs_delta_z_planes"].median(), "p90_abs_raw_delta_z_planes": accepted_high["raw_abs_delta_z_planes"].quantile(.9), "long_axis": enriched["long_axis"].iloc[0]})
-        frac=source_roi_match_fraction(enriched)
+        frac=source_roi_match_fraction(enriched, all_source_rois=source_base.rename(columns={"source_x": "source_x"}))
+        frac.to_csv(tables_dir/f"{sa}_{sb}_match_fraction_by_long_axis.csv", index=False)
+        medians = enriched.loc[enriched.accepted_graph].copy(); medians["bin"] = np.minimum((medians.long_axis_position_normalized * 5).astype(int), 4)
+        medians = medians.groupby("bin").agg(bin_center=("long_axis_position_normalized", "mean"), n_matches=("raw_delta_z_planes", "count"), median_delta_z_planes=("raw_delta_z_planes", "median"), median_abs_delta_z_planes=("raw_abs_delta_z_planes", "median")).reset_index()
+        medians.insert(0, "session_a", sa); medians.insert(1, "session_b", sb); medians.to_csv(tables_dir/f"{sa}_{sb}_axial_shift_bins.csv", index=False)
         fig, axes=plt.subplots(1,3,figsize=(14,4));
-        axes[0].scatter(accepted_high.long_axis_position_normalized, accepted_high.raw_delta_z_planes, s=8); axes[0].set_title("Signed raw dz vs long axis"); axes[1].scatter(accepted_high.long_axis_position_normalized, accepted_high.raw_abs_delta_z_planes, s=8); axes[1].set_title("Absolute raw dz vs long axis"); axes[2].bar(frac.bin.astype(str), frac.accepted_fraction); axes[2].set_title("Accepted source fraction")
+        axes[0].scatter(accepted_high.long_axis_position_normalized, accepted_high.raw_delta_z_planes, s=8); axes[0].plot(medians.bin_center, medians.median_delta_z_planes, "o-"); axes[0].set_title("Signed raw dz vs long axis"); axes[1].scatter(accepted_high.long_axis_position_normalized, accepted_high.raw_abs_delta_z_planes, s=8); axes[1].plot(medians.bin_center, medians.median_abs_delta_z_planes, "o-"); axes[1].set_title("Absolute raw dz vs long axis"); axes[2].bar(frac.bin.astype(str), frac.accepted_fraction); axes[2].set_title("Accepted source fraction")
         for ax in axes: ax.grid(alpha=.2); ax.set_xlabel("normalized long-axis position")
         path=axial_dir/f"{sa}_{sb}_axial_shift_qc.png"; _save_figure(path,fig,dpi=dpi); paths.append(path)
         fig, axes=plt.subplots(1,2,figsize=(9,3.5)); axes[0].hist(accepted_high.raw_delta_z_planes.dropna(), bins=15); axes[0].set_title("Signed raw dz (planes)"); axes[1].hist(accepted_high.raw_abs_delta_z_planes.dropna(), bins=15); axes[1].set_title("Absolute raw dz (planes)"); path=axial_dir/f"{sa}_{sb}_delta_z_distribution.png"; _save_figure(path,fig,dpi=dpi); paths.append(path)
@@ -535,6 +592,7 @@ def generate_matching_qc(config: MatchingQCConfig) -> dict[str, Path]:
                     pairwise_candidates,
                     [pairwise_matches_high, pairwise_matches_balanced, pairwise_matches_graph],
                     dpi=int(config.dpi),
+                    include_skip_pairs=bool(config.include_skip_pairs),
                 )
             )
         saved_paths.extend(

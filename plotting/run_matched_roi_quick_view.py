@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import tifffile
 from matplotlib import pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap, PowerNorm
+from matplotlib.colors import LinearSegmentedColormap
 from longitudinal_session import resolve_longitudinal_session_metadata
 
 def extract_centered_crop_with_padding(image_2d, *, center_y, center_x, height, width, fill_value=0):
@@ -38,8 +38,7 @@ def plot_matched_roi_raw_slices(*, cluster_id=None, track_uid=None, tracks_table
         if pd.isna(label): loaded.append((s,None,None,None,None)); continue
         coords=np.where(mask==int(label))
         if len(coords[0])==0: loaded.append((s,None,None,None,None)); continue
-        areas = np.count_nonzero(mask == int(label), axis=(1, 2))
-        z0=int(np.argmax(areas)); yc=int(round(coords[1].mean())); xc=int(round(coords[2].mean()))
+        z0=int(round(coords[0].mean())); yc=int(round(coords[1].mean())); xc=int(round(coords[2].mean()))
         h=int(coords[1].max()-coords[1].min()+1+2*crop_padding_px); w=int(coords[2].max()-coords[2].min()+1+2*crop_padding_px); max_h=max(max_h,h); max_w=max(max_w,w)
         loaded.append((s,mask,red,green,(int(label),z0,yc,xc)))
     height=max(min_crop_size_px,max_h); width=max(min_crop_size_px,max_w); offsets=tuple(range(z_radius,-z_radius-1,-1)); nrows=2*len(offsets); fig,axes=plt.subplots(nrows,max(1,len(loaded)),figsize=(2.2*max(1,len(loaded)),1.8*nrows),squeeze=False)
@@ -60,10 +59,13 @@ def plot_matched_roi_raw_slices(*, cluster_id=None, track_uid=None, tracks_table
                 day.append((rc,gc,mc,off,requested_z < 0 or requested_z >= mask.shape[0]))
         prepared.append(day)
     rv=max(float(np.percentile(np.concatenate(reds),99.5)) if reds else 0.0,1.0); gv=max(float(np.percentile(np.concatenate(greens),99.5)) if greens else 0.0,1.0)
+    metadata_rows=[]
     for col,(s,_,_,_,info) in enumerate(loaded):
         for i,off in enumerate(offsets):
             if i < len(prepared[col]):
-                rc,gc,mc,_,out_of_stack=prepared[col][i]; axes[i,col].imshow(rc,cmap=red_cmap,vmin=0,vmax=rv); axes[i+len(offsets),col].imshow(gc,cmap=green_cmap,vmin=0,vmax=gv)
+                rc,gc,mc,_,out_of_stack=prepared[col][i];
+                requested_z = (info[1] + off) if info else np.nan
+                metadata_rows.append({"match_policy": track.get("match_policy", ""), "roi_id": track.get("roi_id", cluster_id if cluster_id is not None else ""), "cluster_id": track.get("cluster_id", ""), "track_uid": track.get("track_uid", ""), "session_index": s.session_index, "session_id": s.session_id, "elapsed_days": s.elapsed_days, "acquisition_date": s.acquisition_date.strftime("%Y-%m-%d"), "session_roi_label": info[0] if info else np.nan, "z_offset": off, "z_center_abs": info[1] if info else np.nan, "requested_z_abs": requested_z, "displayed_z_abs": requested_z if not out_of_stack else np.nan, "z_out_of_bounds": out_of_stack, "y_center": info[2] if info else np.nan, "x_center": info[3] if info else np.nan, "crop_height": height, "crop_width": width, "mask_path": s.mask_path, "red_image_path": s.red_image_path, "green_image_path": s.green_image_path}) axes[i,col].imshow(rc,cmap=red_cmap,vmin=0,vmax=rv); axes[i+len(offsets),col].imshow(gc,cmap=green_cmap,vmin=0,vmax=gv)
                 if out_of_stack:
                     axes[i,col].text(.5,.5,'out of stack',ha='center',va='center',color='white'); axes[i+len(offsets),col].text(.5,.5,'out of stack',ha='center',va='center',color='white')
                 for ax in (axes[i,col],axes[i+len(offsets),col]):
@@ -75,7 +77,9 @@ def plot_matched_roi_raw_slices(*, cluster_id=None, track_uid=None, tracks_table
         label=f"Day {int(s.elapsed_days)}\n{s.acquisition_date.strftime('%Y-%m-%d')}"; axes[0,col].set_title(label)
     for ax in axes.ravel(): ax.set_xticks([]); ax.set_yticks([])
     fig.tight_layout()
-    if output_path is not None: fig.savefig(output_path,dpi=180); plt.close(fig)
+    if output_path is not None:
+        fig.savefig(output_path,dpi=180); plt.close(fig)
+        pd.DataFrame(metadata_rows).to_csv(Path(output_path).with_name(Path(output_path).stem + "_metadata.csv"), index=False)
     return fig
 
 def _tracks_from_raw_table(raw_table, policy):

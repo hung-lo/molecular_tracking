@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import tifffile
 from matplotlib import pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.colors import LinearSegmentedColormap, PowerNorm
 from longitudinal_session import resolve_longitudinal_session_metadata
 
 def extract_centered_crop_with_padding(image_2d, *, center_y, center_x, height, width, fill_value=0):
@@ -38,7 +38,8 @@ def plot_matched_roi_raw_slices(*, cluster_id=None, track_uid=None, tracks_table
         if pd.isna(label): loaded.append((s,None,None,None,None)); continue
         coords=np.where(mask==int(label))
         if len(coords[0])==0: loaded.append((s,None,None,None,None)); continue
-        z0=int(round(coords[0].mean())); yc=int(round(coords[1].mean())); xc=int(round(coords[2].mean()))
+        areas = np.count_nonzero(mask == int(label), axis=(1, 2))
+        z0=int(np.argmax(areas)); yc=int(round(coords[1].mean())); xc=int(round(coords[2].mean()))
         h=int(coords[1].max()-coords[1].min()+1+2*crop_padding_px); w=int(coords[2].max()-coords[2].min()+1+2*crop_padding_px); max_h=max(max_h,h); max_w=max(max_w,w)
         loaded.append((s,mask,red,green,(int(label),z0,yc,xc)))
     height=max(min_crop_size_px,max_h); width=max(min_crop_size_px,max_w); offsets=tuple(range(z_radius,-z_radius-1,-1)); nrows=2*len(offsets); fig,axes=plt.subplots(nrows,max(1,len(loaded)),figsize=(2.2*max(1,len(loaded)),1.8*nrows),squeeze=False)
@@ -54,21 +55,26 @@ def plot_matched_roi_raw_slices(*, cluster_id=None, track_uid=None, tracks_table
                     rc=np.zeros((height,width),dtype=red.dtype); gc=np.zeros((height,width),dtype=green.dtype); mc=np.zeros((height,width),dtype=np.uint8)
                 else:
                     z=requested_z; rc=extract_centered_crop_with_padding(red[z],center_y=yc,center_x=xc,height=height,width=width); gc=extract_centered_crop_with_padding(green[z],center_y=yc,center_x=xc,height=height,width=width); mc=extract_centered_crop_with_padding((mask[z]==label).astype(np.uint8),center_y=yc,center_x=xc,height=height,width=width)
-                reds.append(rc.ravel()); greens.append(gc.ravel()); day.append((rc,gc,mc,off))
+                if 0 <= requested_z < mask.shape[0]:
+                    reds.append(rc.ravel()); greens.append(gc.ravel())
+                day.append((rc,gc,mc,off,requested_z < 0 or requested_z >= mask.shape[0]))
         prepared.append(day)
     rv=max(float(np.percentile(np.concatenate(reds),99.5)) if reds else 0.0,1.0); gv=max(float(np.percentile(np.concatenate(greens),99.5)) if greens else 0.0,1.0)
     for col,(s,_,_,_,info) in enumerate(loaded):
         for i,off in enumerate(offsets):
             if i < len(prepared[col]):
-                rc,gc,mc,_=prepared[col][i]; axes[i,col].imshow(rc,cmap=red_cmap,vmin=0,vmax=rv); axes[i+len(offsets),col].imshow(gc,cmap=green_cmap,vmin=0,vmax=gv)
+                rc,gc,mc,_,out_of_stack=prepared[col][i]; axes[i,col].imshow(rc,cmap=red_cmap,vmin=0,vmax=rv); axes[i+len(offsets),col].imshow(gc,cmap=green_cmap,vmin=0,vmax=gv)
+                if out_of_stack:
+                    axes[i,col].text(.5,.5,'out of stack',ha='center',va='center',color='white'); axes[i+len(offsets),col].text(.5,.5,'out of stack',ha='center',va='center',color='white')
                 for ax in (axes[i,col],axes[i+len(offsets),col]):
                     if mc.any(): ax.contour(mc,levels=[.5],colors='white',linewidths=.6)
             else:
                 axes[i,col].text(.5,.5,'not matched',ha='center',va='center'); axes[i+len(offsets),col].text(.5,.5,'not matched',ha='center',va='center')
-            axes[i,col].set_ylabel(f'z={off:+d}'); axes[i+len(offsets),col].set_ylabel(f'z={off:+d}')
+            if col == 0:
+                axes[i,col].set_ylabel(f'Red\nz={off:+d}'); axes[i+len(offsets),col].set_ylabel(f'Green\nz={off:+d}')
         label=f"Day {int(s.elapsed_days)}\n{s.acquisition_date.strftime('%Y-%m-%d')}"; axes[0,col].set_title(label)
     for ax in axes.ravel(): ax.set_xticks([]); ax.set_yticks([])
-    axes[0,0].set_ylabel('Red z=...'); axes[len(offsets),0].set_ylabel('Green z=...'); fig.tight_layout()
+    fig.tight_layout()
     if output_path is not None: fig.savefig(output_path,dpi=180); plt.close(fig)
     return fig
 
@@ -76,7 +82,10 @@ def _tracks_from_raw_table(raw_table, policy):
     selected = raw_table.loc[raw_table["match_policy"].eq(policy)].copy()
     if selected.empty: raise ValueError(f"No rows found for policy {policy!r}")
     key = "cluster_id" if "cluster_id" in selected.columns else "roi_id"
-    rows = selected[[key, "roi_id", "track_uid", "session_id", "session_roi_label"]].drop_duplicates()
+    check_cols = [key, "roi_id", "track_uid", "session_id", "session_roi_label"]
+    counts = selected.groupby([key, "track_uid", "session_id"])["session_roi_label"].nunique(dropna=True)
+    if (counts > 1).any(): raise ValueError("Conflicting session_roi_label values across channel rows")
+    rows = selected[check_cols].drop_duplicates()
     tracks = rows.groupby([key, "roi_id", "track_uid"], as_index=False).first()
     for _, row in tracks.iterrows():
         values = rows[(rows[key] == row[key]) & (rows["track_uid"] == row["track_uid"])]
@@ -88,5 +97,5 @@ def main(argv=None):
     g=ap.add_mutually_exclusive_group(required=True); g.add_argument('--cluster-id'); g.add_argument('--track-uid')
     ap.add_argument('--policy',choices=['high','balanced','graph'],default='high'); ap.add_argument('--output'); ap.add_argument('--z-radius',type=int,default=3)
     a=ap.parse_args(argv); root=Path(a.analysis_dir); manifest=pd.read_csv(root/'session_manifest_resolved.csv'); raw=pd.read_csv(root/'matched_roi_intensity_results_raw.csv'); tracks=_tracks_from_raw_table(raw,a.policy)
-    out=Path(a.output or root/f"raw_roi_{a.cluster_id or a.track_uid}.png"); plot_matched_roi_raw_slices(cluster_id=a.cluster_id,track_uid=a.track_uid,tracks_table=tracks,session_table=manifest,output_path=out,z_radius=a.z_radius)
+    out=Path(a.output or root/f"raw_roi_{a.policy}_{a.cluster_id or a.track_uid}.png"); plot_matched_roi_raw_slices(cluster_id=a.cluster_id,track_uid=a.track_uid,tracks_table=tracks,session_table=manifest,output_path=out,z_radius=a.z_radius)
 if __name__=='__main__': main()

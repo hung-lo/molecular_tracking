@@ -281,3 +281,48 @@ def test_axial_scatter_histogram_and_medians_share_high_confidence_population(
     medians = pd.read_csv(output_dir / "tables" / "a_b_axial_shift_bins.csv")
     assert medians["n_matches"].tolist() == [1]
     assert medians["median_delta_z_planes"].tolist() == [2.0]
+
+
+def test_exported_qc_flags_use_candidate_key_for_accepted_and_rejected(
+    tmp_path: Path,
+) -> None:
+    enriched = pd.DataFrame(
+        {
+            "session_a": ["a", "a", "a"],
+            "session_b": ["b", "b", "b"],
+            "label_a": [1, 2, 3],
+            "label_b": [11, 12, 13],
+            "score": [0.9, 0.8, 0.7],
+            "dice": [0.9, 0.8, 0.7],
+            "distance_um": [1.0, 2.0, 3.0],
+            "ambiguity": [0.1, 0.2, 0.3],
+            "accepted_for_track": [True, True, False],
+            "high_rule": [True, True, False],
+            "spatial_grid_row": [0, 1, 2],
+            "spatial_grid_col": [0, 1, 2],
+        },
+        index=[10, 20, 30],
+    )
+    enriched["_candidate_row_id"] = enriched.index
+    selected_accepted = select_spatial_examples(enriched, accepted=True, limit=1)
+    selected_rejected = select_spatial_examples(enriched, accepted=False, limit=1)
+    enriched["selected_high_confidence_example"] = enriched["_candidate_row_id"].isin(
+        selected_accepted["_candidate_row_id"]
+    )
+    enriched["selected_rejected_example"] = enriched["_candidate_row_id"].isin(
+        selected_rejected["_candidate_row_id"]
+    )
+
+    exported_path = tmp_path / "matching_qc_examples.csv"
+    enriched.to_csv(exported_path, index=False)
+    exported = pd.read_csv(exported_path)
+    accepted_flagged = exported.loc[exported["selected_high_confidence_example"]]
+    rejected_flagged = exported.loc[exported["selected_rejected_example"]]
+
+    key_columns = ["session_a", "session_b", "label_a", "label_b"]
+    assert accepted_flagged[key_columns].to_dict("records") == [
+        {"session_a": "a", "session_b": "b", "label_a": 1, "label_b": 11}
+    ]
+    assert rejected_flagged[key_columns].to_dict("records") == [
+        {"session_a": "a", "session_b": "b", "label_a": 3, "label_b": 13}
+    ]

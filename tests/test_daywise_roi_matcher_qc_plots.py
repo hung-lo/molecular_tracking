@@ -6,7 +6,9 @@ import json
 import numpy as np
 import pandas as pd
 import tifffile
+import matplotlib.pyplot as plt
 
+import daywise_roi_matcher_qc_plots as qc
 from affine_overlap_matcher import AffineOverlapParams, VoxelSpacing
 from daywise_roi_matcher_qc_plots import (
     DaywiseQCPlotConfig,
@@ -136,3 +138,28 @@ def test_selected_example_ids_survive_sampler_index_reset() -> None:
     selected = select_spatial_examples(table, accepted=True, limit=1)
     assert selected["label_a"].tolist() == [1]
     assert selected["_candidate_row_id"].tolist() == [10]
+
+
+def test_large_z_renderer_uses_two_by_seven_centroid_planes(tmp_path: Path, monkeypatch) -> None:
+    mask = np.zeros((9, 12, 12), dtype=np.uint16)
+    mask[4, 5, 6] = 1
+    mask_path = tmp_path / "mask.tif"
+    red_path = tmp_path / "red.tif"
+    tifffile.imwrite(mask_path, mask)
+    tifffile.imwrite(red_path, np.ones_like(mask))
+    manifest = pd.DataFrame({"session_id": ["a", "b"], "mask_path": [str(mask_path)] * 2, "red_image_path": [str(red_path)] * 2})
+    table = pd.DataFrame({"session_a": ["a"], "session_b": ["b"], "label_a": [1], "label_b": [1], "accepted_for_track": [True], "raw_abs_delta_z_planes": [4.0], "raw_delta_z_planes": [4.0]})
+    original_subplots = plt.subplots
+    captured = []
+
+    def capture(*args, **kwargs):
+        result = original_subplots(*args, **kwargs)
+        captured.append(result)
+        return result
+
+    monkeypatch.setattr(qc.plt, "subplots", capture)
+    qc._render_large_z_examples(table, manifest, tmp_path, pair_name="a_b", dpi=40)
+    fig, axes = captured[0]
+    assert axes.shape == (2, 7)
+    assert [axes[0, i].get_title().split("dz ")[-1] for i in range(7)] == ["+3", "+2", "+1", "0", "-1", "-2", "-3"]
+    plt.close(fig)

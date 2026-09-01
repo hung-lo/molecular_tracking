@@ -480,7 +480,7 @@ def _render_large_z_examples(table: pd.DataFrame, manifest: pd.DataFrame, output
                     if 0 <= z < image.shape[0]:
                         y0=max(0,yc-size//2); x0=max(0,xc-size//2); crop=image[z,y0:min(image.shape[1],y0+size),x0:min(image.shape[2],x0+size)]; ax.imshow(crop,cmap="magma"); ax.contour(mask[z,y0:min(mask.shape[1],y0+size),x0:min(mask.shape[2],x0+size)]==label,levels=[.5],colors="cyan",linewidths=.5)
                     else: ax.text(.5,.5,"out",ha="center",va="center")
-                    ax.set_title(f"{session} dz {offset:+d}",fontsize=7)
+                    ax.set_title(f"{session} dz {offset:+d}" if offset else f"{session} dz 0", fontsize=7)
             fig.suptitle(f"{pair_name} {category} | labels {item['label_a']} -> {item['label_b']} | raw dz={item['raw_delta_z_planes']:+.2f}")
             path=output_dir/f"{pair_name}_{category}_large_z_{number}.png"; _save_figure(path,fig,dpi=dpi); paths.append(path)
     return paths

@@ -25,8 +25,11 @@ policy. The affine ``balanced`` result is used only to determine agreement.
 from __future__ import annotations
 
 import argparse
+import csv
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import hashlib
+import io
 import json
 import math
 from pathlib import Path
@@ -62,7 +65,7 @@ from run_daywise_matched_roi_pipeline import (
     run_daywise_matched_roi_pipeline,
 )
 from run_weekly_matched_output_quick_plots import build_quick_plots
-from session_manifest import load_session_manifest
+from session_manifest import SessionRecord, load_session_manifest
 
 
 MASTER_RUNNER_VERSION = "daywise_master_graph_affine_consensus_v1"
@@ -111,6 +114,98 @@ class MasterPipelineConfig:
     exclude_xy_edge: bool = False
     exclude_z_edge: bool = False
     max_volume_ratio_from_track_median: float | None = None
+    sessions: str | None = None
+
+
+@dataclass(frozen=True)
+class SessionSelection:
+    """Describe the contiguous session subset requested for one master run."""
+
+    mode: str
+    requested_count: int | None
+    raw: str | None = None
+
+
+_SELECTED_MANIFEST_FIELDS = [
+    "session_index",
+    "source_session_index",
+    "session_id",
+    "acquisition_date",
+    "mask_path",
+    "red_image_path",
+    "green_image_path",
+    "required",
+]
+
+
+def _parse_session_selection(value: str | None) -> SessionSelection:
+    """Parse the deliberately narrow ``first:N``/``last:N`` selector syntax."""
+
+    if value is None:
+        return SessionSelection(mode="all", requested_count=None, raw=None)
+
+    text = str(value).strip()
+    match = re.fullmatch(r"(first|last):([0-9]+)", text)
+    if match is None:
+        raise ValueError(
+            "--sessions must be first:N or last:N, for example first:5 or last:5."
+        )
+
+    mode = match.group(1)
+    count = int(match.group(2))
+    if count < 2:
+        raise ValueError(
+            "--sessions requires N >= 2 because matching needs at least two sessions."
+        )
+    return SessionSelection(mode=mode, requested_count=count, raw=text)
+
+
+def _select_session_records(
+    records: list[SessionRecord], selection: SessionSelection
+) -> list[SessionRecord]:
+    """Select records in their validated source-manifest order."""
+
+    source_records = list(records)
+    if selection.mode == "all":
+        return source_records
+
+    if selection.requested_count is None:
+        raise ValueError("A first/last session selection requires a requested count.")
+    count = int(selection.requested_count)
+    if count > len(source_records):
+        selector = selection.raw or f"{selection.mode}:{count}"
+        raise ValueError(
+            f"Requested {selector} but the source manifest contains only "
+            f"{len(source_records)} sessions. Choose a value from 2 through "
+            f"{len(source_records)}, or omit --sessions to run all sessions."
+        )
+
+    if selection.mode == "first":
+        return source_records[:count]
+    if selection.mode == "last":
+        return source_records[-count:]
+    raise AssertionError(f"Unsupported session selection mode: {selection.mode!r}")
+
+
+def _records_metadata(records: list[SessionRecord]) -> dict[str, Any]:
+    """Return the date/session metadata used in run names and summaries."""
+
+    ordered_records = list(records)
+    if not ordered_records:
+        raise ValueError("No sessions were found in the selected manifest records.")
+    required_records = [record for record in ordered_records if record.required]
+    date_records = required_records or ordered_records
+    first_date = min(record.acquisition_date for record in date_records)
+    last_date = max(record.acquisition_date for record in date_records)
+    return {
+        "records": ordered_records,
+        "n_sessions": len(ordered_records),
+        "n_required_sessions": len(required_records),
+        "first_date": first_date,
+        "last_date": last_date,
+        "start_date": first_date.strftime("%Y%m%d"),
+        "session_ids": [str(record.session_id) for record in ordered_records],
+    }
 
 
 def _format_duration(seconds: float) -> str:
@@ -165,33 +260,32 @@ def _edge_key_frame(frame: pd.DataFrame) -> pd.MultiIndex:
 
 def _manifest_metadata(manifest_path: Path) -> dict[str, Any]:
     records = load_session_manifest(manifest_path)
-    if not records:
-        raise ValueError(f"No sessions were found in manifest: {manifest_path}")
-    required_records = [record for record in records if record.required]
-    date_records = required_records or records
-    first_date = min(record.acquisition_date for record in date_records)
-    last_date = max(record.acquisition_date for record in date_records)
-    return {
-        "records": records,
-        "n_sessions": len(records),
-        "n_required_sessions": len(required_records),
-        "first_date": first_date,
-        "last_date": last_date,
-        "start_date": first_date.strftime("%Y%m%d"),
-        "session_ids": [str(record.session_id) for record in records],
-    }
+    return _records_metadata(records)
 
 
-def _default_run_name(dataset_dir: Path, manifest_meta: dict[str, Any]) -> str:
+def _default_run_name(
+    dataset_dir: Path,
+    manifest_meta: dict[str, Any],
+    selection: SessionSelection | None = None,
+) -> str:
     first_date = manifest_meta["first_date"].strftime("%Y%m%d")
     last_date = manifest_meta["last_date"].strftime("%Y%m%d")
     n_sessions = int(manifest_meta["n_sessions"])
+    selector_suffix = ""
+    if selection is not None and selection.mode != "all":
+        selector_suffix = f"_{selection.mode}{n_sessions}"
     return _safe_name(
-        f"{dataset_dir.name}_{first_date}_to_{last_date}_{n_sessions}s_graph_affine_balanced"
+        f"{dataset_dir.name}_{first_date}_to_{last_date}_{n_sessions}s"
+        f"{selector_suffix}_graph_affine_balanced"
     )
 
 
-def _prepare_run_directory(config: MasterPipelineConfig) -> tuple[Path, Path, Path, Path]:
+def _prepare_run_directory(
+    config: MasterPipelineConfig,
+    *,
+    manifest_meta: dict[str, Any] | None = None,
+    selection: SessionSelection | None = None,
+) -> tuple[Path, Path, Path, Path]:
     dataset_dir = resolve_dataset_dir(config.dataset)
     analysis_dir = get_dataset_analysis_dir(config.dataset)
     output_root = (
@@ -199,8 +293,13 @@ def _prepare_run_directory(config: MasterPipelineConfig) -> tuple[Path, Path, Pa
         if config.output_root
         else analysis_dir / "daywise_master_runs"
     )
-    manifest_meta = _manifest_metadata(Path(config.manifest).expanduser().resolve())
-    run_name = _safe_name(config.run_name or _default_run_name(dataset_dir, manifest_meta))
+    if manifest_meta is None:
+        manifest_meta = _manifest_metadata(Path(config.manifest).expanduser().resolve())
+    if selection is None:
+        selection = _parse_session_selection(config.sessions)
+    run_name = _safe_name(
+        config.run_name or _default_run_name(dataset_dir, manifest_meta, selection)
+    )
     run_dir = output_root / run_name
 
     if run_dir.exists() and config.overwrite:
@@ -215,6 +314,143 @@ def _prepare_run_directory(config: MasterPipelineConfig) -> tuple[Path, Path, Pa
     extraction_dir = run_dir / "extraction"
     plots_dir = run_dir / "plots"
     return run_dir, match_dir, extraction_dir, plots_dir
+
+
+def _selected_manifest_csv_bytes(selected_records: list[SessionRecord]) -> bytes:
+    """Serialize selected records using resolved paths and run-local indices."""
+
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=_SELECTED_MANIFEST_FIELDS,
+        lineterminator="\n",
+    )
+    writer.writeheader()
+    for run_index, record in enumerate(selected_records):
+        writer.writerow(
+            {
+                "session_index": run_index,
+                "source_session_index": record.session_index,
+                "session_id": record.session_id,
+                "acquisition_date": record.acquisition_date.isoformat(),
+                "mask_path": str(record.mask_path),
+                "red_image_path": (
+                    str(record.red_image_path)
+                    if record.red_image_path is not None
+                    else ""
+                ),
+                "green_image_path": (
+                    str(record.green_image_path)
+                    if record.green_image_path is not None
+                    else ""
+                ),
+                "required": "true" if record.required else "false",
+            }
+        )
+    return buffer.getvalue().encode("utf-8")
+
+
+def _write_selected_session_manifest(
+    output_path: Path,
+    selected_records: list[SessionRecord],
+) -> None:
+    """Write a self-contained effective manifest for a subset run."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(_selected_manifest_csv_bytes(selected_records))
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _session_selection_provenance(
+    selection: SessionSelection,
+    source_records: list[SessionRecord],
+    selected_records: list[SessionRecord],
+    effective_manifest_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "mode": selection.mode,
+        "requested_count": selection.requested_count,
+        "source_session_count": len(source_records),
+        "selected_session_count": len(selected_records),
+        "selected_source_session_indices": [
+            int(record.session_index) for record in selected_records
+        ],
+        "selected_session_ids": [
+            str(record.session_id) for record in selected_records
+        ],
+        "selected_acquisition_dates": [
+            record.acquisition_date.isoformat() for record in selected_records
+        ],
+        "effective_manifest_sha256": effective_manifest_sha256,
+    }
+
+
+def _has_files(run_dir: Path) -> bool:
+    return any(path.is_file() for path in run_dir.rglob("*"))
+
+
+def _verify_resume_session_selection(
+    run_dir: Path,
+    *,
+    expected_selection: dict[str, Any],
+    effective_manifest_path: Path,
+    expected_manifest_sha256: str,
+) -> None:
+    """Refuse to resume when the effective session input cannot be proven identical."""
+
+    metadata_path = run_dir / "session_selection.json"
+    if not metadata_path.exists():
+        if _has_files(run_dir):
+            raise ValueError(
+                f"Cannot safely resume run {run_dir}: it has existing pipeline files "
+                "but no session-selection metadata. Choose a new --run-name or use "
+                "--overwrite to rebuild it."
+            )
+        return
+
+    try:
+        existing_selection = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Cannot safely resume run {run_dir}: session-selection metadata is invalid. "
+            "Choose a new --run-name or use --overwrite."
+        ) from exc
+    if not isinstance(existing_selection, dict):
+        raise ValueError(
+            f"Cannot safely resume run {run_dir}: session-selection metadata is invalid. "
+            "Choose a new --run-name or use --overwrite."
+        )
+
+    comparison_keys = (
+        "mode",
+        "requested_count",
+        "selected_source_session_indices",
+        "selected_session_ids",
+        "effective_manifest_sha256",
+    )
+    if any(
+        existing_selection.get(key) != expected_selection.get(key)
+        for key in comparison_keys
+    ):
+        raise ValueError(
+            f"Cannot resume run {run_dir}: the requested session subset differs from "
+            "the existing run. Choose a new --run-name or use --overwrite."
+        )
+
+    if not effective_manifest_path.is_file():
+        raise ValueError(
+            f"Cannot resume run {run_dir}: the effective manifest is missing. "
+            "Choose a new --run-name or use --overwrite."
+        )
+    existing_manifest_sha256 = file_sha256(effective_manifest_path)
+    if existing_manifest_sha256 != expected_manifest_sha256:
+        raise ValueError(
+            f"Cannot resume run {run_dir}: the effective manifest has changed. "
+            "Choose a new --run-name or use --overwrite."
+        )
 
 
 def _node_to_track_lookup(tracks: pd.DataFrame) -> dict[tuple[str, int], tuple[str, int]]:
@@ -760,18 +996,29 @@ def plot_wrapped_daywise_linear_relationships(
 def _write_master_summary(
     run_dir: Path,
     config: MasterPipelineConfig,
+    source_manifest_path: Path,
+    effective_manifest_path: Path,
+    selection: SessionSelection,
+    source_meta: dict[str, Any],
+    selected_meta: dict[str, Any],
     agreement_summary: dict[str, Any],
     extraction_annotation: dict[str, Any],
     match_dir: Path,
     extraction_dir: Path,
     plots_dir: Path,
 ) -> None:
+    selection_label = selection.raw if selection.mode != "all" else "all"
+    selected_ids = ", ".join(selected_meta["session_ids"])
     lines = [
         "# Daywise master ROI run",
         "",
         f"- Runner version: `{MASTER_RUNNER_VERSION}`",
         f"- Dataset: `{config.dataset}`",
-        f"- Manifest: `{config.manifest}`",
+        f"- Source manifest: `{source_manifest_path}`",
+        f"- Effective manifest: `{effective_manifest_path}`",
+        f"- Session selection: `{selection_label}`",
+        f"- Sessions used: `{selected_meta['n_sessions']} / {source_meta['n_sessions']}`",
+        f"- Selected session IDs: `{selected_ids}`",
         f"- Final assignment policy: `graph`",
         f"- Agreement comparison policy: `balanced` affine-overlap",
         "",
@@ -795,7 +1042,7 @@ def _write_master_summary(
         f"- Intensity extraction and tables: `{extraction_dir}`",
         f"- Quick plots: `{plots_dir}`",
         "",
-        "The wrapped linear-fit plot is `plots/graph/daywise_green_red_linear_fit_scatters_wrapped_7cols.png` by default.",
+        f"The wrapped linear-fit plot is `plots/graph/daywise_green_red_linear_fit_scatters_wrapped_{int(config.plot_columns)}cols.png` by default.",
     ]
     (run_dir / "SUMMARY.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -805,12 +1052,90 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         if not math.isfinite(float(value)) or float(value) <= 0:
             raise ValueError(f"{name} must be finite and positive")
     start_seconds = time.perf_counter()
-    manifest_path = Path(config.manifest).expanduser().resolve()
+    source_manifest_path = Path(config.manifest).expanduser().resolve()
     dataset_dir = resolve_dataset_dir(config.dataset)
-    manifest_meta = _manifest_metadata(manifest_path)
-    run_dir, match_dir, extraction_dir, plots_dir = _prepare_run_directory(config)
+    source_records = load_session_manifest(source_manifest_path)
+    source_meta = _records_metadata(source_records)
+    selection = _parse_session_selection(config.sessions)
+    selected_records = _select_session_records(source_records, selection)
+    selected_meta = _records_metadata(selected_records)
+    run_dir, match_dir, extraction_dir, plots_dir = _prepare_run_directory(
+        config, manifest_meta=selected_meta, selection=selection
+    )
 
+    source_manifest_sha256 = file_sha256(source_manifest_path)
+    selected_manifest_path = run_dir / "selected_session_manifest.csv"
+    if selection.mode == "all":
+        effective_manifest_path = source_manifest_path
+        effective_manifest_sha256 = source_manifest_sha256
+        selection_provenance = _session_selection_provenance(
+            selection, source_records, selected_records, effective_manifest_sha256
+        )
+        # Legacy all-session runs predate session_selection.json. Preserve their
+        # existing resume behavior, but validate the artifact whenever present.
+        if config.resume and (run_dir / "session_selection.json").exists():
+            _verify_resume_session_selection(
+                run_dir,
+                expected_selection=selection_provenance,
+                effective_manifest_path=effective_manifest_path,
+                expected_manifest_sha256=effective_manifest_sha256,
+            )
+    else:
+        selected_manifest_bytes = _selected_manifest_csv_bytes(selected_records)
+        expected_manifest_sha256 = _sha256_bytes(selected_manifest_bytes)
+        effective_manifest_path = selected_manifest_path
+        if config.resume:
+            _verify_resume_session_selection(
+                run_dir,
+                expected_selection=_session_selection_provenance(
+                    selection, source_records, selected_records, expected_manifest_sha256
+                ),
+                effective_manifest_path=effective_manifest_path,
+                expected_manifest_sha256=expected_manifest_sha256,
+            )
+        if not effective_manifest_path.exists():
+            _write_selected_session_manifest(effective_manifest_path, selected_records)
+        # This is intentionally before matching so path and reindexing errors are
+        # reported without starting an expensive downstream stage.
+        load_session_manifest(effective_manifest_path)
+        effective_manifest_sha256 = file_sha256(effective_manifest_path)
+        if effective_manifest_sha256 != expected_manifest_sha256:
+            raise ValueError(
+                f"Effective manifest has unexpected contents: {effective_manifest_path}"
+            )
+        selection_provenance = _session_selection_provenance(
+            selection, source_records, selected_records, effective_manifest_sha256
+        )
+        if not (config.resume and (run_dir / "session_selection.json").exists()):
+            _write_json(run_dir / "session_selection.json", selection_provenance)
+
+    manifest_meta = selected_meta
     _log(start_seconds, f"Master run directory: {run_dir}")
+    if selection.mode == "all":
+        _log(start_seconds, f"Session selection: all ({source_meta['n_sessions']} sessions)")
+    else:
+        _log(
+            start_seconds,
+            f"Session selection: {selection.raw} | selected "
+            f"{selected_meta['n_sessions']} of {source_meta['n_sessions']} source sessions",
+        )
+        _log(
+            start_seconds,
+            "Selected source indices: "
+            + ", ".join(str(index) for index in selection_provenance["selected_source_session_indices"]),
+        )
+        _log(
+            start_seconds,
+            f"Selected date range: {selected_meta['first_date'].isoformat()} -> "
+            f"{selected_meta['last_date'].isoformat()}",
+        )
+        for run_index, record in enumerate(selected_records):
+            _log(
+                start_seconds,
+                f"Selected session: run={run_index} source={record.session_index} "
+                f"session_id={record.session_id}",
+            )
+        _log(start_seconds, f"Effective manifest: {effective_manifest_path}")
     _log(start_seconds, "Running affine-overlap baseline plus graph refinement")
     spacing = VoxelSpacing(
         z_um=float(config.z_um_per_plane),
@@ -818,7 +1143,7 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         x_um=float(config.xy_um_per_px),
     )
     run_daywise_graph_matching(
-        manifest_path=manifest_path,
+        manifest_path=effective_manifest_path,
         output_dir=match_dir,
         spacing=spacing,
         params=AffineOverlapParams(),
@@ -848,7 +1173,7 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         temporary_extraction_dir = run_daywise_matched_roi_pipeline(
             DaywiseMatchedPipelineConfig(
                 dataset=str(dataset_dir),
-                manifest=str(manifest_path),
+                manifest=str(effective_manifest_path),
                 match_dir=str(match_dir),
                 output_root=str(run_dir / "extraction_work"),
                 policies=("graph",),
@@ -907,6 +1232,17 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
 
     finished_utc = datetime.now(timezone.utc).isoformat()
     total_seconds = time.perf_counter() - start_seconds
+    outputs = {
+        "run_dir": str(run_dir),
+        "matching_dir": str(match_dir),
+        "matching_qc_dir": str(match_dir / "qc"),
+        "extraction_dir": str(extraction_dir),
+        "plots_dir": str(plots_dir),
+        "wrapped_linear_fit_plot": str(wrapped_plot_path),
+    }
+    if selection.mode != "all":
+        outputs["selected_session_manifest"] = str(effective_manifest_path)
+        outputs["session_selection"] = str(run_dir / "session_selection.json")
     run_manifest = {
         "master_runner_version": MASTER_RUNNER_VERSION,
         "mode": config.mode,
@@ -918,29 +1254,34 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         "duration_hms": _format_duration(total_seconds),
         "config": asdict(config),
         "dataset_dir": str(dataset_dir),
-        "manifest_path": str(manifest_path),
+        "manifest_path": str(effective_manifest_path),
+        "source_manifest_path": str(source_manifest_path),
+        "source_manifest_sha256": source_manifest_sha256,
+        "effective_manifest_path": str(effective_manifest_path),
+        "effective_manifest_sha256": effective_manifest_sha256,
+        "session_selection": selection_provenance,
         "manifest": {
-            "n_sessions": int(manifest_meta["n_sessions"]),
-            "n_required_sessions": int(manifest_meta["n_required_sessions"]),
-            "first_date": manifest_meta["first_date"].isoformat(),
-            "last_date": manifest_meta["last_date"].isoformat(),
-            "session_ids": manifest_meta["session_ids"],
+            "path": str(effective_manifest_path),
+            "sha256": effective_manifest_sha256,
+            "n_sessions": int(selected_meta["n_sessions"]),
+            "n_required_sessions": int(selected_meta["n_required_sessions"]),
+            "first_date": selected_meta["first_date"].isoformat(),
+            "last_date": selected_meta["last_date"].isoformat(),
+            "session_ids": selected_meta["session_ids"],
         },
         "agreement": agreement_summary,
         "extraction_annotation": extraction_annotation,
-        "outputs": {
-            "run_dir": str(run_dir),
-            "matching_dir": str(match_dir),
-            "matching_qc_dir": str(match_dir / "qc"),
-            "extraction_dir": str(extraction_dir),
-            "plots_dir": str(plots_dir),
-            "wrapped_linear_fit_plot": str(wrapped_plot_path),
-        },
+        "outputs": outputs,
     }
     _write_json(run_dir / "run_manifest.json", run_manifest)
     _write_master_summary(
         run_dir=run_dir,
         config=config,
+        source_manifest_path=source_manifest_path,
+        effective_manifest_path=effective_manifest_path,
+        selection=selection,
+        source_meta=source_meta,
+        selected_meta=selected_meta,
         agreement_summary=agreement_summary,
         extraction_annotation=extraction_annotation,
         match_dir=match_dir,
@@ -969,6 +1310,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--run-name",
         default=None,
         help="Stable run folder name. A dataset/date/session name is generated by default.",
+    )
+    parser.add_argument(
+        "--sessions",
+        default=None,
+        help="Run only a contiguous subset: first:N or last:N. Default: all sessions.",
     )
     parser.add_argument("--xy-um-per-px", type=float, default=None)
     parser.add_argument("--z-um-per-plane", type=float, default=None)
@@ -1026,7 +1372,9 @@ def main(argv: list[str] | None = None) -> Path:
         selected_rows=selected_catalog_rows(context)
         source_catalog=catalog_path(context)
         companion=Path(args.manifest).with_name("manifest_metadata.json")
-        project_provenance={"mouse_id":context.mouse_id,"experimental_group":mouse_meta.get("experimental_group"),"cohort":mouse_meta.get("cohort"),"viral_constructs":mouse_meta.get("viral_constructs"),"laser_nm":context.laser_nm,"source_catalog_path":str(source_catalog),"source_catalog_sha256":file_sha256(source_catalog),"source_catalog_version":json.loads((source_catalog.parent / "validation_report.json").read_text(encoding="utf-8")).get("catalog_version") if (source_catalog.parent / "validation_report.json").is_file() else None,"source_manifest_path":str(args.manifest),"manifest_metadata_path":str(companion),"selected_session_ids":[row["session_id"] for row in selected_rows],"selected_acquisition_ids":[row["acquisition_id"] for row in selected_rows],"catalog_spacing_um":{"x":catalog_x,"y":catalog_y,"z":catalog_z},"spacing_overrides_um":{"xy":requested_xy,"z":requested_z}}
+        catalog_selected_session_ids = [row["session_id"] for row in selected_rows]
+        catalog_selected_acquisition_ids = [row["acquisition_id"] for row in selected_rows]
+        project_provenance={"mouse_id":context.mouse_id,"experimental_group":mouse_meta.get("experimental_group"),"cohort":mouse_meta.get("cohort"),"viral_constructs":mouse_meta.get("viral_constructs"),"laser_nm":context.laser_nm,"source_catalog_path":str(source_catalog),"source_catalog_sha256":file_sha256(source_catalog),"source_catalog_version":json.loads((source_catalog.parent / "validation_report.json").read_text(encoding="utf-8")).get("catalog_version") if (source_catalog.parent / "validation_report.json").is_file() else None,"source_manifest_path":str(args.manifest),"manifest_metadata_path":str(companion),"selected_session_ids":catalog_selected_session_ids,"selected_acquisition_ids":catalog_selected_acquisition_ids,"catalog_selected_session_ids":catalog_selected_session_ids,"catalog_selected_acquisition_ids":catalog_selected_acquisition_ids,"catalog_spacing_um":{"x":catalog_x,"y":catalog_y,"z":catalog_z},"spacing_overrides_um":{"xy":requested_xy,"z":requested_z}}
         args.xy_um_per_px = catalog_xy if args.xy_um_per_px is None else args.xy_um_per_px
         args.z_um_per_plane = catalog_z if args.z_um_per_plane is None else args.z_um_per_plane
         project_provenance["effective_spacing_um"]={"x":args.xy_um_per_px,"y":args.xy_um_per_px,"z":args.z_um_per_plane}
@@ -1044,6 +1392,7 @@ def main(argv: list[str] | None = None) -> Path:
         manifest=args.manifest,
         output_root=args.output_root,
         run_name=args.run_name,
+        sessions=args.sessions,
         mode=context.mode,
         project_provenance=project_provenance if context.mode == "project" else None,
         xy_um_per_px=args.xy_um_per_px,

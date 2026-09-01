@@ -12,7 +12,24 @@ python tools/build_data_catalog.py --project-config config/project.local.toml --
 python tools/build_data_catalog.py --project-config config/project.local.toml --strict
 python tools/build_session_manifest.py --project-config config/project.local.toml --mouse-id Fucci-Tri_1 --laser-nm 1050
 .venv/bin/python core/run_daywise_master_pipeline.py --project-config config/project.local.toml --mouse-id Fucci-Tri_1 --laser-nm 1050
+
+# quick test on earliest 5 sessions
+.venv/bin/python core/run_daywise_master_pipeline.py \
+  --project-config config/project.local.toml \
+  --mouse-id Fucci-Tri_1 \
+  --laser-nm 1050 \
+  --sessions first:5
+
+# quick test on most recent 5 sessions
+.venv/bin/python core/run_daywise_master_pipeline.py \
+  --project-config config/project.local.toml \
+  --mouse-id Fucci-Tri_1 \
+  --laser-nm 1050 \
+  --sessions last:5
 ```
+
+`--sessions first:N` or `--sessions last:N` creates a run-local subset manifest; it never modifies
+the validated project manifest. Omit the option to run all sessions.
 
 1050 nm is required and primary; 920 nm is optional. Acquisitions containing `_vol10` are
 alignment-only and never enter quantitative manifests. Generated files go under the separate
@@ -386,6 +403,7 @@ The most important flags are:
 - `--manifest`: the daywise session manifest CSV.
 - `--output-root`: where the master run folder should be created.
 - `--run-name`: optional stable folder name for the run.
+- `--sessions`: optional contiguous subset selector in the form `first:N` or `last:N`; omit it to run all sessions.
 - `--xy-um-per-px`, `--z-um-per-plane`, and `--max-pair-gap`: the matching geometry settings.
 
 The master pipeline creates one run directory containing the matching output, the matched ROI extraction tables, the agreement annotations, the quick plots, the wrapped red-vs-green summary figure, and two run-level summaries:

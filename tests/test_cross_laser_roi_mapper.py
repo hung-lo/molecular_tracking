@@ -153,6 +153,20 @@ def test_inverse_transform_round_trip_and_common_volume_status() -> None:
     assert bool(statuses.loc[2, "cross_laser_edge_clipped"])
 
 
+def test_common_volume_is_conservative_when_no_transformed_corner_is_inside() -> None:
+    angle = np.sqrt(0.5)
+    transform = RestrictedTransform(
+        z_intercept=0.0, z_scale=1.0,
+        y_intercept=4.0, y_from_y=angle, y_from_x=-angle,
+        x_intercept=4.0 - 8.0 * angle, x_from_y=angle, x_from_x=angle,
+        method="translation_only", fallback_reason=None, n_seed=0, n_inlier=0,
+        residual_median_um=None, residual_p95_um=None,
+    )
+    features = pd.DataFrame({"label": [1], "bbox_z0": [1], "bbox_z1": [3], "bbox_y0": [1], "bbox_y1": [8], "bbox_x0": [1], "bbox_x1": [8]})
+    status = classify_common_volume(features, transform, (9, 9, 9)).iloc[0]
+    assert status["common_volume_status"] == "partially_inside_common_volume"
+
+
 def test_identity_resolution_keeps_primary_automatic_and_red_provisional() -> None:
     primary = pd.DataFrame(
         {
@@ -177,6 +191,23 @@ def test_identity_resolution_keeps_primary_automatic_and_red_provisional() -> No
     assert bool(rows.loc[2, "provisional_identity"])
     assert bool(rows.loc[2, "review_required"])
     assert not bool(rows.loc[2, "recommended_for_identity"])
+
+
+def test_identity_resolution_marks_outside_volume_without_candidate_failure() -> None:
+    primary = pd.DataFrame(
+        {
+            "label_1050": [1],
+            "green_status": ["no_candidate"],
+            "green_high_label_920": [np.nan],
+            "common_volume_status": ["outside_common_volume"],
+        }
+    )
+    row = resolve_identity_evidence(primary).iloc[0]
+    assert row["resolved_status"] == "outside_common_volume"
+    assert row["resolved_920_source"] == ""
+    assert pd.isna(row["resolved_label_920"])
+    assert not bool(row["recommended_for_identity"])
+    assert not bool(row["review_required"])
 
 
 def test_identity_resolution_blocks_cross_source_conflict() -> None:

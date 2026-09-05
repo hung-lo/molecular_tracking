@@ -100,10 +100,9 @@ def fixed_coverage_by_long_axis(
         return pd.DataFrame(
             columns=["bin", "bin_center", "n_observable_1050", "n_high", "high_fraction"]
         )
-    high_column = (
-        "green_high_label_920"
-        if "green_high_label_920" in coverage
-        else "primary_green_label_920"
+    high_column = next(
+        (column for column in ("green_high_label_920", "red_high_label_920", "primary_green_label_920") if column in coverage),
+        None,
     )
     if high_column not in coverage:
         raise ValueError("fixed_coverage does not include a primary green high-match column")
@@ -130,13 +129,16 @@ def select_cross_laser_examples(
     *,
     limit: int = 12,
     status_column: str = "resolved_status",
+    image_shape_yx: tuple[int, int] | None = None,
 ) -> pd.DataFrame:
     """Select deterministic spatially distributed rows for cross-laser review."""
 
     if limit < 1 or table.empty:
         return table.iloc[0:0].copy()
     output = table.copy()
-    if "long_axis_position_normalized" not in output:
+    if image_shape_yx is not None:
+        output = _with_long_axis_position(output, image_shape_yx=image_shape_yx)
+    elif "long_axis_position_normalized" not in output:
         if {"centroid_1050_x", "centroid_1050_y"}.issubset(output.columns):
             maximum_x = max(float(pd.to_numeric(output["centroid_1050_x"]).max()), 1.0)
             maximum_y = max(float(pd.to_numeric(output["centroid_1050_y"]).max()), 1.0)
@@ -290,15 +292,19 @@ def generate_cross_laser_qc(
     outputs["fixed_coverage"] = _save_figure(root / "fixed_coverage.png", figure)
 
     if identity_resolution is not None and not identity_resolution.empty:
-        categories = [
-            "primary_high",
-            "secondary_high_rescue_candidate",
-            "cross_source_conflict",
-        ]
-        counts = identity_resolution["resolved_status"].value_counts()
+        primary = set(identity_resolution.loc[identity_resolution["primary_green_status"].eq("high"), "label_1050"])
+        secondary = set(identity_resolution.loc[identity_resolution["secondary_red_status"].eq("high"), "label_1050"])
+        categories = ["green_high_only", "red_high_only", "both_high", "cross_source_conflict", "red_rescue_candidate"]
+        counts = {
+            "green_high_only": len(primary - secondary),
+            "red_high_only": len(secondary - primary),
+            "both_high": len(primary & secondary),
+            "cross_source_conflict": int(identity_resolution["cross_source_conflict"].sum()),
+            "red_rescue_candidate": int(identity_resolution["resolved_status"].eq("secondary_high_rescue_candidate").sum()),
+        }
         figure, axis = plt.subplots(figsize=(7, 4))
-        axis.bar(categories, [int(counts.get(category, 0)) for category in categories])
-        axis.set_title("Primary and secondary identity evidence")
+        axis.bar(categories, [int(counts[category]) for category in categories])
+        axis.set_title("Green/red source comparison")
         axis.tick_params(axis="x", labelrotation=20)
         outputs["source_comparison"] = _save_figure(root / "source_comparison.png", figure)
     return outputs

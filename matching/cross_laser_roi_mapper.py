@@ -187,8 +187,8 @@ def _annotate_pair_table(
         output.insert(0, column, value)
 
     diagnostic_columns = [
-        "label_1050",
-        "label_920",
+        "fixed_label",
+        "moving_label",
         "centroid_1050_z",
         "centroid_1050_y",
         "centroid_1050_x",
@@ -229,8 +229,15 @@ def _annotate_pair_table(
     raw_delta_um = raw_delta * spacing_zyx
     aligned_delta_um = aligned_delta * spacing_zyx
 
-    output["label_1050"] = labels_fixed
-    output["label_920"] = labels_moving
+    output["fixed_label"] = labels_fixed
+    output["moving_label"] = labels_moving
+    if fixed_source.laser_nm == 1050:
+        output["label_1050"] = labels_fixed
+        output[f"label_920_{fixed_source.channel if moving_source.channel == fixed_source.channel else moving_source.channel}"] = labels_moving
+        output["label_920"] = labels_moving
+    elif fixed_source.laser_nm == moving_source.laser_nm == 920:
+        output[f"label_920_{fixed_source.channel}"] = labels_fixed
+        output[f"label_920_{moving_source.channel}"] = labels_moving
     for index, axis in enumerate(("z", "y", "x")):
         output[f"centroid_1050_{axis}"] = fixed_coordinates[:, index]
         output[f"centroid_920_{axis}"] = moving_coordinates[:, index]
@@ -280,10 +287,10 @@ def classify_common_volume(
         inside = ((corners >= 0.0) & (corners <= (shape - 1.0))).all(axis=1)
         if bool(inside.all()):
             status = "inside_common_volume"
-        elif bool(inside.any()):
-            status = "partially_inside_common_volume"
-        else:
+        elif bool(np.any(corners.max(axis=0) < 0.0) or np.any(corners.min(axis=0) > (shape - 1.0))):
             status = "outside_common_volume"
+        else:
+            status = "partially_inside_common_volume"
         rows.append(
             {
                 "label_1050": int(series["label"]),
@@ -526,6 +533,10 @@ def map_cross_laser_source(
         fixed_shape_zyx=tuple(int(value) for value in fixed.shape),
         moving_shape_zyx=tuple(int(value) for value in moving.shape),
     )
+    # Only 1050-fixed relations need 1050 coverage tables. The 920-red to
+    # 920-green consistency relation is consumed as pair evidence only.
+    if fixed_source.laser_nm != 1050:
+        return result
     result.fixed_coverage = build_fixed_coverage(result)
     result.moving_coverage = build_moving_coverage(result)
     observable = result.fixed_coverage["common_volume_status"].ne("outside_common_volume")
@@ -592,7 +603,9 @@ def resolve_identity_evidence(
     red_to_green: dict[int, int] = {}
     if green_red_high_matches is not None and not green_red_high_matches.empty:
         for row in green_red_high_matches.itertuples(index=False):
-            red_to_green[int(row.label_920)] = int(row.label_1050)
+            red_label = row.label_920_red if hasattr(row, "label_920_red") else row.label_920
+            green_label = row.label_920_green if hasattr(row, "label_920_green") else row.label_1050
+            red_to_green[int(red_label)] = int(green_label)
 
     conflict_values: list[bool] = []
     statuses: list[str] = []
@@ -603,6 +616,15 @@ def resolve_identity_evidence(
     review: list[bool] = []
     for row in resolution.itertuples(index=False):
         fixed_label = int(row.label_1050)
+        if getattr(row, "common_volume_status", "") == "outside_common_volume":
+            conflict_values.append(False)
+            statuses.append("outside_common_volume")
+            sources.append("")
+            labels.append(np.nan)
+            recommended.append(False)
+            provisional.append(False)
+            review.append(False)
+            continue
         primary_high = (
             row.primary_green_status == "high"
             and pd.notna(row.primary_green_label_920)

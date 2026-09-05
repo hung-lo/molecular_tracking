@@ -395,10 +395,8 @@ def _session_summary(
             "aligned_residual_distance_um"
         ].median(),
         "n_high_both_sources_same_1050": 0,
-        "n_primary_high_only": int(resolution["resolved_status"].eq("primary_high").sum()),
-        "n_secondary_high_only": int(
-            resolution["resolved_status"].eq("secondary_high_rescue_candidate").sum()
-        ),
+        "n_primary_high_only": int(len(primary.high_matches)),
+        "n_secondary_high_only": 0,
         "n_source_conflicts": int(resolution["cross_source_conflict"].sum()),
         "n_secondary_rescue_candidates": int(
             resolution["resolved_status"].eq("secondary_high_rescue_candidate").sum()
@@ -412,8 +410,23 @@ def _session_summary(
             secondary.high_matches["label_1050"].astype(int).tolist()
         )
         row["n_high_both_sources_same_1050"] = int(len(primary_labels & secondary_labels))
+        row["n_primary_high_only"] = int(len(primary_labels - secondary_labels))
+        row["n_secondary_high_only"] = int(len(secondary_labels - primary_labels))
         row["n_920_red_rois"] = int(len(secondary.moving_features))
     return row
+
+
+def _near_miss_representatives(primary, labels: set[int]) -> pd.DataFrame:
+    """Keep one useful balanced or rejected candidate per fixed 1050 ROI."""
+    if not labels:
+        return primary.candidates.iloc[:0].copy()
+    order = ["score", "dice", "distance_um", "label_920"]
+    balanced = primary.balanced_matches.loc[primary.balanced_matches["label_1050"].astype(int).isin(labels)]
+    balanced = balanced.sort_values(order, ascending=[False, False, True, True]).drop_duplicates("label_1050")
+    used = set(balanced["label_1050"].astype(int))
+    rejected = primary.candidates.loc[primary.candidates["label_1050"].astype(int).isin(labels - used)]
+    rejected = rejected.sort_values(order, ascending=[False, False, True, True]).drop_duplicates("label_1050")
+    return pd.concat([balanced, rejected], ignore_index=True, sort=False)
 
 
 def _default_run_name(pairs: list[SessionPair]) -> str:
@@ -680,38 +693,37 @@ def run_cross_laser_roi_map(
                 raise RuntimeError(f"Source mask was modified during cross-laser mapping: {path}")
             source_hashes.append({"path": path, "sha256": before_hash})
         try:
-            accepted_session = accepted_pairs_by_source(primary)
-            if secondary is not None:
-                accepted_session = pd.concat(
-                    [accepted_session, accepted_pairs_by_source(secondary)],
-                    ignore_index=True,
-                    sort=False,
-                )
             qcs = generate_cross_laser_qc(
                 output_dir=run_dir / "qc" / pair.session_id,
                 fixed_coverage=merged_coverage,
-                accepted_pairs=accepted_session,
+                accepted_pairs=accepted_pairs_by_source(primary),
                 image_shape_yx=(fixed_mask.shape[1], fixed_mask.shape[2]),
                 identity_resolution=resolution,
             )
+            if secondary is not None:
+                qcs.update({f"920_red_{name}": path for name, path in generate_cross_laser_qc(
+                    output_dir=run_dir / "qc" / pair.session_id / "920_red",
+                    fixed_coverage=secondary.fixed_coverage,
+                    accepted_pairs=accepted_pairs_by_source(secondary),
+                    image_shape_yx=(fixed_mask.shape[1], fixed_mask.shape[2]),
+                ).items()})
+            image_shape_yx = (fixed_mask.shape[1], fixed_mask.shape[2])
             examples = {
                 "primary_green_high": select_cross_laser_examples(
-                    resolution.loc[resolution["resolved_status"].eq("primary_high")]
+                    resolution.loc[resolution["resolved_status"].eq("primary_high")], image_shape_yx=image_shape_yx
                 ),
                 "primary_green_near_miss": select_cross_laser_examples(
                     resolution.loc[
                         resolution["primary_green_status"].isin(
                             ["balanced_only", "candidate_but_rejected"]
                         )
-                    ]
+                    ], image_shape_yx=image_shape_yx
                 ),
                 "secondary_red_rescue_candidate": select_cross_laser_examples(
-                    resolution.loc[
-                        resolution["resolved_status"].eq("secondary_high_rescue_candidate")
-                    ]
+                    resolution.loc[resolution["resolved_status"].eq("secondary_high_rescue_candidate")], image_shape_yx=image_shape_yx
                 ),
                 "cross_source_conflict": select_cross_laser_examples(
-                    resolution.loc[resolution["resolved_status"].eq("cross_source_conflict")]
+                    resolution.loc[resolution["resolved_status"].eq("cross_source_conflict")], image_shape_yx=image_shape_yx
                 ),
             }
             for name, table in examples.items():
@@ -726,13 +738,14 @@ def run_cross_laser_roi_map(
             green_image = _load_mask(green_image_path)
             primary_example_groups = {
                 "primary_green_high": primary.high_matches,
-                "primary_green_near_miss": primary.candidates.loc[
-                    ~primary.candidates["high_rule"].astype(bool)
-                ],
+                "primary_green_near_miss": _near_miss_representatives(
+                    primary,
+                    set(resolution.loc[resolution["primary_green_status"].isin(["balanced_only", "candidate_but_rejected"]), "label_1050"].astype(int)),
+                ),
             }
             for name, table in primary_example_groups.items():
                 if not table.empty:
-                    selected = select_cross_laser_examples(table)
+                    selected = select_cross_laser_examples(table, image_shape_yx=image_shape_yx)
                     path = render_cross_laser_contact_sheet(
                         output_path=run_dir / "qc" / pair.session_id / f"{name}.png",
                         fixed_image=fixed_image,
@@ -765,7 +778,7 @@ def run_cross_laser_roi_map(
                         secondary.high_matches["label_1050"].astype(int).isin(labels)
                     ]
                     if not table.empty:
-                        selected = select_cross_laser_examples(table)
+                        selected = select_cross_laser_examples(table, image_shape_yx=image_shape_yx)
                         path = render_cross_laser_contact_sheet(
                             output_path=run_dir / "qc" / pair.session_id / f"{name}.png",
                             fixed_image=fixed_image,

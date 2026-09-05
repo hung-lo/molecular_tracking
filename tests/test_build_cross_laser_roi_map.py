@@ -4,6 +4,7 @@ import csv
 import hashlib
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,7 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from build_cross_laser_roi_map import (
+    _session_summary,
     discover_canonical_session_pairs,
     run_cross_laser_roi_map,
 )
@@ -141,6 +143,7 @@ def test_one_session_cli_run_isolated_and_preserves_source_masks(tmp_path: Path)
     moving_path = _session_mask(derivatives, "2026-08-19", 920)
     _write_mask(fixed_path)
     _write_mask(moving_path, label_offset=100)
+    _write_mask(moving_path.with_name("mask_red.tif"), label_offset=200)
     fixed_before = _sha256(fixed_path)
     moving_before = _sha256(moving_path)
 
@@ -164,12 +167,25 @@ def test_one_session_cli_run_isolated_and_preserves_source_masks(tmp_path: Path)
     resolution = pd.read_csv(run_dir / "identity_resolution.csv")
     assert len(resolution) == 2
     assert set(resolution["resolved_status"]) == {"primary_high"}
-    assert set(resolution["secondary_red_status"]) == {"missing"}
+    assert set(resolution["secondary_red_status"]) == {"high"}
     relabelled = tifffile.imread(
         run_dir / "relabelled_masks" / "session_20260819_920_green_native_as_1050_high.tif"
     )
     assert relabelled.shape == tifffile.imread(moving_path).shape
     assert set(np.unique(relabelled)).issubset(set(np.unique(tifffile.imread(fixed_path))))
+    consistency = pd.read_csv(run_dir / "matches_920_red_to_green_high.csv")
+    assert {"fixed_label", "moving_label", "label_920_green", "label_920_red"}.issubset(consistency.columns)
+    assert "label_1050" not in consistency.columns
+
+
+def test_session_summary_counts_green_red_set_membership() -> None:
+    def source(labels: list[int]) -> SimpleNamespace:
+        pairs = pd.DataFrame({"label_1050": labels, "raw_delta_z_planes": [0.0] * len(labels), "aligned_residual_z_um": [0.0] * len(labels), "aligned_residual_distance_um": [0.0] * len(labels)})
+        coverage = pd.DataFrame({"common_volume_status": ["inside_common_volume"] * 4, "green_high_label_920": [1, 2, 3, np.nan], "green_balanced_label_920": [1, 2, 3, np.nan]})
+        return SimpleNamespace(summary={"mouse_id": "m", "session_id": "s", "acquisition_date": "2026-01-01", "shift_z": 0, "shift_y": 0, "shift_x": 0}, fixed_features=pd.DataFrame({"label": [1, 2, 3, 4]}), moving_features=pd.DataFrame({"label": [1, 2, 3, 4]}), high_matches=pairs, balanced_matches=pairs, fixed_coverage=coverage, transform=SimpleNamespace(n_seed=0, n_inlier=0, residual_median_um=0.0, residual_p95_um=0.0))
+    resolution = pd.DataFrame({"resolved_status": ["primary_high"] * 4, "cross_source_conflict": [False] * 4})
+    summary = _session_summary(primary=source([1, 2, 3]), secondary=source([2, 3, 4]), resolution=resolution)
+    assert (summary["n_high_both_sources_same_1050"], summary["n_primary_high_only"], summary["n_secondary_high_only"]) == (2, 1, 1)
 
 
 def test_unpaired_session_is_skipped_by_default_and_requested_session_fails(tmp_path: Path) -> None:

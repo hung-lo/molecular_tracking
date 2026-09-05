@@ -186,18 +186,16 @@ def _annotate_pair_table(
     for column, value in reversed(tuple(provenance.items())):
         output.insert(0, column, value)
 
-    diagnostic_columns = [
-        "fixed_label",
-        "moving_label",
-        "centroid_1050_z",
-        "centroid_1050_y",
-        "centroid_1050_x",
-        "centroid_920_z",
-        "centroid_920_y",
-        "centroid_920_x",
-        "centroid_920_aligned_z",
-        "centroid_920_aligned_y",
-        "centroid_920_aligned_x",
+    is_1050_fixed = fixed_source.laser_nm == 1050
+    label_columns = ["fixed_label", "moving_label"]
+    if is_1050_fixed:
+        label_columns += ["label_1050", "label_920", f"label_920_{moving_source.channel}"]
+    else:
+        label_columns += [f"label_920_{fixed_source.channel}", f"label_920_{moving_source.channel}"]
+    diagnostic_columns = label_columns + [
+        "fixed_centroid_z", "fixed_centroid_y", "fixed_centroid_x",
+        "moving_centroid_z", "moving_centroid_y", "moving_centroid_x",
+        "moving_aligned_to_fixed_z", "moving_aligned_to_fixed_y", "moving_aligned_to_fixed_x",
         "raw_delta_z_planes",
         "raw_delta_y_px",
         "raw_delta_x_px",
@@ -209,6 +207,12 @@ def _annotate_pair_table(
         "aligned_residual_x_um",
         "aligned_residual_distance_um",
     ]
+    if is_1050_fixed:
+        diagnostic_columns += [
+            "centroid_1050_z", "centroid_1050_y", "centroid_1050_x",
+            "centroid_920_z", "centroid_920_y", "centroid_920_x",
+            "centroid_920_aligned_z", "centroid_920_aligned_y", "centroid_920_aligned_x",
+        ]
     if output.empty:
         for column in diagnostic_columns:
             output[column] = pd.Series(dtype=float)
@@ -231,17 +235,21 @@ def _annotate_pair_table(
 
     output["fixed_label"] = labels_fixed
     output["moving_label"] = labels_moving
-    if fixed_source.laser_nm == 1050:
+    if is_1050_fixed:
         output["label_1050"] = labels_fixed
-        output[f"label_920_{fixed_source.channel if moving_source.channel == fixed_source.channel else moving_source.channel}"] = labels_moving
+        output[f"label_920_{moving_source.channel}"] = labels_moving
         output["label_920"] = labels_moving
     elif fixed_source.laser_nm == moving_source.laser_nm == 920:
         output[f"label_920_{fixed_source.channel}"] = labels_fixed
         output[f"label_920_{moving_source.channel}"] = labels_moving
     for index, axis in enumerate(("z", "y", "x")):
-        output[f"centroid_1050_{axis}"] = fixed_coordinates[:, index]
-        output[f"centroid_920_{axis}"] = moving_coordinates[:, index]
-        output[f"centroid_920_aligned_{axis}"] = aligned_coordinates[:, index]
+        output[f"fixed_centroid_{axis}"] = fixed_coordinates[:, index]
+        output[f"moving_centroid_{axis}"] = moving_coordinates[:, index]
+        output[f"moving_aligned_to_fixed_{axis}"] = aligned_coordinates[:, index]
+        if is_1050_fixed:
+            output[f"centroid_1050_{axis}"] = fixed_coordinates[:, index]
+            output[f"centroid_920_{axis}"] = moving_coordinates[:, index]
+            output[f"centroid_920_aligned_{axis}"] = aligned_coordinates[:, index]
         unit = "planes" if axis == "z" else "px"
         output[f"raw_delta_{axis}_{unit}"] = raw_delta[:, index]
         output[f"raw_delta_{axis}_um"] = raw_delta_um[:, index]
@@ -305,7 +313,7 @@ def _best_evidence(table: pd.DataFrame, label_column: str) -> pd.DataFrame:
     """Select the deterministic best candidate for each fixed or moving label."""
 
     if table.empty:
-        return pd.DataFrame(columns=[label_column])
+        return table.iloc[0:0].copy()
     return (
         table.sort_values(
             ["score", "dice", "distance_um", "label_a", "label_b"],

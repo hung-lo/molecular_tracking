@@ -4,6 +4,7 @@ import pandas as pd
 
 from cross_laser_roi_qc import (
     fixed_coverage_by_long_axis,
+    generate_cross_laser_qc,
     high_confidence_long_axis_statistics,
     select_cross_laser_examples,
 )
@@ -72,3 +73,12 @@ def test_example_selection_is_deterministic_and_spatially_distributed() -> None:
 
     assert first["label_1050"].tolist() == second["label_1050"].tolist()
     assert len(first) == 3
+
+
+def test_source_comparison_csv_matches_qc_categories(tmp_path) -> None:
+    coverage = pd.DataFrame({"label_1050": [1], "centroid_1050_y": [1], "centroid_1050_x": [1], "common_volume_status": ["inside_common_volume"], "green_high_label_920": [10]})
+    resolution = pd.DataFrame({"label_1050": [1, 2], "primary_green_status": ["high", "no_candidate"], "secondary_red_status": ["high", "high"], "cross_source_conflict": [False, True], "resolved_status": ["primary_high", "secondary_high_rescue_candidate"]})
+    outputs = generate_cross_laser_qc(output_dir=tmp_path, fixed_coverage=coverage, accepted_pairs=pd.DataFrame(), image_shape_yx=(10, 10), identity_resolution=resolution)
+    table = pd.read_csv(outputs["source_comparison_table"]).set_index("category")
+    assert table.loc["both_high", "count"] == 1
+    assert table.loc["red_high_only", "count"] == 1

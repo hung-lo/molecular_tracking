@@ -7,6 +7,9 @@ import pytest
 from affine_overlap_matcher import RestrictedTransform, VoxelSpacing, extract_roi_features
 from cross_laser_roi_mapper import (
     CrossLaserSource,
+    _annotate_pair_table,
+    build_fixed_coverage,
+    build_moving_coverage,
     classify_common_volume,
     inverse_restricted_transform,
     map_cross_laser_source,
@@ -252,3 +255,29 @@ def test_relabelled_primary_mask_preserves_native_geometry_without_source_mutati
     assert relabelled.shape == source.shape
     assert np.array_equal(source, before)
     assert set(np.unique(relabelled)) == {0, 11}
+
+
+def test_empty_match_tables_keep_coverage_and_consistency_schema() -> None:
+    fixed = _mask_with_objects([(1, (slice(3, 5), slice(4, 9), slice(4, 9)))])
+    moving = _mask_with_objects([(101, (slice(3, 5), slice(4, 9), slice(4, 9)))])
+    fixed_source, moving_source = _sources()
+    result = map_cross_laser_source(mouse_id="m", session_id="s", acquisition_date="2026-01-01", fixed_mask=fixed, moving_mask=moving, fixed_source=fixed_source, moving_source=moving_source, spacing=VoxelSpacing())
+    result.candidates = result.candidates.iloc[:0].copy()
+    result.high_matches = result.high_matches.iloc[:0].copy()
+    result.balanced_matches = result.balanced_matches.iloc[:0].copy()
+    fixed_coverage = build_fixed_coverage(result)
+    moving_coverage = build_moving_coverage(result)
+    assert fixed_coverage["green_status"].tolist() == ["no_candidate"]
+    assert moving_coverage["mapping_status"].tolist() == ["no_candidate"]
+    consistency = map_cross_laser_source(mouse_id="m", session_id="s", acquisition_date="2026-01-01", fixed_mask=moving, moving_mask=moving, fixed_source=CrossLaserSource("920_green", 920, "green"), moving_source=CrossLaserSource("920_red", 920, "red"), spacing=VoxelSpacing())
+    empty = _annotate_pair_table(pd.DataFrame(columns=["label_a", "label_b", "score", "dice", "distance_um"]), mouse_id="m", session_id="s", acquisition_date="2026-01-01", fixed_source=consistency.fixed_source, moving_source=consistency.source, fixed_features=consistency.fixed_features, moving_features=consistency.moving_features, transform=consistency.transform, spacing=VoxelSpacing())
+    assert {"fixed_label", "moving_label", "label_920_green", "label_920_red"}.issubset(empty.columns)
+    assert not any(column.startswith("centroid_1050") or column == "label_1050" for column in empty.columns)
+
+
+def test_competing_moving_labels_do_not_duplicate_fixed_identity() -> None:
+    fixed = _mask_with_objects([(1, (slice(3, 5), slice(4, 10), slice(4, 10)))])
+    moving = _mask_with_objects([(101, (slice(3, 5), slice(4, 7), slice(4, 10))), (102, (slice(3, 5), slice(7, 10), slice(4, 10)))])
+    fixed_source, moving_source = _sources()
+    result = map_cross_laser_source(mouse_id="m", session_id="s", acquisition_date="2026-01-01", fixed_mask=fixed, moving_mask=moving, fixed_source=fixed_source, moving_source=moving_source, spacing=VoxelSpacing())
+    assert result.high_matches["label_1050"].nunique() <= 1

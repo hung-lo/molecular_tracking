@@ -213,3 +213,13 @@ def test_unpaired_session_is_skipped_by_default_and_requested_session_fails(tmp_
         discover_canonical_session_pairs(
             config, mouse_id="mouse_1", requested_sessions=("20260819",)
         )
+
+
+def test_noncanonical_catalog_row_cannot_form_a_pair(tmp_path: Path) -> None:
+    config_path, _, derivatives = _project(tmp_path)
+    primary = _catalog_row(session_id="s", acquisition_date="2026-08-19", acquisition_id="a", laser_nm=1050)
+    optional = _catalog_row(session_id="s", acquisition_date="2026-08-19", acquisition_id="b", laser_nm=920)
+    optional["analysis_included"] = "false"
+    _write_catalog(derivatives, [primary, optional])
+    with pytest.raises(ValueError, match="No canonical paired"):
+        discover_canonical_session_pairs(load_project_config(config_path), mouse_id="mouse_1")

@@ -124,6 +124,16 @@ def fixed_coverage_by_long_axis(
     return output
 
 
+def source_comparison_counts(identity_resolution: pd.DataFrame) -> pd.DataFrame:
+    """Return the same green/red source categories used by the QC plot."""
+    primary = set(identity_resolution.loc[identity_resolution["primary_green_status"].eq("high"), "label_1050"])
+    secondary = set(identity_resolution.loc[identity_resolution["secondary_red_status"].eq("high"), "label_1050"])
+    return pd.DataFrame({
+        "category": ["green_high_only", "red_high_only", "both_high", "cross_source_conflict", "red_rescue_candidate"],
+        "count": [len(primary - secondary), len(secondary - primary), len(primary & secondary), int(identity_resolution["cross_source_conflict"].sum()), int(identity_resolution["resolved_status"].eq("secondary_high_rescue_candidate").sum())],
+    })
+
+
 def select_cross_laser_examples(
     table: pd.DataFrame,
     *,
@@ -292,18 +302,12 @@ def generate_cross_laser_qc(
     outputs["fixed_coverage"] = _save_figure(root / "fixed_coverage.png", figure)
 
     if identity_resolution is not None and not identity_resolution.empty:
-        primary = set(identity_resolution.loc[identity_resolution["primary_green_status"].eq("high"), "label_1050"])
-        secondary = set(identity_resolution.loc[identity_resolution["secondary_red_status"].eq("high"), "label_1050"])
-        categories = ["green_high_only", "red_high_only", "both_high", "cross_source_conflict", "red_rescue_candidate"]
-        counts = {
-            "green_high_only": len(primary - secondary),
-            "red_high_only": len(secondary - primary),
-            "both_high": len(primary & secondary),
-            "cross_source_conflict": int(identity_resolution["cross_source_conflict"].sum()),
-            "red_rescue_candidate": int(identity_resolution["resolved_status"].eq("secondary_high_rescue_candidate").sum()),
-        }
+        comparison = source_comparison_counts(identity_resolution)
+        comparison_path = root / "source_comparison.csv"
+        comparison.to_csv(comparison_path, index=False)
+        outputs["source_comparison_table"] = comparison_path
         figure, axis = plt.subplots(figsize=(7, 4))
-        axis.bar(categories, [int(counts[category]) for category in categories])
+        axis.bar(comparison["category"], comparison["count"])
         axis.set_title("Green/red source comparison")
         axis.tick_params(axis="x", labelrotation=20)
         outputs["source_comparison"] = _save_figure(root / "source_comparison.png", figure)

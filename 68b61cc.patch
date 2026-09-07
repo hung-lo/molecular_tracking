@@ -1,0 +1,777 @@
+From 68b61cc3d889ab9f3f4aa3b54396b2e3b27894ab Mon Sep 17 00:00:00 2001
+From: hung-lo <hung.lo.ecn@gmail.com>
+Date: Mon, 7 Sep 2026 10:56:43 -0400
+Subject: [PATCH] Refine session normalization, resume validation, and QC
+ plotting
+
+---
+ core/acquisition_settings_qc.py               |   2 +-
+ core/run_daywise_master_pipeline.py           | 114 +++++-------------
+ core/run_daywise_matched_roi_pipeline.py      |   4 +
+ core/session_population_normalization.py      |  58 ++++-----
+ docs/daywise_pipeline.md                      |   2 +
+ plotting/cross_laser_roi_qc.py                |  21 +++-
+ ...un_daywise_green_red_linear_fit_summary.py |  74 +++++-------
+ .../run_weekly_matched_output_quick_plots.py  |  17 ++-
+ tests/test_acquisition_settings_qc.py         |  24 ++++
+ tests/test_cross_laser_roi_qc.py              |   8 ++
+ tests/test_run_daywise_master_pipeline.py     |  15 +++
+ ...t_run_weekly_matched_output_quick_plots.py |  18 +++
+ .../test_session_population_normalization.py  |  37 ++++++
+ tests/test_trajectory_eligibility.py          |  14 +++
+ 14 files changed, 242 insertions(+), 166 deletions(-)
+ create mode 100644 tests/test_session_population_normalization.py
+
+diff --git a/core/acquisition_settings_qc.py b/core/acquisition_settings_qc.py
+index f736090..9a5d1ee 100644
+--- a/core/acquisition_settings_qc.py
++++ b/core/acquisition_settings_qc.py
+@@ -36,7 +36,7 @@ def acquisition_settings_qc(rows: list[dict], session_ids: list[str], laser_nm:
+     if len(versions) > 1:
+         informational.append("software_version")
+     return frame, {
+-        "status": "warning" if changed else "pass",
++        "status": "warning" if changed or informational else "pass",
+         "laser_nm": int(laser_nm), "numeric_tolerance": tolerance,
+         "changed_required_fields": changed, "informational_changes": informational,
+         "n_sessions": len(frame),
+diff --git a/core/run_daywise_master_pipeline.py b/core/run_daywise_master_pipeline.py
+index f779622..3d241ce 100644
+--- a/core/run_daywise_master_pipeline.py
++++ b/core/run_daywise_master_pipeline.py
+@@ -403,6 +403,25 @@ def _has_files(run_dir: Path) -> bool:
+     return any(path.is_file() for path in run_dir.rglob("*"))
+ 
+ 
++def _has_current_extraction(extraction_dir: Path) -> bool:
++    required = [
++        "matched_session_population_roi_metrics.csv",
++        "matched_session_population_signal_qc_summary.csv",
++        "matched_daywise_green_red_linear_fit_summary.csv",
++        "matched_roi_metrics_with_session_normalized_residuals_all_observed.csv",
++        "matched_roi_trajectory_eligibility.csv",
++    ]
++    log_path = extraction_dir / "run_log.json"
++    if not log_path.is_file() or any(not (extraction_dir / name).is_file() for name in required):
++        return False
++    try:
++        payload = json.loads(log_path.read_text(encoding="utf-8"))
++        version = tuple(int(part) for part in str(payload.get("analysis_version", "0.0.0")).split(".")[:3])
++    except (OSError, TypeError, ValueError, json.JSONDecodeError):
++        return False
++    return version >= (0, 3, 0) and payload.get("normalization", {}).get("population") == "all_valid_session_rois"
++
++
+ def _verify_resume_session_selection(
+     run_dir: Path,
+     *,
+@@ -812,10 +831,13 @@ def plot_wrapped_daywise_linear_relationships(
+     """Plot one red-vs-green panel per session, wrapping after max_columns."""
+ 
+     metrics = _read_csv(metrics_path)
+-    if "match_policy" in metrics.columns:
+-        metrics = metrics.loc[metrics["match_policy"].astype(str).eq("graph")].copy()
++    if {"red_signal_qc_pass", "green_signal_qc_pass"}.issubset(metrics.columns):
++        metrics = metrics.loc[
++            metrics["red_signal_qc_pass"].eq(True)
++            & metrics["green_signal_qc_pass"].eq(True)
++        ].copy()
+     if metrics.empty:
+-        raise ValueError("No graph-policy metrics were available for wrapped linear-fit plotting.")
++        raise ValueError("No signal-valid native session ROIs were available for wrapped plotting.")
+ 
+     fit_summary = _read_csv(fit_summary_path)
+     fit_summary["day"] = pd.to_numeric(fit_summary["day"], errors="raise").astype(int)
+@@ -841,8 +863,6 @@ def plot_wrapped_daywise_linear_relationships(
+     excluded_total = 0
+     for day_value in day_values:
+         columns = ["red", "green"]
+-        if "track_match_source" in metrics.columns:
+-            columns.append("track_match_source")
+         if "acquisition_date" in metrics.columns:
+             columns.append("acquisition_date")
+         day_table_raw = (
+@@ -851,11 +871,7 @@ def plot_wrapped_daywise_linear_relationships(
+             .dropna(subset=["red", "green"])
+             .reset_index(drop=True)
+         )
+-        day_table, excluded_count = _filter_green_artifacts(day_table_raw, green_artifact_threshold)
+-        if day_table.empty and not day_table_raw.empty:
+-            day_table = day_table_raw.copy()
+-            excluded_count = 0
+-        excluded_total += excluded_count
++        day_table, excluded_count = day_table_raw, 0
+         if not day_table.empty:
+             x_min = min(x_min, float(day_table["red"].min()))
+             x_max = max(x_max, float(day_table["red"].max()))
+@@ -878,51 +894,7 @@ def plot_wrapped_daywise_linear_relationships(
+             y_low = np.asarray([], dtype=float)
+             y_high = np.asarray([], dtype=float)
+ 
+-        if "track_match_source" in day_table.columns:
+-            consensus = day_table["track_match_source"].eq("consensus")
+-            graph_only = day_table["track_match_source"].eq("graph_only")
+-            other = ~(consensus | graph_only)
+-            axis.scatter(
+-                day_table.loc[consensus, "red"],
+-                day_table.loc[consensus, "green"],
+-                s=10,
+-                alpha=0.22,
+-                color="#1f3b4d",
+-                edgecolors="none",
+-                rasterized=True,
+-                label="Consensus",
+-            )
+-            axis.scatter(
+-                day_table.loc[graph_only, "red"],
+-                day_table.loc[graph_only, "green"],
+-                s=18,
+-                alpha=0.70,
+-                facecolors="none",
+-                edgecolors="#d97706",
+-                linewidths=0.7,
+-                rasterized=True,
+-                label="Graph only",
+-            )
+-            if other.any():
+-                axis.scatter(
+-                    day_table.loc[other, "red"],
+-                    day_table.loc[other, "green"],
+-                    s=9,
+-                    alpha=0.18,
+-                    color="0.5",
+-                    edgecolors="none",
+-                    rasterized=True,
+-                )
+-        else:
+-            axis.scatter(
+-                x_values,
+-                y_values,
+-                s=10,
+-                alpha=0.2,
+-                color="#1f3b4d",
+-                edgecolors="none",
+-                rasterized=True,
+-            )
++        axis.scatter(x_values, y_values, s=10, alpha=0.2, color="#1f3b4d", edgecolors="none", rasterized=True)
+ 
+         if len(x_grid) > 0 and np.all(np.isfinite(y_hat)):
+             if np.all(np.isfinite(y_low)) and np.all(np.isfinite(y_high)):
+@@ -937,22 +909,6 @@ def plot_wrapped_daywise_linear_relationships(
+             axis.plot(x_grid, y_hat, color="#d62828", linewidth=1.8)
+ 
+         date_label = _actual_date_label(day_table, day_value, start_date)
+-        consensus_n = int(
+-            day_table.get("track_match_source", pd.Series(dtype=str)).eq("consensus").sum()
+-        )
+-        graph_only_n = int(
+-            day_table.get("track_match_source", pd.Series(dtype=str)).eq("graph_only").sum()
+-        )
+-        source_text = (
+-            f"\nconsensus={consensus_n}, graph-only={graph_only_n}"
+-            if "track_match_source" in day_table.columns
+-            else ""
+-        )
+-        artifact_text = (
+-            f"\nexcluded green>{green_artifact_threshold:g}: {excluded_count}"
+-            if excluded_count
+-            else ""
+-        )
+         axis.set_title(f"Session {day_value} | {date_label}", fontsize=10)
+         axis.set_xlabel("Corrected red", fontsize=9)
+         axis.set_ylabel("Corrected green", fontsize=9)
+@@ -963,7 +919,7 @@ def plot_wrapped_daywise_linear_relationships(
+             (
+                 f"slope={fit_row['slope']:.3f}\n"
+                 f"R²={fit_row['r_squared']:.3f}\n"
+-                f"n={int(fit_row['n_rois'])}{source_text}{artifact_text}"
++                f"n={int(fit_row['n_rois'])}"
+             ),
+             transform=axis.transAxes,
+             ha="left",
+@@ -986,7 +942,7 @@ def plot_wrapped_daywise_linear_relationships(
+     if handles:
+         figure.legend(handles, labels, loc="upper right", frameon=False)
+     figure.suptitle(
+-        "Daywise corrected red-green relationships: graph final assignments",
++        "Daywise corrected red-green relationships: all signal-valid native session ROIs",
+         fontsize=14,
+         y=0.995,
+     )
+@@ -994,8 +950,8 @@ def plot_wrapped_daywise_linear_relationships(
+         0.5,
+         0.01,
+         (
+-            f"Green values above {green_artifact_threshold:g} were excluded from the fit; "
+-            f"total excluded rows = {excluded_total}."
++            "Points are all signal-valid native session ROIs; the red line is the "
++            "saved canonical session-population fit."
+         ),
+         ha="center",
+         va="bottom",
+@@ -1101,7 +1057,7 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
+         )
+         acquisition_table.to_csv(run_dir / "acquisition_settings_by_session.csv", index=False)
+         _write_json(run_dir / "acquisition_settings_qc.json", acquisition_qc)
+-        if config.require_acquisition_settings_consistent and acquisition_qc["status"] == "warning":
++        if config.require_acquisition_settings_consistent and acquisition_qc["changed_required_fields"]:
+             raise ValueError("Required acquisition settings changed across selected sessions: " + ", ".join(acquisition_qc["changed_required_fields"]))
+     else:
+         acquisition_table, acquisition_qc = acquisition_settings_qc([], [], 1050)
+@@ -1207,11 +1163,7 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
+     _log(start_seconds, "Annotating graph tracks by agreement with balanced affine matches")
+     agreement_summary = annotate_graph_affine_agreement(match_dir)
+ 
+-    required_extraction_files = [
+-        extraction_dir / "matched_roi_log_ratio_metrics_complete.csv",
+-        extraction_dir / "matched_daywise_green_red_linear_fit_summary.csv",
+-    ]
+-    if config.resume and all(path.exists() for path in required_extraction_files):
++    if config.resume and _has_current_extraction(extraction_dir):
+         _log(start_seconds, f"Reusing existing extraction output: {extraction_dir}")
+     else:
+         _log(start_seconds, "Extracting graph-policy matched ROI intensities")
+diff --git a/core/run_daywise_matched_roi_pipeline.py b/core/run_daywise_matched_roi_pipeline.py
+index 2fde6b0..c62c059 100644
+--- a/core/run_daywise_matched_roi_pipeline.py
++++ b/core/run_daywise_matched_roi_pipeline.py
+@@ -1002,6 +1002,10 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
+     metrics_table = _concat("metrics_table")
+     all_metrics_table = _concat("all_metrics_table")
+     sensitivity_fit_summary = _concat("fit_summary")
++    fit_metadata = session_population[["day", "session_index", "session_id", "acquisition_date", "elapsed_days"]].drop_duplicates("day")
++    sensitivity_fit_summary = sensitivity_fit_summary.merge(
++        fit_metadata, on="day", how="left", validate="many_to_one"
++    )
+     sensitivity_residual_table = _concat("residual_table")
+     geometry_long = _concat("geometry_long")
+     matched_tracks = _concat("matched_tracks")
+diff --git a/core/session_population_normalization.py b/core/session_population_normalization.py
+index 92f0243..50017e0 100644
+--- a/core/session_population_normalization.py
++++ b/core/session_population_normalization.py
+@@ -6,13 +6,7 @@ import numpy as np
+ import pandas as pd
+ import tifffile
+ 
+-from roi_log_ratio_analysis import (
+-    apply_channel_dark_correction,
+-    compute_log_ratio_metrics,
+-    extract_roi_mean_intensities,
+-    summarize_daily_green_red_linear_fits,
+-    wide_table_from_long_table,
+-)
++from roi_log_ratio_analysis import compute_log_ratio_metrics, extract_roi_mean_intensities, summarize_daily_green_red_linear_fits
+ 
+ 
+ def extract_session_population(records, *, green_dark: float, red_dark: float, epsilon: float) -> pd.DataFrame:
+@@ -22,43 +16,31 @@ def extract_session_population(records, *, green_dark: float, red_dark: float, e
+     for record in required:
+         mask = tifffile.imread(record.mask_path)
+         labels = pd.DataFrame({"mask_label": np.unique(mask[mask > 0]).astype(int)})
++        labels["session_index"] = int(record.session_index)
++        labels["day"] = int(record.session_index)
++        labels["session_id"] = str(record.session_id)
++        labels["acquisition_date"] = record.acquisition_date.isoformat()
++        labels["elapsed_days"] = int((record.acquisition_date - start_date).days)
+         for channel, path, dark in (
+             ("red", record.red_image_path, red_dark),
+             ("green", record.green_image_path, green_dark),
+         ):
+             extracted = pd.DataFrame(extract_roi_mean_intensities(tifffile.imread(path), mask, exclude_zero_pixels=True))
+-            extracted = extracted.rename(columns={"roi_id": "mask_label"})
+-            table = labels.merge(extracted, on="mask_label", how="left", validate="one_to_one")
+-            table["channel"] = channel
+-            table["roi_id"] = table["mask_label"]
+-            table["image"] = path.name
+-            table["zero_hit_pass"] = table["mean_intensity"].notna()
+-            table["dark_value"] = float(dark)
+-            table["session_index"] = int(record.session_index)
+-            table["day"] = int(record.session_index)
+-            table["session_id"] = str(record.session_id)
+-            table["acquisition_date"] = record.acquisition_date.isoformat()
+-            table["elapsed_days"] = int((record.acquisition_date - start_date).days)
+-            rows.append(table)
+-    long = pd.concat(rows, ignore_index=True)
+-    corrected = apply_channel_dark_correction(
+-        long, green_dark=green_dark, red_dark=red_dark,
+-        intensity_column="mean_intensity", corrected_column="mean_intensity_corrected",
+-        clip_floor=None,
+-    )
+-    wide = wide_table_from_long_table(corrected, intensity_column="mean_intensity_corrected")
+-    metadata = corrected.pivot_table(
+-        index=["day", "mask_label"], columns="channel",
+-        values=["mean_intensity", "dark_value", "zero_hit_pass"], aggfunc="first",
+-    )
+-    metadata.columns = [f"{channel}_{name if name != 'mean_intensity' else 'raw'}" for name, channel in metadata.columns]
+-    metadata = metadata.reset_index()
+-    session_meta = corrected[["day", "session_index", "session_id", "acquisition_date", "elapsed_days"]].drop_duplicates()
+-    wide = wide.rename(columns={"roi_id": "mask_label"}).merge(metadata, on=["day", "mask_label"]).merge(session_meta, on="day")
+-    wide["roi_id"] = wide["mask_label"]
++            if not extracted.empty:
++                extracted = extracted.rename(columns={"roi_id": "mask_label", "mean_intensity": f"{channel}_raw"})
++                labels = labels.merge(extracted[["mask_label", f"{channel}_raw"]], on="mask_label", how="left", validate="one_to_one")
++            else:
++                labels[f"{channel}_raw"] = np.nan
++            labels[f"{channel}_dark_value"] = float(dark)
++            labels[f"{channel}_zero_hit_pass"] = labels[f"{channel}_raw"].notna()
++            labels[channel] = labels[f"{channel}_raw"] - float(dark)
++        rows.append(labels)
++    wide = pd.concat(rows, ignore_index=True)
+     wide["session_roi_label"] = wide["mask_label"]
++    wide["__session_native_roi_key"] = wide["session_id"].astype(str) + "::" + wide["mask_label"].astype(str)
++    wide["roi_id"] = wide["__session_native_roi_key"]
+     metrics = compute_log_ratio_metrics(wide, epsilon=epsilon)
+-    return metrics.drop(columns=[column for column in metrics if column.startswith("day0_") or "first_observed" in column or column.startswith("delta_")])
++    return metrics.drop(columns=["roi_id", "__session_native_roi_key"] + [column for column in metrics if column.startswith("day0_") or "first_observed" in column or column.startswith("delta_")])
+ 
+ 
+ def fit_session_population(population: pd.DataFrame) -> pd.DataFrame:
+@@ -76,6 +58,8 @@ def fit_session_population(population: pd.DataFrame) -> pd.DataFrame:
+             "residual_std_fit_population": float(residuals.std(ddof=1)),
+         })
+     fits = fits.merge(pd.DataFrame(diagnostics), on="day", validate="one_to_one")
++    metadata = population[["day", "session_index", "session_id", "acquisition_date", "elapsed_days"]].drop_duplicates("day")
++    fits = fits.merge(metadata, on="day", how="left", validate="one_to_one")
+     fits["normalization_population"] = "all_valid_session_rois"
+     return fits
+ 
+diff --git a/docs/daywise_pipeline.md b/docs/daywise_pipeline.md
+index 4e3ac0f..67ce74c 100644
+--- a/docs/daywise_pipeline.md
++++ b/docs/daywise_pipeline.md
+@@ -29,3 +29,5 @@ Trajectory eligibility is a downstream identity/coverage criterion and does not
+ Standard PCA complete-case matrices are centered across the actual PCA cell population. Partial-track matrices preserve `NaN` and are not imputed or variance-scaled automatically.
+ 
+ Cross-laser 920/1050 correspondence is a validation layer and is not required for inclusion in the primary 1050 longitudinal trajectory analysis.
++
++Project-mode master runs also write `acquisition_settings_by_session.csv` and `acquisition_settings_qc.json` for the selected sessions. Changes warn by default; `--require-acquisition-settings-consistent` stops before matching when a required numeric setting changes. Resume reuses extraction only when its `run_log.json` proves v0.3 normalization provenance and all required v0.3 outputs exist.
+diff --git a/plotting/cross_laser_roi_qc.py b/plotting/cross_laser_roi_qc.py
+index 0114b6f..34a3258 100644
+--- a/plotting/cross_laser_roi_qc.py
++++ b/plotting/cross_laser_roi_qc.py
+@@ -125,10 +125,12 @@ def fixed_coverage_by_long_axis(
+             n_candidate_but_rejected=("_status", lambda values: int(values.eq("candidate_but_rejected").sum())),
+             n_no_candidate=("_status", lambda values: int(values.eq("no_candidate").sum())),
+             n_edge_clipped=("_edge", "sum"),
++            n_common_volume_partial=("common_volume_status", lambda values: int(values.astype(str).eq("partially_inside_common_volume").sum())),
+         )
+         .reset_index()
+     )
+     output = output.merge(total_by_bin, on="bin", how="left")
++    output["n_native_edge_clipped"] = output["n_edge_clipped"]
+     output["n_observable_1050"] = output["n_1050_observable"]
+     output["n_high"] = output["n_primary_high"]
+     for count, fraction in (
+@@ -145,10 +147,21 @@ def fixed_coverage_by_long_axis(
+ def moving_density_by_long_axis(moving_coverage: pd.DataFrame, *, image_shape_yx: tuple[int, int], bins: int = 5) -> pd.DataFrame:
+     """Count moving detections after mapping their centroids into fixed space."""
+     if moving_coverage.empty:
+-        return pd.DataFrame(columns=["bin", "n_920_detections"])
+-    moving = _with_long_axis_position(moving_coverage, image_shape_yx=image_shape_yx)
++        return pd.DataFrame(columns=["bin", "n_920_detections", "n_920_outside_fixed_xy"])
++    moving = moving_coverage.copy()
++    height, width = image_shape_yx
++    x = pd.to_numeric(moving["centroid_1050_x"], errors="coerce")
++    y = pd.to_numeric(moving["centroid_1050_y"], errors="coerce")
++    inside = x.between(0, width - 1) & y.between(0, height - 1)
++    outside_count = int((~inside).sum())
++    moving = moving.loc[inside].copy()
++    if moving.empty:
++        return pd.DataFrame({"bin": range(bins), "n_920_detections": 0, "n_920_outside_fixed_xy": outside_count})
++    moving = _with_long_axis_position(moving, image_shape_yx=image_shape_yx)
+     moving["bin"] = np.minimum((moving["long_axis_position_normalized"].clip(0, 0.999999) * bins).astype(int), bins - 1)
+-    return moving.groupby("bin", sort=True).size().rename("n_920_detections").reset_index()
++    output = moving.groupby("bin", sort=True).size().rename("n_920_detections").reset_index()
++    output["n_920_outside_fixed_xy"] = outside_count
++    return output
+ 
+ 
+ def source_comparison_counts(identity_resolution: pd.DataFrame) -> pd.DataFrame:
+@@ -258,6 +271,8 @@ def generate_cross_laser_qc(
+             coverage = coverage.merge(density, on="bin", how="left")
+             count = f"n_920_{source}_detections"
+             coverage[count] = coverage[count].fillna(0).astype(int)
++            outside = int(density.get("n_920_outside_fixed_xy", pd.Series([0])).iloc[0])
++            coverage[f"n_920_{source}_outside_fixed_xy"] = outside
+             coverage[f"920_{source}_to_1050_detection_count_ratio"] = coverage[count] / coverage["n_1050_observable"]
+     medians_path = root / "high_residual_long_axis_medians.csv"
+     coverage_path = root / "fixed_coverage_by_long_axis.csv"
+diff --git a/plotting/run_daywise_green_red_linear_fit_summary.py b/plotting/run_daywise_green_red_linear_fit_summary.py
+index 25e7ee3..b77ca27 100644
+--- a/plotting/run_daywise_green_red_linear_fit_summary.py
++++ b/plotting/run_daywise_green_red_linear_fit_summary.py
+@@ -229,20 +229,22 @@ def plot_daywise_scatter_summary(
+     start_date : str, default=None
+         Reference date used to convert day offsets into date labels.
+     green_artifact_threshold : float, default=1500.0
+-        Rows with corrected green values above this threshold are treated as
+-        artifacts and excluded from the fitted lines.
++        Retained for API compatibility; it does not alter a supplied canonical
++        fit or its display population.
+     """
+ 
+     if roi_metrics.empty:
+         raise ValueError("No ROI metrics were available for scatter plotting.")
+ 
+-    filtered_metrics, excluded_total = _filter_green_artifacts(
+-        roi_metrics,
+-        green_artifact_threshold=green_artifact_threshold,
+-    )
+-    if filtered_metrics.empty:
+-        raise ValueError("No ROI metrics remained after filtering green artifacts.")
+-    plot_fit_summary = summarize_daily_green_red_linear_fits(filtered_metrics)
++    plot_fit_summary = fit_summary.copy()
++    if {"red_signal_qc_pass", "green_signal_qc_pass"}.issubset(roi_metrics.columns):
++        roi_metrics = roi_metrics.loc[
++            roi_metrics["red_signal_qc_pass"].eq(True)
++            & roi_metrics["green_signal_qc_pass"].eq(True)
++        ].copy()
++    if roi_metrics.empty:
++        raise ValueError("No signal-valid ROI metrics were available for scatter plotting.")
++    excluded_total = 0
+     timing = resolve_plot_day_axis(roi_metrics, start_date=start_date)
+     source_to_plot = dict(zip(timing["source_day"], timing["plot_day"], strict=True))
+     source_to_date = dict(zip(timing["source_day"], timing["date_label"], strict=True))
+@@ -272,13 +274,7 @@ def plot_daywise_scatter_summary(
+             .dropna(subset=["red", "green"])
+             .reset_index(drop=True)
+         )
+-        filtered_day_table, excluded_count = _filter_green_artifacts(
+-            day_table,
+-            green_artifact_threshold=green_artifact_threshold,
+-        )
+-        if filtered_day_table.empty and not day_table.empty:
+-            filtered_day_table = day_table.copy()
+-            excluded_count = 0
++        filtered_day_table, excluded_count = day_table, 0
+         if not filtered_day_table.empty:
+             x_min = min(x_min, float(filtered_day_table["red"].min()))
+             x_max = max(x_max, float(filtered_day_table["red"].max()))
+@@ -300,17 +296,20 @@ def plot_daywise_scatter_summary(
+     for axis, (day_value, day_table, excluded_count), date_label in zip(
+         axes, panels, date_labels, strict=True
+     ):
++        fit_row = plot_fit_summary.loc[plot_fit_summary["day"].eq(day_value)].iloc[0]
+         x_values = day_table["red"].to_numpy(dtype=float)
+         y_values = day_table["green"].to_numpy(dtype=float)
+         if len(day_table) >= 2:
+-            x_grid, y_hat, y_low, y_high = compute_regression_ci_band(x_values, y_values)
++            x_grid = np.linspace(float(x_values.min()), float(x_values.max()), 200)
++            y_hat = float(fit_row["intercept"]) + float(fit_row["slope"]) * x_grid
++            y_low = np.asarray([], dtype=float)
++            y_high = np.asarray([], dtype=float)
+         else:
+             x_grid = np.asarray([], dtype=float)
+             y_hat = np.asarray([], dtype=float)
+             y_low = np.asarray([], dtype=float)
+             y_high = np.asarray([], dtype=float)
+ 
+-        fit_row = plot_fit_summary.loc[plot_fit_summary["day"].eq(day_value)].iloc[0]
+         axis.scatter(
+             x_values,
+             y_values,
+@@ -320,8 +319,7 @@ def plot_daywise_scatter_summary(
+             edgecolors="none",
+             rasterized=True,
+         )
+-        if len(x_grid) > 0 and np.all(np.isfinite(y_low)) and np.all(np.isfinite(y_high)):
+-            axis.fill_between(x_grid, y_low, y_high, color="#8ecae6", alpha=0.35, linewidth=0)
++        if len(x_grid) > 0:
+             axis.plot(x_grid, y_hat, color="#d62828", linewidth=2.0)
+ 
+         axis.set_title(f"Day {int(source_to_plot[int(day_value)])}\n{source_to_date[int(day_value)]}", fontsize=11)
+@@ -365,12 +363,9 @@ def plot_daywise_scatter_summary(
+         0.5,
+         0.02,
+         (
+-            "Each panel shows one imaging day from the current mean-merge SAM "
+-            "size+shape-filtered ROI set. The red line is the fitted linear "
+-            "relationship between corrected red and green values, and the blue "
+-            "band is the 95% confidence interval of the mean fit. "
+-            f"Green values above {green_artifact_threshold:g} were excluded from the fit; "
+-            f"total excluded rows = {excluded_total}."
++            "Each panel shows all signal-valid native session ROIs. The red line "
++            "is the saved canonical session-population fit; no display filter "
++            "recomputes or changes that fit."
+         ),
+         ha="center",
+         va="bottom",
+@@ -404,20 +399,15 @@ def plot_fit_parameter_summary(
+     start_date : str, default=None
+         Reference date used to convert day offsets into date labels.
+     green_artifact_threshold : float, default=1500.0
+-        Rows with corrected green values above this threshold are treated as
+-        artifacts and excluded from the plotted fit summary.
++        Retained for API compatibility; it does not alter a supplied fit.
+     """
+ 
+     plot_fit_summary = fit_summary.copy()
+-    excluded_total = 0
+-    if roi_metrics is not None and not roi_metrics.empty:
+-        filtered_metrics, excluded_total = _filter_green_artifacts(
+-            roi_metrics,
+-            green_artifact_threshold=green_artifact_threshold,
+-        )
+-        if not filtered_metrics.empty:
+-            plot_fit_summary = summarize_daily_green_red_linear_fits(filtered_metrics)
+-            roi_metrics = filtered_metrics
++    if roi_metrics is not None and {"red_signal_qc_pass", "green_signal_qc_pass"}.issubset(roi_metrics.columns):
++        roi_metrics = roi_metrics.loc[
++            roi_metrics["red_signal_qc_pass"].eq(True)
++            & roi_metrics["green_signal_qc_pass"].eq(True)
++        ].copy()
+ 
+     day_values = plot_fit_summary["day"].to_numpy(dtype=int)
+     date_labels = _resolve_day_date_labels(
+@@ -487,7 +477,7 @@ def plot_fit_parameter_summary(
+         edgecolor="#6c757d",
+     )
+     n_axis.set_title("ROI count by day", fontsize=11)
+-    n_axis.set_ylabel("Number of filtered ROIs", fontsize=10)
++    n_axis.set_ylabel("Number of fit-population ROIs", fontsize=10)
+ 
+     for axis in axes.ravel():
+         axis.set_xticks(x_positions, date_labels, rotation=30, ha="right")
+@@ -498,11 +488,9 @@ def plot_fit_parameter_summary(
+         0.5,
+         0.02,
+         (
+-            "This summary tracks how the fitted corrected green-vs-red "
+-            "relationship changes across imaging days for the current mean-merge "
+-            "SAM size+shape-filtered ROI set. "
+-            f"Green values above {green_artifact_threshold:g} were excluded from the plotted fit; "
+-            f"total excluded rows = {excluded_total}."
++            "This summary uses the saved canonical fit from all signal-valid "
++            "native session ROIs. Plotting does not refit or apply an artifact "
++            "threshold to the canonical fit."
+         ),
+         ha="center",
+         va="bottom",
+diff --git a/plotting/run_weekly_matched_output_quick_plots.py b/plotting/run_weekly_matched_output_quick_plots.py
+index 20ecec9..fa5ef6f 100644
+--- a/plotting/run_weekly_matched_output_quick_plots.py
++++ b/plotting/run_weekly_matched_output_quick_plots.py
+@@ -87,6 +87,17 @@ def _load_metrics_table(path: Path) -> pd.DataFrame:
+     return table
+ 
+ 
++def _load_native_fit_population(path: Path) -> pd.DataFrame:
++    table = pd.read_csv(path)
++    required = {"day", "session_id", "session_roi_label", "red", "green"}
++    missing = required.difference(table.columns)
++    if missing:
++        raise ValueError(f"Missing native fit-population columns in {path}: {sorted(missing)}")
++    if {"red_signal_qc_pass", "green_signal_qc_pass"}.issubset(table.columns):
++        table = table.loc[table["red_signal_qc_pass"].eq(True) & table["green_signal_qc_pass"].eq(True)].copy()
++    return table
++
++
+ def _load_fit_summary(path: Path) -> pd.DataFrame:
+     table = pd.read_csv(path)
+     required_columns = {"day", "slope", "intercept", "r_squared", "n_rois"}
+@@ -188,7 +199,11 @@ def build_quick_plots(
+ 
+     log_message(run_start_seconds, f"Loading saved matched tables from {analysis_dir}")
+     metrics_table = _filter_table_by_policy(_load_metrics_table(metrics_path), policy)
+-    fit_population = _filter_table_by_policy(_load_metrics_table(fit_population_path), policy)
++    fit_population = (
++        _load_native_fit_population(fit_population_path)
++        if fit_population_path.name == "matched_session_population_roi_metrics.csv"
++        else _filter_table_by_policy(_load_metrics_table(fit_population_path), policy)
++    )
+     residuals_table = _filter_table_by_policy(_load_metrics_table(residuals_path), policy)
+     fit_summary = _filter_table_by_policy(_load_fit_summary(fit_summary_path), policy)
+     unique_days = int(fit_summary["day"].nunique()) if not fit_summary.empty and "day" in fit_summary.columns else 0
+diff --git a/tests/test_acquisition_settings_qc.py b/tests/test_acquisition_settings_qc.py
+index e736124..cbaab0f 100644
+--- a/tests/test_acquisition_settings_qc.py
++++ b/tests/test_acquisition_settings_qc.py
+@@ -10,3 +10,27 @@ def test_selected_laser_acquisition_changes_warn() -> None:
+     assert table["session_id"].tolist() == ["s0", "s1"]
+     assert qc["status"] == "warning"
+     assert qc["changed_required_fields"] == ["pmt_a_gain"]
++
++
++def test_acquisition_qc_constant_and_nonselected_laser_change() -> None:
++    rows = [{"session_id": f"s{i}", "pmt_a_gain": 1, "pmt_b_gain": 2, "pockels_1050_start_pct": 3, "pockels_1050_stop_pct": 4, "pockels_920_start_pct": i, "pockels_920_stop_pct": i, "average_num": 2} for i in range(2)]
++    _, constant = acquisition_settings_qc(rows, ["s0", "s1"], 1050)
++    assert constant["status"] == "pass"
++    rows[1]["pockels_1050_stop_pct"] = 8
++    _, changed = acquisition_settings_qc(rows, ["s0", "s1"], 1050)
++    assert changed["status"] == "warning"
++    assert "pockels_1050_stop_pct" in changed["changed_required_fields"]
++    assert "pockels_920_start_pct" not in changed["changed_required_fields"]
++
++
++def test_acquisition_qc_only_uses_selected_subset() -> None:
++    rows = [{"session_id": "s0", "pmt_a_gain": 1}, {"session_id": "s1", "pmt_a_gain": 1}, {"session_id": "s2", "pmt_a_gain": 9}]
++    _, qc = acquisition_settings_qc(rows, ["s0", "s1"], 1050)
++    assert qc["status"] == "pass" and qc["n_sessions"] == 2
++
++
++def test_software_change_warns_but_is_not_strict_numeric_failure() -> None:
++    rows = [{"session_id": "s0", "pmt_a_gain": 1, "pmt_b_gain": 2, "pockels_1050_start_pct": 3, "pockels_1050_stop_pct": 4, "average_num": 2, "software_version": "a"}, {"session_id": "s1", "pmt_a_gain": 1, "pmt_b_gain": 2, "pockels_1050_start_pct": 3, "pockels_1050_stop_pct": 4, "average_num": 2, "software_version": "b"}]
++    _, qc = acquisition_settings_qc(rows, ["s0", "s1"], 1050)
++    assert qc["status"] == "warning"
++    assert qc["changed_required_fields"] == []
+diff --git a/tests/test_cross_laser_roi_qc.py b/tests/test_cross_laser_roi_qc.py
+index a2cdf5f..257cf56 100644
+--- a/tests/test_cross_laser_roi_qc.py
++++ b/tests/test_cross_laser_roi_qc.py
+@@ -8,6 +8,7 @@ from cross_laser_roi_qc import (
+     fixed_coverage_by_long_axis,
+     generate_cross_laser_qc,
+     high_confidence_long_axis_statistics,
++    moving_density_by_long_axis,
+     select_cross_laser_examples,
+ )
+ 
+@@ -69,6 +70,13 @@ def test_high_scatter_and_bin_medians_use_exact_same_high_population() -> None:
+     assert medians.loc[medians["bin"].eq(0), "median_raw_delta_z_planes"].item() == 2.0
+ 
+ 
++def test_moving_density_excludes_centroids_outside_fixed_xy() -> None:
++    moving = pd.DataFrame({"centroid_1050_x": [-1, 2, 11], "centroid_1050_y": [2, 2, 2]})
++    density = moving_density_by_long_axis(moving, image_shape_yx=(10, 10), bins=2)
++    assert int(density["n_920_detections"].sum()) == 1
++    assert int(density["n_920_outside_fixed_xy"].iloc[0]) == 2
++
++
+ def test_example_selection_is_deterministic_and_spatially_distributed() -> None:
+     rows = pd.DataFrame(
+         {
+diff --git a/tests/test_run_daywise_master_pipeline.py b/tests/test_run_daywise_master_pipeline.py
+index db56b4f..3eab15c 100644
+--- a/tests/test_run_daywise_master_pipeline.py
++++ b/tests/test_run_daywise_master_pipeline.py
+@@ -14,6 +14,7 @@ from run_daywise_master_pipeline import (
+     _select_session_records,
+     _session_selection_provenance,
+     _verify_resume_session_selection,
++    _has_current_extraction,
+     _write_selected_session_manifest,
+     parse_args,
+ )
+@@ -40,6 +41,20 @@ def test_run_daywise_master_pipeline_parse_args_and_defaults() -> None:
+     assert args.sessions is None
+     assert args.skip_ranked_roi_views is False
+     assert args.ranked_roi_z_radius == 3
++    assert args.trajectory_min_sessions == 2
++    assert args.require_acquisition_settings_consistent is False
++
++
++def test_resume_requires_current_normalization_provenance(tmp_path: Path) -> None:
++    extraction = tmp_path / "extraction"
++    extraction.mkdir()
++    for name in ("matched_roi_log_ratio_metrics_complete.csv", "matched_daywise_green_red_linear_fit_summary.csv"):
++        (extraction / name).touch()
++    assert not _has_current_extraction(extraction)
++    (extraction / "run_log.json").write_text(json.dumps({"analysis_version": "0.3.0", "normalization": {"population": "all_valid_session_rois"}}))
++    for name in ("matched_session_population_roi_metrics.csv", "matched_session_population_signal_qc_summary.csv", "matched_roi_metrics_with_session_normalized_residuals_all_observed.csv", "matched_roi_trajectory_eligibility.csv"):
++        (extraction / name).touch()
++    assert _has_current_extraction(extraction)
+ 
+ 
+ def test_run_daywise_master_pipeline_config_defaults() -> None:
+diff --git a/tests/test_run_weekly_matched_output_quick_plots.py b/tests/test_run_weekly_matched_output_quick_plots.py
+index 96f8405..ef351b2 100644
+--- a/tests/test_run_weekly_matched_output_quick_plots.py
++++ b/tests/test_run_weekly_matched_output_quick_plots.py
+@@ -5,6 +5,7 @@ from pathlib import Path
+ import pandas as pd
+ 
+ from run_weekly_matched_output_quick_plots import _filter_table_by_policy, _resolve_output_dir
++import run_daywise_green_red_linear_fit_summary as fit_plots
+ from run_ranked_roi_quick_views import _resolve_run_inputs
+ from roi_log_ratio_analysis import select_top_changing_rois
+ 
+@@ -73,3 +74,20 @@ def test_final_directional_ranking_is_sign_correct_and_not_random() -> None:
+     assert decreasing.roi_id.tolist() == [2]
+     assert set(increasing.selection_mode) == {"final"}
+     assert set(decreasing.selection_metric_column) == {"day_last_delta_log2_green_over_red"}
++
++
++def test_fit_plots_use_supplied_summary_without_refitting(tmp_path: Path, monkeypatch) -> None:
++    metrics = pd.DataFrame({
++        "day": [0, 0, 1, 1], "session_id": ["s0"] * 2 + ["s1"] * 2,
++        "red": [1., 2., 1., 2.], "green": [1., 2., 1., 2.],
++        "red_signal_qc_pass": [True] * 4, "green_signal_qc_pass": [True] * 4,
++        "acquisition_date": ["2026-01-01"] * 2 + ["2026-01-03"] * 2,
++    })
++    fits = pd.DataFrame({
++        "day": [0, 1], "slope": [9., 9.], "intercept": [0., 0.], "r_squared": [0.1, 0.1], "n_rois": [2, 2],
++        "slope_ci_low": [8., 8.], "slope_ci_high": [10., 10.], "intercept_ci_low": [-1., -1.], "intercept_ci_high": [1., 1.],
++    })
++    monkeypatch.setattr(fit_plots, "summarize_daily_green_red_linear_fits", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected refit")))
++    fit_plots.plot_daywise_scatter_summary(metrics, fits, tmp_path / "scatter.png", start_date="20260101")
++    fit_plots.plot_fit_parameter_summary(fits, tmp_path / "params.png", roi_metrics=metrics, start_date="20260101")
++    assert (tmp_path / "scatter.png").is_file() and (tmp_path / "params.png").is_file()
+diff --git a/tests/test_session_population_normalization.py b/tests/test_session_population_normalization.py
+new file mode 100644
+index 0000000..4abb768
+--- /dev/null
++++ b/tests/test_session_population_normalization.py
+@@ -0,0 +1,37 @@
++from datetime import date
++
++import numpy as np
++import pandas as pd
++import tifffile
++
++from session_manifest import SessionRecord
++from session_population_normalization import extract_session_population, summarize_signal_qc
++
++
++def _write_session(tmp_path, session_id, red, green):
++    mask = np.array([[[1, 2]]], dtype=np.uint16)
++    mask_path = tmp_path / f"{session_id}_mask.tif"
++    red_path = tmp_path / f"{session_id}_red.tif"
++    green_path = tmp_path / f"{session_id}_green.tif"
++    tifffile.imwrite(mask_path, mask)
++    tifffile.imwrite(red_path, np.array([[[red[0], red[1]]]], dtype=np.uint16))
++    tifffile.imwrite(green_path, np.array([[[green[0], green[1]]]], dtype=np.uint16))
++    return SessionRecord(0, session_id, date(2026, 1, 1), mask_path, red_path, green_path)
++
++
++def test_native_population_keeps_both_channel_zero_hit_and_has_no_longitudinal_id(tmp_path):
++    first = _write_session(tmp_path, "s0", (10, 0), (20, 0))
++    second = _write_session(tmp_path, "s1", (10, 30), (20, 0))
++    second = SessionRecord(1, "s1", date(2026, 1, 2), second.mask_path, second.red_image_path, second.green_image_path)
++    population = extract_session_population([first, second], green_dark=0, red_dark=0, epsilon=1)
++
++    assert len(population) == 4
++    assert "roi_id" not in population.columns
++    assert set(zip(population.session_id, population.session_roi_label)) == {("s0", 1), ("s0", 2), ("s1", 1), ("s1", 2)}
++    zero_hit = population.loc[(population.session_id == "s0") & (population.session_roi_label == 2)].iloc[0]
++    assert pd.isna(zero_hit.red) and pd.isna(zero_hit.green)
++    assert not bool(zero_hit.red_zero_hit_pass) and not bool(zero_hit.green_zero_hit_pass)
++    assert not bool(zero_hit.ratio_qc_pass)
++    qc = summarize_signal_qc(population).set_index("session_id")
++    assert qc.loc["s0", "n_native_rois"] == 2
++    assert qc.loc["s0", "n_ratio_valid"] == 1
+diff --git a/tests/test_trajectory_eligibility.py b/tests/test_trajectory_eligibility.py
+index 1f9bf56..6b16563 100644
+--- a/tests/test_trajectory_eligibility.py
++++ b/tests/test_trajectory_eligibility.py
+@@ -19,3 +19,17 @@ def test_eligibility_and_centering_preserve_missingness() -> None:
+     assert np.allclose(centered.mean(), 0)
+     assert np.array_equal(matrices["mask"][["s0", "s1", "s2"]].to_numpy(), matrices["raw"][["s0", "s1", "s2"]].notna().astype(int).to_numpy())
+     assert matrices["complete_centered"][["s0", "s1", "s2"]].isna().sum().sum() == 0
++
++
++def test_signal_invalid_is_not_tracking_missingness() -> None:
++    observations = pd.DataFrame([
++        {"track_uid": "d", "roi_id": 4, "session_index": i, "session_id": f"s{i}", "elapsed_days": i, "ratio_qc_pass": i != 1, "green_fit_signed_distance": float(i) if i != 1 else np.nan}
++        for i in range(3)
++    ])
++    tracks = pd.DataFrame({"track_uid": ["d"], "roi_id": [4], "cluster_id": [4], "has_cycle_conflict": [False]})
++    eligibility, _ = build_trajectory_eligibility(observations, tracks, ["s0", "s1", "s2"], TrajectoryEligibilityConfig(min_sessions=2))
++    row = eligibility.iloc[0]
++    assert row["n_track_labels_present"] == 3
++    assert row["n_signal_valid_sessions"] == 2
++    assert row["n_usable_trajectory_sessions"] == 2
++    assert row["n_track_present_but_signal_invalid"] == 1
+-- 
+2.39.3 (Apple Git-146)
+

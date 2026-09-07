@@ -71,6 +71,7 @@ from session_manifest import SessionRecord, load_session_manifest
 
 
 MASTER_RUNNER_VERSION = "daywise_master_graph_affine_consensus_v1"
+MIN_REUSABLE_EXTRACTION_VERSION = (0, 3, 1)
 AGREEMENT_COLUMNS = [
     "track_match_source",
     "n_accepted_graph_edges",
@@ -419,7 +420,7 @@ def _has_current_extraction(extraction_dir: Path) -> bool:
         version = tuple(int(part) for part in str(payload.get("analysis_version", "0.0.0")).split(".")[:3])
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return False
-    return version >= (0, 3, 0) and payload.get("normalization", {}).get("population") == "all_valid_session_rois"
+    return version >= MIN_REUSABLE_EXTRACTION_VERSION and payload.get("normalization", {}).get("population") == "all_valid_session_rois"
 
 
 def _verify_resume_session_selection(

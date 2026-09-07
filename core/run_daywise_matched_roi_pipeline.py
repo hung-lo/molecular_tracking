@@ -42,7 +42,7 @@ from session_population_normalization import extract_session_population, fit_ses
 from trajectory_eligibility import TrajectoryEligibilityConfig, build_trajectory_eligibility, build_trajectory_matrices
 from match_policy_registry import DEFAULT_ANALYSIS_POLICIES, SUPPORTED_MATCH_POLICIES, resolve_requested_policies
 
-ANALYSIS_VERSION = "0.3.0"
+ANALYSIS_VERSION = "0.3.1"
 
 
 @dataclass(frozen=True)

@@ -58,10 +58,9 @@ for _import_dir in (
 
 from affine_overlap_matcher import AffineOverlapParams, VoxelSpacing
 from analysis_paths import get_dataset_analysis_dir, resolve_dataset_dir
+from acquisition_settings_qc import acquisition_settings_qc
 from project_cli import catalog_path, catalog_spacing, file_sha256, ready_manifest_path, resolve_selection, selected_catalog_rows, selected_mouse_metadata
 from run_daywise_graph_matching import run_daywise_graph_matching
-from run_daywise_green_red_linear_fit_summary import compute_regression_ci_band
-from roi_log_ratio_analysis import summarize_daily_green_red_linear_fits
 from run_daywise_matched_roi_pipeline import (
     DaywiseMatchedPipelineConfig,
     run_daywise_matched_roi_pipeline,
@@ -120,6 +119,13 @@ class MasterPipelineConfig:
     exclude_z_edge: bool = False
     max_volume_ratio_from_track_median: float | None = None
     sessions: str | None = None
+    trajectory_min_sessions: int = 2
+    trajectory_min_session_fraction: float | None = None
+    trajectory_max_internal_missing_sessions: int | None = None
+    trajectory_require_first_session: bool = False
+    trajectory_require_last_session: bool = False
+    require_acquisition_settings_consistent: bool = False
+    acquisition_settings_rows: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -811,7 +817,7 @@ def plot_wrapped_daywise_linear_relationships(
     if metrics.empty:
         raise ValueError("No graph-policy metrics were available for wrapped linear-fit plotting.")
 
-    fit_summary = summarize_daily_green_red_linear_fits(metrics)
+    fit_summary = _read_csv(fit_summary_path)
     fit_summary["day"] = pd.to_numeric(fit_summary["day"], errors="raise").astype(int)
     day_values = sorted(fit_summary["day"].unique().tolist())
     n_columns = min(max(1, int(max_columns)), len(day_values))
@@ -860,15 +866,18 @@ def plot_wrapped_daywise_linear_relationships(
     for axis, (day_value, day_table, excluded_count) in zip(flat_axes, panels, strict=False):
         x_values = day_table["red"].to_numpy(dtype=float)
         y_values = day_table["green"].to_numpy(dtype=float)
+        fit_row = fit_summary.loc[fit_summary["day"].eq(day_value)].iloc[0]
         if len(day_table) >= 2:
-            x_grid, y_hat, y_low, y_high = compute_regression_ci_band(x_values, y_values)
+            x_grid = np.linspace(float(x_values.min()), float(x_values.max()), 200)
+            y_hat = float(fit_row["intercept"]) + float(fit_row["slope"]) * x_grid
+            y_low = np.asarray([], dtype=float)
+            y_high = np.asarray([], dtype=float)
         else:
             x_grid = np.asarray([], dtype=float)
             y_hat = np.asarray([], dtype=float)
             y_low = np.asarray([], dtype=float)
             y_high = np.asarray([], dtype=float)
 
-        fit_row = fit_summary.loc[fit_summary["day"].eq(day_value)].iloc[0]
         if "track_match_source" in day_table.columns:
             consensus = day_table["track_match_source"].eq("consensus")
             graph_only = day_table["track_match_source"].eq("graph_only")
@@ -1013,6 +1022,7 @@ def _write_master_summary(
     plots_dir: Path,
     ranked_roi_views_dir: Path | None,
 ) -> None:
+    acquisition_status = json.loads((run_dir / "acquisition_settings_qc.json").read_text(encoding="utf-8"))["status"]
     selection_label = selection.raw if selection.mode != "all" else "all"
     selected_ids = ", ".join(selected_meta["session_ids"])
     lines = [
@@ -1027,6 +1037,7 @@ def _write_master_summary(
         f"- Selected session IDs: `{selected_ids}`",
         f"- Final assignment policy: `graph`",
         f"- Agreement comparison policy: `balanced` affine-overlap",
+        f"- Acquisition settings QC: `{acquisition_status}`",
         "",
         "## Agreement rule",
         "",
@@ -1081,6 +1092,21 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
     run_dir, match_dir, extraction_dir, plots_dir = _prepare_run_directory(
         config, manifest_meta=selected_meta, selection=selection
     )
+
+    if config.mode == "project":
+        acquisition_table, acquisition_qc = acquisition_settings_qc(
+            list(config.acquisition_settings_rows),
+            [str(record.session_id) for record in selected_records],
+            int((config.project_provenance or {})["laser_nm"]),
+        )
+        acquisition_table.to_csv(run_dir / "acquisition_settings_by_session.csv", index=False)
+        _write_json(run_dir / "acquisition_settings_qc.json", acquisition_qc)
+        if config.require_acquisition_settings_consistent and acquisition_qc["status"] == "warning":
+            raise ValueError("Required acquisition settings changed across selected sessions: " + ", ".join(acquisition_qc["changed_required_fields"]))
+    else:
+        acquisition_table, acquisition_qc = acquisition_settings_qc([], [], 1050)
+        acquisition_table.to_csv(run_dir / "acquisition_settings_by_session.csv", index=False)
+        _write_json(run_dir / "acquisition_settings_qc.json", acquisition_qc)
 
     source_manifest_sha256 = file_sha256(source_manifest_path)
     selected_manifest_path = run_dir / "selected_session_manifest.csv"
@@ -1212,6 +1238,11 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
                 max_volume_ratio_from_track_median=(
                     config.max_volume_ratio_from_track_median
                 ),
+                trajectory_min_sessions=config.trajectory_min_sessions,
+                trajectory_min_session_fraction=config.trajectory_min_session_fraction,
+                trajectory_max_internal_missing_sessions=config.trajectory_max_internal_missing_sessions,
+                trajectory_require_first_session=config.trajectory_require_first_session,
+                trajectory_require_last_session=config.trajectory_require_last_session,
             )
         )
         extraction_dir = _relocate_extraction_output(
@@ -1257,7 +1288,7 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         / f"daywise_green_red_linear_fit_scatters_wrapped_{int(config.plot_columns)}cols.png"
     )
     plot_wrapped_daywise_linear_relationships(
-        metrics_path=extraction_dir / "matched_roi_log_ratio_metrics_complete.csv",
+            metrics_path=extraction_dir / "matched_session_population_roi_metrics.csv",
         fit_summary_path=(
             extraction_dir / "matched_daywise_green_red_linear_fit_summary.csv"
         ),
@@ -1275,6 +1306,8 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         "extraction_dir": str(extraction_dir),
         "plots_dir": str(plots_dir),
         "wrapped_linear_fit_plot": str(wrapped_plot_path),
+        "acquisition_settings_by_session": str(run_dir / "acquisition_settings_by_session.csv"),
+        "acquisition_settings_qc": str(run_dir / "acquisition_settings_qc.json"),
         "ranked_roi_views_dir": (
             str(ranked_roi_views_dir) if ranked_roi_views_dir is not None else None
         ),
@@ -1314,6 +1347,7 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         "agreement": agreement_summary,
         "extraction_annotation": extraction_annotation,
         "outputs": outputs,
+        "acquisition_settings_qc": acquisition_qc,
     }
     _write_json(run_dir / "run_manifest.json", run_manifest)
     _write_master_summary(
@@ -1396,6 +1430,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--exclude-xy-edge", action="store_true")
     parser.add_argument("--exclude-z-edge", action="store_true")
     parser.add_argument("--max-volume-ratio-from-track-median", type=float, default=None)
+    parser.add_argument("--trajectory-min-sessions", type=int, default=2)
+    parser.add_argument("--trajectory-min-session-fraction", type=float, default=None)
+    parser.add_argument("--trajectory-max-internal-missing-sessions", type=int, default=None)
+    parser.add_argument("--trajectory-require-first-session", action="store_true")
+    parser.add_argument("--trajectory-require-last-session", action="store_true")
+    parser.add_argument("--require-acquisition-settings-consistent", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -1470,6 +1510,13 @@ def main(argv: list[str] | None = None) -> Path:
         exclude_xy_edge=bool(args.exclude_xy_edge),
         exclude_z_edge=bool(args.exclude_z_edge),
         max_volume_ratio_from_track_median=args.max_volume_ratio_from_track_median,
+        trajectory_min_sessions=args.trajectory_min_sessions,
+        trajectory_min_session_fraction=args.trajectory_min_session_fraction,
+        trajectory_max_internal_missing_sessions=args.trajectory_max_internal_missing_sessions,
+        trajectory_require_first_session=bool(args.trajectory_require_first_session),
+        trajectory_require_last_session=bool(args.trajectory_require_last_session),
+        require_acquisition_settings_consistent=bool(args.require_acquisition_settings_consistent),
+        acquisition_settings_rows=tuple(selected_rows) if context.mode == "project" else (),
     )
     return run_master_pipeline(config)
 

@@ -38,9 +38,11 @@ from roi_log_ratio_analysis import (
     wide_table_from_long_table,
 )
 from session_manifest import SessionRecord, load_session_manifest, validate_manifest_for_intensity
+from session_population_normalization import extract_session_population, fit_session_population, summarize_signal_qc
+from trajectory_eligibility import TrajectoryEligibilityConfig, build_trajectory_eligibility, build_trajectory_matrices
 from match_policy_registry import DEFAULT_ANALYSIS_POLICIES, SUPPORTED_MATCH_POLICIES, resolve_requested_policies
 
-ANALYSIS_VERSION = "0.2.0"
+ANALYSIS_VERSION = "0.3.0"
 
 
 @dataclass(frozen=True)
@@ -83,6 +85,11 @@ class DaywiseMatchedPipelineConfig:
     exclude_xy_edge: bool = False
     exclude_z_edge: bool = False
     max_volume_ratio_from_track_median: float | None = None
+    trajectory_min_sessions: int = 2
+    trajectory_min_session_fraction: float | None = None
+    trajectory_max_internal_missing_sessions: int | None = None
+    trajectory_require_first_session: bool = False
+    trajectory_require_last_session: bool = False
 
 
 def format_duration_seconds(duration_seconds: float) -> str:
@@ -490,7 +497,7 @@ def _track_geometry_summary(geometry_long: pd.DataFrame, qc_config: Segmentation
         required_group = group.loc[group["required"].astype(bool)].copy()
         n_required_sessions = int(required_group["session_id"].nunique())
         if not required_group.empty and "geometry_qc_pass" in required_group:
-            n_geometry_qc_pass = int(required_group["geometry_qc_pass"].fillna(False).astype(bool).sum())
+            n_geometry_qc_pass = int(required_group["geometry_qc_pass"].eq(True).sum())
         else:
             n_geometry_qc_pass = 0
         pass_fraction = float(n_geometry_qc_pass / n_required_sessions) if n_required_sessions > 0 else np.nan
@@ -630,6 +637,7 @@ def _policy_analysis(
         "roi_day_table": pd.DataFrame(),
         "complete_table": pd.DataFrame(),
         "metrics_table": pd.DataFrame(),
+        "all_metrics_table": pd.DataFrame(),
         "fit_summary": pd.DataFrame(),
         "residual_table": pd.DataFrame(),
         "residual_summary": pd.DataFrame(),
@@ -664,13 +672,16 @@ def _policy_analysis(
     fit_summary = pd.DataFrame()
     residual_table = pd.DataFrame()
     residual_summary = pd.DataFrame()
+    baseline_day = min(required_days)
+    all_metrics_table = compute_log_ratio_metrics(roi_day_table, epsilon=epsilon, baseline_day=baseline_day)
     if not complete_table.empty:
-        metrics_table = compute_log_ratio_metrics(complete_table, epsilon=epsilon)
+        metrics_table = compute_log_ratio_metrics(complete_table, epsilon=epsilon, baseline_day=baseline_day)
         fit_summary = summarize_daily_green_red_linear_fits(metrics_table)
         fit_summary.insert(0, "match_policy", policy)
         residual_table = compute_green_red_fit_residuals(
             metrics_table,
             fit_summary=fit_summary.drop(columns=["match_policy"]),
+            baseline_day=baseline_day,
         )
         residual_summary = summarize_residual_sign_changes(residual_table)
         residual_summary = residual_summary.merge(
@@ -708,7 +719,7 @@ def _policy_analysis(
     matched_tracks["exactly_one_required_session_missing"] = matched_tracks["exactly_one_required_session_missing"].fillna(False).astype(bool)
     matched_tracks["segmentation_failure"] = (
         matched_tracks["segmentation_qc_status"].astype(str) == "configured"
-    ) & (~matched_tracks["segmentation_qc_pass_all_required_days"].fillna(False).astype(bool))
+    ) & (~matched_tracks["segmentation_qc_pass_all_required_days"].eq(True))
     matched_tracks["edge_heavy"] = matched_tracks["n_edge_sessions"].fillna(0).astype(int) > 0
     matched_tracks["review_required"] = matched_tracks["review_required"].fillna(False).astype(bool)
     matched_tracks["review_required"] = matched_tracks["review_required"] | matched_tracks["segmentation_failure"] | matched_tracks["edge_heavy"]
@@ -784,6 +795,7 @@ def _policy_analysis(
         "roi_day_table": roi_day_table,
         "complete_table": complete_table,
         "metrics_table": metrics_table,
+        "all_metrics_table": all_metrics_table,
         "fit_summary": fit_summary,
         "residual_table": residual_table,
         "residual_summary": residual_summary,
@@ -803,7 +815,8 @@ def _policy_analysis(
 
 def _write_summary_markdown(
     output_dir: Path,
-    config: SegmentationQCConfig,
+    config: DaywiseMatchedPipelineConfig,
+    qc_config: SegmentationQCConfig,
     filter_counts: pd.DataFrame,
     fit_summary: pd.DataFrame,
     manifest_records: list[SessionRecord],
@@ -812,6 +825,7 @@ def _write_summary_markdown(
     sensitivity_complete: pd.DataFrame,
     one_gap_high: pd.DataFrame,
     one_gap_balanced: pd.DataFrame,
+    signal_qc_summary: pd.DataFrame,
 ) -> None:
     summary_lines = [
         "# Daywise Matched ROI Pipeline",
@@ -821,8 +835,8 @@ def _write_summary_markdown(
         "complete-day filtering used in the registered ROI workflow.",
         "",
         "Key analysis choices:",
-        f"- Segmentation QC mode: `{config.mode}`",
-        f"- Dark values: green `{319.0}`, red `{534.0}`",
+        f"- Segmentation QC mode: `{qc_config.mode}`",
+        f"- Dark values: green `{config.green_dark}`, red `{config.red_dark}`; epsilon `{config.epsilon}`",
         "",
         "Sessions:",
     ]
@@ -847,11 +861,17 @@ def _write_summary_markdown(
             f"- balanced one-gap sensitivity: `{len(one_gap_balanced)}`",
         ]
     )
+    if not signal_qc_summary.empty:
+        summary_lines.extend(["", "Session signal QC:"])
+        for _, row in signal_qc_summary.sort_values("session_index").iterrows():
+            summary_lines.append(
+                f"- {row['session_id']}: `{int(row['n_ratio_valid'])} / {int(row['n_native_rois'])}` ratio-valid native ROIs"
+            )
     if not fit_summary.empty:
         summary_lines.extend(["", "Green-vs-red fit summary:"])
-        for _, row in fit_summary.sort_values(["match_policy", "day"]).iterrows():
+        for _, row in fit_summary.sort_values("day").iterrows():
             summary_lines.append(
-                f"- {row['match_policy']} day {int(row['day'])}: slope `{row['slope']:.3f}`, "
+                f"- day {int(row['day'])}: slope `{row['slope']:.3f}`, "
                 f"intercept `{row['intercept']:.1f}`, R² `{row['r_squared']:.3f}`"
             )
     (output_dir / "SUMMARY.md").write_text("\n".join(summary_lines), encoding="utf-8")
@@ -925,6 +945,22 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         max_volume_ratio_from_track_median=config.max_volume_ratio_from_track_median,
         min_segmentation_pass_fraction=config.min_segmentation_pass_fraction,
     )
+    trajectory_config = TrajectoryEligibilityConfig(
+        min_sessions=config.trajectory_min_sessions,
+        min_session_fraction=config.trajectory_min_session_fraction,
+        max_internal_missing_sessions=config.trajectory_max_internal_missing_sessions,
+        require_first_session=config.trajectory_require_first_session,
+        require_last_session=config.trajectory_require_last_session,
+    )
+
+    session_population = extract_session_population(
+        required_manifest_records,
+        green_dark=config.green_dark,
+        red_dark=config.red_dark,
+        epsilon=config.epsilon,
+    )
+    fit_summary = fit_session_population(session_population)
+    signal_qc_summary = summarize_signal_qc(session_population)
 
     policy_results: dict[str, dict[str, Any]] = {}
     for policy in requested_policies:
@@ -964,9 +1000,9 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
     roi_day_table = _concat("roi_day_table")
     complete_table = _concat("complete_table")
     metrics_table = _concat("metrics_table")
-    fit_summary = _concat("fit_summary")
-    residual_table = _concat("residual_table")
-    residual_summary = _concat("residual_summary")
+    all_metrics_table = _concat("all_metrics_table")
+    sensitivity_fit_summary = _concat("fit_summary")
+    sensitivity_residual_table = _concat("residual_table")
     geometry_long = _concat("geometry_long")
     matched_tracks = _concat("matched_tracks")
     filter_counts = _concat("filter_counts")
@@ -976,6 +1012,19 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
     one_gap_high = policy_results.get("high", {}).get("one_gap", pd.DataFrame())
     one_gap_balanced = policy_results.get("balanced", {}).get("one_gap", pd.DataFrame())
     review_flagged = _concat("review_flagged")
+
+    residual_all_observed = pd.concat(
+        [compute_green_red_fit_residuals(policy_results[policy]["all_metrics_table"], fit_summary, baseline_day=min(required_days)) for policy in requested_policies],
+        ignore_index=True,
+    )
+    complete_ids = complete_table[["match_policy", "roi_id", "day"]].drop_duplicates()
+    residual_table = residual_all_observed.merge(
+        complete_ids, on=["match_policy", "roi_id", "day"], how="inner", validate="one_to_one"
+    )
+    residual_summary = pd.concat(
+        [summarize_residual_sign_changes(group) for _, group in residual_table.groupby("match_policy", sort=False)],
+        ignore_index=True,
+    ) if not residual_table.empty else pd.DataFrame()
 
     def _sort_if_present(table: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
         if table.empty:
@@ -990,7 +1039,8 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
     roi_day_table = _sort_if_present(roi_day_table, ["match_policy", "roi_id", "day"])
     complete_table = _sort_if_present(complete_table, ["match_policy", "roi_id", "day"])
     metrics_table = _sort_if_present(metrics_table, ["match_policy", "roi_id", "day", "channel"])
-    fit_summary = _sort_if_present(fit_summary, ["match_policy", "day"])
+    fit_summary = _sort_if_present(fit_summary, ["day"])
+    sensitivity_fit_summary = _sort_if_present(sensitivity_fit_summary, ["match_policy", "day"])
     residual_table = _sort_if_present(residual_table, ["match_policy", "roi_id", "day", "channel"])
     residual_summary = _sort_if_present(residual_summary, ["match_policy", "roi_id"])
     geometry_long = _sort_if_present(geometry_long, ["match_policy", "track_uid", "session_index"])
@@ -1003,13 +1053,35 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
     one_gap_balanced = _sort_if_present(one_gap_balanced, ["match_policy", "cluster_id"])
     review_flagged = _sort_if_present(review_flagged, ["match_policy", "cluster_id"])
 
+    geometry_flags = geometry_long[["match_policy", "roi_id", "session_index", "geometry_qc_pass"]].drop_duplicates()
+    trajectory_observations = residual_all_observed.merge(
+        geometry_flags, on=["match_policy", "roi_id", "session_index"], how="left", validate="one_to_one"
+    )
+    trajectory_eligibility, eligible_observations = build_trajectory_eligibility(
+        trajectory_observations,
+        matched_tracks,
+        [str(record.session_id) for record in required_manifest_records],
+        trajectory_config,
+    )
+    matrices = build_trajectory_matrices(
+        eligible_observations,
+        [str(record.session_id) for record in required_manifest_records],
+    )
+
     raw_table.to_csv(output_dir / "matched_roi_intensity_results_raw.csv", index=False)
     corrected_table.to_csv(output_dir / "matched_roi_intensity_results_dark_corrected.csv", index=False)
     geometry_long.to_csv(output_dir / "matched_roi_geometry_qc_long.csv", index=False)
     matched_tracks.to_csv(output_dir / "matched_track_qc_summary.csv", index=False)
-    roi_day_table.to_csv(output_dir / "matched_roi_day_table_complete.csv", index=False)
+    roi_day_table.to_csv(output_dir / "matched_roi_day_table_all.csv", index=False)
+    complete_table.to_csv(output_dir / "matched_roi_day_table_complete.csv", index=False)
+    all_metrics_table.to_csv(output_dir / "matched_roi_log_ratio_metrics_all_observed.csv", index=False)
     metrics_table.to_csv(output_dir / "matched_roi_log_ratio_metrics_complete.csv", index=False)
+    session_population.to_csv(output_dir / "matched_session_population_roi_metrics.csv", index=False)
+    signal_qc_summary.to_csv(output_dir / "matched_session_population_signal_qc_summary.csv", index=False)
     fit_summary.to_csv(output_dir / "matched_daywise_green_red_linear_fit_summary.csv", index=False)
+    sensitivity_fit_summary.to_csv(output_dir / "matched_daywise_green_red_linear_fit_summary_complete_track_sensitivity.csv", index=False)
+    sensitivity_residual_table.to_csv(output_dir / "matched_roi_metrics_with_complete_track_fit_residuals_sensitivity.csv", index=False)
+    residual_all_observed.to_csv(output_dir / "matched_roi_metrics_with_session_normalized_residuals_all_observed.csv", index=False)
     residual_table.to_csv(output_dir / "matched_roi_metrics_with_green_red_fit_residuals.csv", index=False)
     residual_summary.to_csv(output_dir / "matched_roi_residual_sign_change_summary.csv", index=False)
     primary_matching.to_csv(output_dir / "primary_high_complete_matching.csv", index=False)
@@ -1019,6 +1091,20 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
     one_gap_balanced.to_csv(output_dir / "sensitivity_balanced_one_internal_gap.csv", index=False)
     review_flagged.to_csv(output_dir / "review_flagged_tracks.csv", index=False)
     filter_counts.to_csv(output_dir / "filter_step_counts_with_percentages.csv", index=False)
+    trajectory_eligibility.to_csv(output_dir / "matched_roi_trajectory_eligibility.csv", index=False)
+    eligible_observations.to_csv(output_dir / "matched_roi_trajectory_observations_eligible.csv", index=False)
+    matrix_files = {
+        "raw": "matched_roi_trajectory_signed_distance_matrix.csv",
+        "mask": "matched_roi_trajectory_observation_mask.csv",
+        "missingness": "matched_roi_trajectory_missingness_by_session.csv",
+        "centered": "matched_roi_trajectory_signed_distance_matrix_centered_with_nan.csv",
+        "centering": "matched_roi_trajectory_centering_summary.csv",
+        "complete_raw": "matched_roi_pca_complete_case_raw.csv",
+        "complete_centered": "matched_roi_pca_complete_case_centered.csv",
+        "complete_centering": "matched_roi_pca_complete_case_centering_summary.csv",
+    }
+    for key, filename in matrix_files.items():
+        matrices[key].to_csv(output_dir / filename, index=False)
 
     warnings: list[str] = []
     if qc_config.mode == "all_required" and all(
@@ -1039,6 +1125,7 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         "matched_roi_intensity_results_dark_corrected": str(output_dir / "matched_roi_intensity_results_dark_corrected.csv"),
         "matched_roi_geometry_qc_long": str(output_dir / "matched_roi_geometry_qc_long.csv"),
         "matched_track_qc_summary": str(output_dir / "matched_track_qc_summary.csv"),
+        "matched_roi_day_table_all": str(output_dir / "matched_roi_day_table_all.csv"),
         "matched_roi_day_table_complete": str(output_dir / "matched_roi_day_table_complete.csv"),
         "matched_roi_log_ratio_metrics_complete": str(output_dir / "matched_roi_log_ratio_metrics_complete.csv"),
         "matched_daywise_green_red_linear_fit_summary": str(output_dir / "matched_daywise_green_red_linear_fit_summary.csv"),
@@ -1052,6 +1139,15 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         "review_flagged_tracks": str(output_dir / "review_flagged_tracks.csv"),
         "filter_step_counts_with_percentages": str(output_dir / "filter_step_counts_with_percentages.csv"),
     }
+    for filename in [
+        "matched_session_population_roi_metrics.csv", "matched_session_population_signal_qc_summary.csv",
+        "matched_daywise_green_red_linear_fit_summary_complete_track_sensitivity.csv",
+        "matched_roi_metrics_with_complete_track_fit_residuals_sensitivity.csv",
+        "matched_roi_metrics_with_session_normalized_residuals_all_observed.csv",
+        "matched_roi_log_ratio_metrics_all_observed.csv", "matched_roi_trajectory_eligibility.csv",
+        "matched_roi_trajectory_observations_eligible.csv", *matrix_files.values(),
+    ]:
+        output_paths[Path(filename).stem] = str(output_dir / filename)
     if qc_config.mode != "all_required" or any(
         value is not None
         for value in [
@@ -1074,6 +1170,9 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         "run_finished_utc": run_finished_utc,
         "config": asdict(config),
         "segmentation_qc_config": asdict(qc_config),
+        "normalization": {"population": "all_valid_session_rois", "regression": "OLS_with_intercept", "signal_validity_rule": "corrected_green_gt_0_and_corrected_red_gt_0", "epsilon": config.epsilon, "green_dark": config.green_dark, "red_dark": config.red_dark},
+        "trajectory_eligibility": asdict(trajectory_config),
+        "pca_preparation": {"feature": "green_fit_signed_distance", "missing_values": "preserved_as_nan", "imputation": "none", "scaling": "none", "centered_complete_case": True},
         "manifest_path": str(config.manifest),
         "match_dir": str(match_dir),
         "manifest_sha256": _sha256_file(Path(config.manifest).resolve()),
@@ -1091,9 +1190,12 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
             "matched_roi_intensity_results_dark_corrected": int(len(corrected_table)),
             "matched_roi_geometry_qc_long": int(len(geometry_long)),
             "matched_track_qc_summary": int(len(matched_tracks)),
-            "matched_roi_day_table_complete": int(len(roi_day_table)),
+            "matched_roi_day_table_all": int(len(roi_day_table)),
+            "matched_roi_day_table_complete": int(len(complete_table)),
+            "matched_roi_log_ratio_metrics_all_observed": int(len(all_metrics_table)),
             "matched_roi_log_ratio_metrics_complete": int(len(metrics_table)),
             "matched_daywise_green_red_linear_fit_summary": int(len(fit_summary)),
+            "matched_daywise_green_red_linear_fit_summary_complete_track_sensitivity": int(len(sensitivity_fit_summary)),
             "matched_roi_metrics_with_green_red_fit_residuals": int(len(residual_table)),
             "matched_roi_residual_sign_change_summary": int(len(residual_summary)),
             "primary_high_complete_matching": int(len(primary_matching)),
@@ -1103,6 +1205,13 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
             "sensitivity_balanced_one_internal_gap": int(len(one_gap_balanced)),
             "review_flagged_tracks": int(len(review_flagged)),
             "filter_step_counts_with_percentages": int(len(filter_counts)),
+            **{Path(filename).stem: int(len(matrices[key])) for key, filename in matrix_files.items()},
+            "matched_session_population_roi_metrics": int(len(session_population)),
+            "matched_session_population_signal_qc_summary": int(len(signal_qc_summary)),
+            "matched_roi_metrics_with_complete_track_fit_residuals_sensitivity": int(len(sensitivity_residual_table)),
+            "matched_roi_metrics_with_session_normalized_residuals_all_observed": int(len(residual_all_observed)),
+            "matched_roi_trajectory_eligibility": int(len(trajectory_eligibility)),
+            "matched_roi_trajectory_observations_eligible": int(len(eligible_observations)),
         },
         "output_paths": output_paths,
     }
@@ -1110,7 +1219,8 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
 
     _write_summary_markdown(
         output_dir=output_dir,
-        config=qc_config,
+        config=config,
+        qc_config=qc_config,
         filter_counts=filter_counts,
         fit_summary=fit_summary,
         manifest_records=manifest_records,
@@ -1119,6 +1229,7 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         sensitivity_complete=sensitivity_complete,
         one_gap_high=one_gap_high,
         one_gap_balanced=one_gap_balanced,
+        signal_qc_summary=signal_qc_summary,
     )
 
     print(f"[{format_duration_seconds(total_duration_seconds)}] Pipeline completed", flush=True)
@@ -1144,6 +1255,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--exclude-xy-edge", action="store_true")
     parser.add_argument("--exclude-z-edge", action="store_true")
     parser.add_argument("--max-volume-ratio-from-track-median", type=float, default=None)
+    parser.add_argument("--trajectory-min-sessions", type=int, default=2)
+    parser.add_argument("--trajectory-min-session-fraction", type=float, default=None)
+    parser.add_argument("--trajectory-max-internal-missing-sessions", type=int, default=None)
+    parser.add_argument("--trajectory-require-first-session", action="store_true")
+    parser.add_argument("--trajectory-require-last-session", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -1174,6 +1290,11 @@ def main(argv: list[str] | None = None) -> Path:
         exclude_xy_edge=bool(args.exclude_xy_edge),
         exclude_z_edge=bool(args.exclude_z_edge),
         max_volume_ratio_from_track_median=args.max_volume_ratio_from_track_median,
+        trajectory_min_sessions=args.trajectory_min_sessions,
+        trajectory_min_session_fraction=args.trajectory_min_session_fraction,
+        trajectory_max_internal_missing_sessions=args.trajectory_max_internal_missing_sessions,
+        trajectory_require_first_session=bool(args.trajectory_require_first_session),
+        trajectory_require_last_session=bool(args.trajectory_require_last_session),
     )
     return run_daywise_matched_roi_pipeline(config)
 

@@ -289,6 +289,19 @@ def test_day0_normalized_delta_is_zero_on_day0() -> None:
     assert np.allclose(day0_rows["delta_log2_green_over_red"].to_numpy(), 0.0)
 
 
+def test_log_ratio_requires_positive_dark_corrected_signals_and_true_day0() -> None:
+    table = pd.DataFrame({
+        "roi_id": [1, 1, 2], "day": [0, 1, 1],
+        "red": [-2.0, 4.0, 8.0], "green": [-3.0, 8.0, 16.0],
+    })
+    metrics = compute_log_ratio_metrics(table)
+    assert not bool(metrics.loc[0, "ratio_qc_pass"])
+    assert np.isnan(metrics.loc[0, "log2_green_over_red"])
+    assert np.isnan(metrics.loc[1, "first_observed_log2_green_over_red"])
+    assert np.isnan(metrics.loc[2, "day0_log2_green_over_red"])
+    assert metrics.loc[2, "first_observed_log2_green_over_red"] == metrics.loc[2, "log2_green_over_red"]
+
+
 def test_green_values_can_be_normalized_to_day0() -> None:
     long_table = make_long_table()
     wide_table = filter_complete_rois(wide_table_from_long_table(long_table, start_date="20260511"))

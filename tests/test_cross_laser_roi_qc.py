@@ -1,13 +1,25 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from cross_laser_roi_qc import (
+    _crop_plane,
     fixed_coverage_by_long_axis,
     generate_cross_laser_qc,
     high_confidence_long_axis_statistics,
     select_cross_laser_examples,
 )
+
+
+def test_crop_plane_uses_largest_roi_cross_section() -> None:
+    mask = np.zeros((3, 7, 7), dtype=np.uint16)
+    mask[0, 3, 3] = 1
+    mask[1, 2:5, 2:5] = 1
+    image = np.broadcast_to(np.arange(3)[:, None, None], mask.shape)
+    crop, selected = _crop_plane(image, mask, label=1, radius=2)
+    assert np.all(crop == 1)
+    assert selected.sum() == 9
 
 
 def test_fixed_coverage_denominator_includes_observable_zero_candidate_rois() -> None:

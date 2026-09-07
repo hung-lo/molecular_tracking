@@ -172,6 +172,9 @@ def build_quick_plots(
         "weekly_matched_roi_log_ratio_metrics_complete.csv",
         "matched_roi_log_ratio_metrics_complete.csv",
     )
+    fit_population_path = analysis_dir / "matched_session_population_roi_metrics.csv"
+    if not fit_population_path.is_file():
+        fit_population_path = metrics_path
     residuals_path = _first_existing_path(
         analysis_dir,
         "weekly_matched_roi_metrics_with_green_red_fit_residuals.csv",
@@ -185,6 +188,7 @@ def build_quick_plots(
 
     log_message(run_start_seconds, f"Loading saved matched tables from {analysis_dir}")
     metrics_table = _filter_table_by_policy(_load_metrics_table(metrics_path), policy)
+    fit_population = _filter_table_by_policy(_load_metrics_table(fit_population_path), policy)
     residuals_table = _filter_table_by_policy(_load_metrics_table(residuals_path), policy)
     fit_summary = _filter_table_by_policy(_load_fit_summary(fit_summary_path), policy)
     unique_days = int(fit_summary["day"].nunique()) if not fit_summary.empty and "day" in fit_summary.columns else 0
@@ -211,7 +215,7 @@ def build_quick_plots(
         include_traces=True,
     )
     plot_daywise_scatter_summary(
-        roi_metrics=metrics_table,
+        roi_metrics=fit_population,
         fit_summary=fit_summary,
         output_path=output_dir / "daywise_green_red_linear_fit_scatters.png",
         start_date=start_date,
@@ -219,7 +223,7 @@ def build_quick_plots(
     plot_fit_parameter_summary(
         fit_summary=fit_summary,
         output_path=output_dir / "daywise_green_red_linear_fit_parameters.png",
-        roi_metrics=metrics_table,
+        roi_metrics=fit_population,
         start_date=start_date,
     )
 

@@ -699,6 +699,8 @@ def run_cross_laser_roi_map(
                 accepted_pairs=accepted_pairs_by_source(primary),
                 image_shape_yx=(fixed_mask.shape[1], fixed_mask.shape[2]),
                 identity_resolution=resolution,
+                moving_green_coverage=primary.moving_coverage,
+                moving_red_coverage=secondary.moving_coverage if secondary is not None else None,
             )
             if secondary is not None:
                 qcs.update({f"920_red_{name}": path for name, path in generate_cross_laser_qc(

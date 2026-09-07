@@ -343,9 +343,14 @@ The daywise analysis output directory contains tables such as:
 
 - `matched_roi_intensity_results_raw.csv`
 - `matched_roi_intensity_results_dark_corrected.csv`
+- `matched_session_population_roi_metrics.csv`
+- `matched_roi_day_table_all.csv`
 - `matched_roi_day_table_complete.csv`
 - `matched_track_qc_summary.csv`
 - `matched_daywise_green_red_linear_fit_summary.csv`
+- `matched_roi_trajectory_eligibility.csv`
+- `matched_roi_trajectory_signed_distance_matrix.csv`
+- `matched_roi_pca_complete_case_centered.csv`
 - `primary_high_complete_matching.csv`
 - `sensitivity_balanced_complete.csv`
 - `review_flagged_tracks.csv`

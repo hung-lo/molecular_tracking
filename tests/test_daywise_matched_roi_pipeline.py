@@ -134,5 +134,32 @@ def test_run_daywise_matched_roi_pipeline_accepts_graph_policy(tmp_path: Path) -
     assert set(complete["match_policy"].astype(str)) == {"graph"}
     assert complete.shape[0] == 6
     assert set(complete["elapsed_days"].astype(int)) == {0, 1}
-    assert set(fit_summary["match_policy"].astype(str)) == {"graph"}
+    assert set(fit_summary["normalization_population"]) == {"all_valid_session_rois"}
     assert run_log["output_paths"]["matched_daywise_green_red_linear_fit_summary"].endswith("matched_daywise_green_red_linear_fit_summary.csv")
+
+
+def test_track_attrition_does_not_change_native_session_fit(tmp_path: Path) -> None:
+    manifest_path, match_dir = _build_dataset(tmp_path)
+    baseline_dir = run_daywise_matched_roi_pipeline(DaywiseMatchedPipelineConfig(
+        dataset=str(tmp_path), manifest=str(manifest_path), match_dir=str(match_dir),
+        output_root=str(tmp_path / "baseline"), policies=("high",), green_dark=0, red_dark=0,
+    ))
+    tracks_path = match_dir / "tracks_high.csv"
+    tracks = pd.read_csv(tracks_path)
+    tracks.loc[0, "20260512_roi"] = np.nan
+    tracks.to_csv(tracks_path, index=False)
+    attrited_dir = run_daywise_matched_roi_pipeline(DaywiseMatchedPipelineConfig(
+        dataset=str(tmp_path), manifest=str(manifest_path), match_dir=str(match_dir),
+        output_root=str(tmp_path / "attrited"), policies=("high",), green_dark=0, red_dark=0,
+    ))
+
+    pd.testing.assert_frame_equal(
+        pd.read_csv(baseline_dir / "matched_daywise_green_red_linear_fit_summary.csv"),
+        pd.read_csv(attrited_dir / "matched_daywise_green_red_linear_fit_summary.csv"),
+    )
+    all_rows = pd.read_csv(attrited_dir / "matched_roi_day_table_all.csv")
+    complete_rows = pd.read_csv(attrited_dir / "matched_roi_day_table_complete.csv")
+    population = pd.read_csv(attrited_dir / "matched_session_population_roi_metrics.csv")
+    assert len(all_rows) == 5
+    assert len(complete_rows) == 4
+    assert len(population) == 6

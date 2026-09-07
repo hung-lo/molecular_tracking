@@ -427,6 +427,10 @@ def build_moving_coverage(result: CrossLaserSourceResult) -> pd.DataFrame:
     moving["session_id"] = result.summary["session_id"]
     moving["acquisition_date"] = result.summary["acquisition_date"]
     moving["source"] = result.source.name
+    aligned = result.transform.apply(
+        moving[["centroid_920_z", "centroid_920_y", "centroid_920_x"]].to_numpy(float)
+    )
+    moving[["centroid_1050_z", "centroid_1050_y", "centroid_1050_x"]] = aligned
     moving = moving.loc[:, ["mouse_id", "session_id", "acquisition_date", "source"] + [column for column in moving if column not in {"mouse_id", "session_id", "acquisition_date", "source"}]]
     candidates = _best_evidence(result.candidates, "label_920")
     high = _best_evidence(result.high_matches, "label_920")
@@ -650,12 +654,12 @@ def resolve_identity_evidence(
             )
         conflict_values.append(conflict)
         if primary_high:
-            statuses.append("primary_high")
+            statuses.append("primary_high_with_secondary_conflict" if conflict else "primary_high")
             sources.append("920_green_primary")
             labels.append(float(row.primary_green_label_920))
             recommended.append(True)
             provisional.append(False)
-            review.append(False)
+            review.append(conflict)
         elif conflict:
             statuses.append("cross_source_conflict")
             sources.append("")
@@ -764,13 +768,20 @@ def relabel_primary_high_mask(
     source = np.asarray(moving_mask)
     if source.ndim != 3 or not np.issubdtype(source.dtype, np.integer):
         raise ValueError("moving_mask must be a 3D integer label mask.")
+    if np.any(source < 0):
+        raise ValueError("moving_mask labels must be nonnegative.")
     mapping = {
         int(row.label_920): int(row.label_1050)
         for row in high_matches.itertuples(index=False)
     }
     maximum = max(mapping.values(), default=0)
     dtype = np.uint16 if maximum <= np.iinfo(np.uint16).max else np.uint32
-    relabelled = np.zeros(source.shape, dtype=dtype)
+    max_source_label = int(source.max(initial=0))
+    lut = np.zeros(max_source_label + 1, dtype=dtype)
     for moving_label, fixed_label in mapping.items():
-        relabelled[source == moving_label] = fixed_label
-    return relabelled
+        if moving_label < 0 or moving_label > max_source_label:
+            raise ValueError(f"Moving label {moving_label} is outside the mask label range.")
+        if fixed_label < 0:
+            raise ValueError("Fixed labels must be nonnegative.")
+        lut[moving_label] = fixed_label
+    return lut[source]

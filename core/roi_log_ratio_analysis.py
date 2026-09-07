@@ -138,6 +138,7 @@ def filter_complete_rois(
 def compute_log_ratio_metrics(
     roi_day_table: pd.DataFrame,
     epsilon: float = 1.0,
+    baseline_day: int = 0,
 ) -> pd.DataFrame:
     """Compute brightness and day-0-normalized green/red metrics.
 
@@ -168,14 +169,36 @@ def compute_log_ratio_metrics(
         metrics["green"] / metrics["brightness"],
         np.nan,
     )
-    metrics["log2_green_over_red"] = np.log2(
-        (metrics["green"] + epsilon) / (metrics["red"] + epsilon)
+    metrics["green_finite"] = np.isfinite(metrics["green"])
+    metrics["red_finite"] = np.isfinite(metrics["red"])
+    metrics["green_above_dark"] = metrics["green_finite"] & metrics["green"].gt(0)
+    metrics["red_above_dark"] = metrics["red_finite"] & metrics["red"].gt(0)
+    metrics["green_signal_qc_pass"] = metrics["green_above_dark"]
+    metrics["red_signal_qc_pass"] = metrics["red_above_dark"]
+    metrics["ratio_qc_pass"] = metrics["green_signal_qc_pass"] & metrics["red_signal_qc_pass"]
+    metrics["log2_green_over_red"] = np.nan
+    valid = metrics["ratio_qc_pass"]
+    metrics.loc[valid, "log2_green_over_red"] = np.log2(
+        (metrics.loc[valid, "green"] + epsilon) / (metrics.loc[valid, "red"] + epsilon)
     )
-    metrics["day0_log2_green_over_red"] = metrics.groupby("roi_id")[
-        "log2_green_over_red"
-    ].transform("first")
+    baseline = (
+        metrics.loc[metrics["day"].eq(baseline_day), ["roi_id", "log2_green_over_red"]]
+        .drop_duplicates("roi_id")
+        .set_index("roi_id")["log2_green_over_red"]
+    )
+    metrics["day0_log2_green_over_red"] = metrics["roi_id"].map(baseline)
     metrics["delta_log2_green_over_red"] = (
         metrics["log2_green_over_red"] - metrics["day0_log2_green_over_red"]
+    )
+    first = metrics.drop_duplicates("roi_id").set_index("roi_id")
+    metrics["first_observed_day"] = metrics["roi_id"].map(first["day"])
+    if "elapsed_days" in metrics:
+        metrics["first_observed_elapsed_days"] = metrics["roi_id"].map(first["elapsed_days"])
+    metrics["first_observed_log2_green_over_red"] = metrics["roi_id"].map(
+        first["log2_green_over_red"]
+    )
+    metrics["delta_log2_green_over_red_from_first_observed"] = (
+        metrics["log2_green_over_red"] - metrics["first_observed_log2_green_over_red"]
     )
     return metrics
 
@@ -467,6 +490,11 @@ def summarize_daily_green_red_linear_fits(
 
     summary_rows: list[dict[str, float | int]] = []
     for day, day_table in roi_metrics.groupby("day", sort=True):
+        if {"red_signal_qc_pass", "green_signal_qc_pass"}.issubset(day_table.columns):
+            day_table = day_table.loc[
+                day_table["red_signal_qc_pass"].eq(True)
+                & day_table["green_signal_qc_pass"].eq(True)
+            ]
         valid_rows = day_table[[red_column, green_column]].replace([np.inf, -np.inf], np.nan)
         valid_rows = valid_rows.dropna().reset_index(drop=True)
         if len(valid_rows) < 2:
@@ -521,6 +549,7 @@ def compute_green_red_fit_residuals(
     fit_summary: pd.DataFrame | None = None,
     red_column: str = "red",
     green_column: str = "green",
+    baseline_day: int = 0,
 ) -> pd.DataFrame:
     """Compute day-specific signed deviations from the fitted green-vs-red line.
 
@@ -590,17 +619,36 @@ def compute_green_red_fit_residuals(
     output["green_fit_signed_distance"] = output["green_fit_residual"] / np.sqrt(
         1.0 + output["slope"].astype(float) ** 2
     )
-    output["day0_green_fit_residual"] = output.groupby("roi_id")[
-        "green_fit_residual"
-    ].transform("first")
+    if "ratio_qc_pass" in output:
+        invalid = ~output["ratio_qc_pass"].eq(True)
+        output.loc[invalid, ["predicted_green_from_fit", "green_fit_residual", "green_fit_signed_distance"]] = np.nan
+    baseline_rows = output.loc[output["day"].eq(baseline_day)].drop_duplicates("roi_id")
+    baseline_rows = baseline_rows.set_index("roi_id")
+    output["day0_green_fit_residual"] = output["roi_id"].map(
+        baseline_rows["green_fit_residual"]
+    )
     output["delta_green_fit_residual"] = (
         output["green_fit_residual"] - output["day0_green_fit_residual"]
     )
-    output["day0_green_fit_signed_distance"] = output.groupby("roi_id")[
-        "green_fit_signed_distance"
-    ].transform("first")
+    output["day0_green_fit_signed_distance"] = output["roi_id"].map(
+        baseline_rows["green_fit_signed_distance"]
+    )
     output["delta_green_fit_signed_distance"] = (
         output["green_fit_signed_distance"] - output["day0_green_fit_signed_distance"]
+    )
+    first = output.drop_duplicates("roi_id").set_index("roi_id")
+    output["first_observed_green_fit_residual"] = output["roi_id"].map(
+        first["green_fit_residual"]
+    )
+    output["delta_green_fit_residual_from_first_observed"] = (
+        output["green_fit_residual"] - output["first_observed_green_fit_residual"]
+    )
+    output["first_observed_green_fit_signed_distance"] = output["roi_id"].map(
+        first["green_fit_signed_distance"]
+    )
+    output["delta_green_fit_signed_distance_from_first_observed"] = (
+        output["green_fit_signed_distance"]
+        - output["first_observed_green_fit_signed_distance"]
     )
     return output
 

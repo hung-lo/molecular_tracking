@@ -93,8 +93,14 @@ def fixed_coverage_by_long_axis(
     missing = required.difference(fixed_coverage.columns)
     if missing:
         raise ValueError(f"fixed_coverage is missing required columns: {sorted(missing)}")
-    coverage = fixed_coverage.loc[
-        fixed_coverage["common_volume_status"].astype(str).ne("outside_common_volume")
+    all_coverage = _with_long_axis_position(fixed_coverage, image_shape_yx=image_shape_yx)
+    all_coverage["bin"] = np.minimum(
+        (all_coverage["long_axis_position_normalized"].clip(0, 0.999999) * bins).astype(int),
+        bins - 1,
+    )
+    total_by_bin = all_coverage.groupby("bin", sort=True).size().rename("n_1050_total")
+    coverage = all_coverage.loc[
+        all_coverage["common_volume_status"].astype(str).ne("outside_common_volume")
     ].copy()
     if coverage.empty:
         return pd.DataFrame(
@@ -106,22 +112,43 @@ def fixed_coverage_by_long_axis(
     )
     if high_column not in coverage:
         raise ValueError("fixed_coverage does not include a primary green high-match column")
-    coverage = _with_long_axis_position(coverage, image_shape_yx=image_shape_yx)
-    coverage["bin"] = np.minimum(
-        (coverage["long_axis_position_normalized"].clip(0, 0.999999) * bins).astype(int),
-        bins - 1,
-    )
+    status_column = next((column for column in ("green_status", "primary_green_status", "red_status") if column in coverage), None)
+    coverage["_status"] = coverage[status_column].astype(str) if status_column else np.where(coverage[high_column].notna(), "high", "no_candidate")
+    coverage["_edge"] = coverage.get("touches_1050_xy_edge", False) | coverage.get("touches_1050_z_edge", False)
     output = (
         coverage.groupby("bin", sort=True)
         .agg(
             bin_center=("long_axis_position_normalized", "median"),
-            n_observable_1050=("label_1050", "count"),
-            n_high=(high_column, lambda values: int(values.notna().sum())),
+            n_1050_observable=("label_1050", "count"),
+            n_primary_high=("_status", lambda values: int(values.eq("high").sum())),
+            n_primary_balanced_only=("_status", lambda values: int(values.eq("balanced_only").sum())),
+            n_candidate_but_rejected=("_status", lambda values: int(values.eq("candidate_but_rejected").sum())),
+            n_no_candidate=("_status", lambda values: int(values.eq("no_candidate").sum())),
+            n_edge_clipped=("_edge", "sum"),
         )
         .reset_index()
     )
-    output["high_fraction"] = output["n_high"] / output["n_observable_1050"]
+    output = output.merge(total_by_bin, on="bin", how="left")
+    output["n_observable_1050"] = output["n_1050_observable"]
+    output["n_high"] = output["n_primary_high"]
+    for count, fraction in (
+        ("n_primary_high", "high_fraction_observable"),
+        ("n_primary_balanced_only", "balanced_only_fraction_observable"),
+        ("n_candidate_but_rejected", "rejected_fraction_observable"),
+        ("n_no_candidate", "no_candidate_fraction_observable"),
+    ):
+        output[fraction] = output[count] / output["n_1050_observable"]
+    output["high_fraction"] = output["high_fraction_observable"]
     return output
+
+
+def moving_density_by_long_axis(moving_coverage: pd.DataFrame, *, image_shape_yx: tuple[int, int], bins: int = 5) -> pd.DataFrame:
+    """Count moving detections after mapping their centroids into fixed space."""
+    if moving_coverage.empty:
+        return pd.DataFrame(columns=["bin", "n_920_detections"])
+    moving = _with_long_axis_position(moving_coverage, image_shape_yx=image_shape_yx)
+    moving["bin"] = np.minimum((moving["long_axis_position_normalized"].clip(0, 0.999999) * bins).astype(int), bins - 1)
+    return moving.groupby("bin", sort=True).size().rename("n_920_detections").reset_index()
 
 
 def source_comparison_counts(identity_resolution: pd.DataFrame) -> pd.DataFrame:
@@ -206,6 +233,8 @@ def generate_cross_laser_qc(
     accepted_pairs: pd.DataFrame,
     image_shape_yx: tuple[int, int],
     identity_resolution: pd.DataFrame | None = None,
+    moving_green_coverage: pd.DataFrame | None = None,
+    moving_red_coverage: pd.DataFrame | None = None,
 ) -> dict[str, Path]:
     """Write numerical cross-laser QC without affecting mapping outputs."""
 
@@ -218,6 +247,18 @@ def generate_cross_laser_qc(
     coverage = fixed_coverage_by_long_axis(
         fixed_coverage, image_shape_yx=image_shape_yx
     )
+    if not medians.empty:
+        coverage = coverage.merge(
+            medians[["bin", "median_aligned_residual_distance_um"]].rename(columns={"median_aligned_residual_distance_um": "median_high_aligned_residual_um"}),
+            on="bin", how="left",
+        )
+    for source, moving in (("green", moving_green_coverage), ("red", moving_red_coverage)):
+        if moving is not None:
+            density = moving_density_by_long_axis(moving, image_shape_yx=image_shape_yx).rename(columns={"n_920_detections": f"n_920_{source}_detections"})
+            coverage = coverage.merge(density, on="bin", how="left")
+            count = f"n_920_{source}_detections"
+            coverage[count] = coverage[count].fillna(0).astype(int)
+            coverage[f"920_{source}_to_1050_detection_count_ratio"] = coverage[count] / coverage["n_1050_observable"]
     medians_path = root / "high_residual_long_axis_medians.csv"
     coverage_path = root / "fixed_coverage_by_long_axis.csv"
     medians.to_csv(medians_path, index=False)
@@ -326,7 +367,10 @@ def _crop_plane(
     labels = np.argwhere(mask == int(label))
     if labels.size == 0:
         raise ValueError(f"Label {label} is absent from its native mask.")
-    z, y, x = np.rint(labels.mean(axis=0)).astype(int)
+    z_values, counts = np.unique(labels[:, 0], return_counts=True)
+    z = int(z_values[np.argmax(counts)])
+    plane_labels = labels[labels[:, 0] == z]
+    y, x = np.rint(plane_labels[:, 1:].mean(axis=0)).astype(int)
     if image.ndim != 3 or image.shape != mask.shape:
         raise ValueError("Raw image and label mask must be same-shape ZYX stacks.")
     y0, y1 = max(y - radius, 0), min(y + radius + 1, image.shape[1])

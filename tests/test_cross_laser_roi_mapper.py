@@ -240,6 +240,22 @@ def test_identity_resolution_blocks_cross_source_conflict() -> None:
     assert not bool(resolution.loc[2, "recommended_for_identity"])
 
 
+def test_primary_identity_remains_selected_but_conflict_requires_review() -> None:
+    primary = pd.DataFrame({
+        "label_1050": [1, 2], "green_status": ["high", "high"],
+        "green_high_label_920": [10, 99],
+    })
+    secondary = pd.DataFrame({
+        "label_1050": [1, 2], "red_status": ["high", "no_candidate"],
+        "red_high_label_920": [20, np.nan],
+    })
+    consistency = pd.DataFrame({"label_1050": [99], "label_920": [20]})
+    row = resolve_identity_evidence(primary, secondary_fixed_coverage=secondary, green_red_high_matches=consistency).set_index("label_1050").loc[1]
+    assert row["resolved_status"] == "primary_high_with_secondary_conflict"
+    assert bool(row["recommended_for_identity"])
+    assert bool(row["review_required"])
+
+
 def test_relabelled_primary_mask_preserves_native_geometry_without_source_mutation() -> None:
     source = _mask_with_objects(
         [
@@ -255,6 +271,15 @@ def test_relabelled_primary_mask_preserves_native_geometry_without_source_mutati
     assert relabelled.shape == source.shape
     assert np.array_equal(source, before)
     assert set(np.unique(relabelled)) == {0, 11}
+
+
+def test_relabelled_primary_mask_matches_reference_loop() -> None:
+    source = np.array([[[0, 1, 2], [3, 2, 1]]], dtype=np.uint16)
+    matches = pd.DataFrame({"label_920": [1, 3], "label_1050": [11, 70000]})
+    expected = np.zeros(source.shape, dtype=np.uint32)
+    expected[source == 1] = 11
+    expected[source == 3] = 70000
+    assert np.array_equal(relabel_primary_high_mask(source, matches), expected)
 
 
 def test_empty_match_tables_keep_coverage_and_consistency_schema() -> None:

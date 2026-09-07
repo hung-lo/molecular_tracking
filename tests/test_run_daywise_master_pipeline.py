@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 import json
+import pandas as pd
 from pathlib import Path
 
 import pytest
@@ -404,3 +405,31 @@ def test_master_pipeline_skips_ranked_roi_views_and_records_null_outputs(
     summary = (run_dir / "SUMMARY.md").read_text(encoding="utf-8")
     assert "Ranked individual ROI views:" in summary
     assert "skipped" in summary
+
+
+def test_wrapped_plot_skips_empty_confidence_interval(tmp_path: Path) -> None:
+    metrics_path = tmp_path / "metrics.csv"
+    fit_summary_path = tmp_path / "fit_summary.csv"
+    output_path = tmp_path / "wrapped.png"
+    pd.DataFrame(
+        {"day": [0, 0], "red": [1.0, 2.0], "green": [2.0, 4.0]}
+    ).to_csv(metrics_path, index=False)
+    pd.DataFrame(
+        {
+            "day": [0],
+            "slope": [2.0],
+            "intercept": [0.0],
+            "r_squared": [1.0],
+            "n_rois": [2],
+        }
+    ).to_csv(fit_summary_path, index=False)
+
+    master.plot_wrapped_daywise_linear_relationships(
+        metrics_path=metrics_path,
+        fit_summary_path=fit_summary_path,
+        output_path=output_path,
+        start_date="20260819",
+    )
+
+    assert output_path.is_file()
+    assert output_path.stat().st_size > 0

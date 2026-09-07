@@ -29,3 +29,5 @@ Trajectory eligibility is a downstream identity/coverage criterion and does not 
 Standard PCA complete-case matrices are centered across the actual PCA cell population. Partial-track matrices preserve `NaN` and are not imputed or variance-scaled automatically.
 
 Cross-laser 920/1050 correspondence is a validation layer and is not required for inclusion in the primary 1050 longitudinal trajectory analysis.
+
+Project-mode master runs also write `acquisition_settings_by_session.csv` and `acquisition_settings_qc.json` for the selected sessions. Changes warn by default; `--require-acquisition-settings-consistent` stops before matching when a required numeric setting changes. Resume reuses extraction only when its `run_log.json` proves v0.3 normalization provenance and all required v0.3 outputs exist.

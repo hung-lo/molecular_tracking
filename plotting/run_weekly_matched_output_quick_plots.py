@@ -87,6 +87,17 @@ def _load_metrics_table(path: Path) -> pd.DataFrame:
     return table
 
 
+def _load_native_fit_population(path: Path) -> pd.DataFrame:
+    table = pd.read_csv(path)
+    required = {"day", "session_id", "session_roi_label", "red", "green"}
+    missing = required.difference(table.columns)
+    if missing:
+        raise ValueError(f"Missing native fit-population columns in {path}: {sorted(missing)}")
+    if {"red_signal_qc_pass", "green_signal_qc_pass"}.issubset(table.columns):
+        table = table.loc[table["red_signal_qc_pass"].eq(True) & table["green_signal_qc_pass"].eq(True)].copy()
+    return table
+
+
 def _load_fit_summary(path: Path) -> pd.DataFrame:
     table = pd.read_csv(path)
     required_columns = {"day", "slope", "intercept", "r_squared", "n_rois"}
@@ -188,7 +199,11 @@ def build_quick_plots(
 
     log_message(run_start_seconds, f"Loading saved matched tables from {analysis_dir}")
     metrics_table = _filter_table_by_policy(_load_metrics_table(metrics_path), policy)
-    fit_population = _filter_table_by_policy(_load_metrics_table(fit_population_path), policy)
+    fit_population = (
+        _load_native_fit_population(fit_population_path)
+        if fit_population_path.name == "matched_session_population_roi_metrics.csv"
+        else _filter_table_by_policy(_load_metrics_table(fit_population_path), policy)
+    )
     residuals_table = _filter_table_by_policy(_load_metrics_table(residuals_path), policy)
     fit_summary = _filter_table_by_policy(_load_fit_summary(fit_summary_path), policy)
     unique_days = int(fit_summary["day"].nunique()) if not fit_summary.empty and "day" in fit_summary.columns else 0

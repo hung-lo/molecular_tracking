@@ -14,6 +14,7 @@ from run_daywise_master_pipeline import (
     _select_session_records,
     _session_selection_provenance,
     _verify_resume_session_selection,
+    _has_current_extraction,
     _write_selected_session_manifest,
     parse_args,
 )
@@ -40,6 +41,20 @@ def test_run_daywise_master_pipeline_parse_args_and_defaults() -> None:
     assert args.sessions is None
     assert args.skip_ranked_roi_views is False
     assert args.ranked_roi_z_radius == 3
+    assert args.trajectory_min_sessions == 2
+    assert args.require_acquisition_settings_consistent is False
+
+
+def test_resume_requires_current_normalization_provenance(tmp_path: Path) -> None:
+    extraction = tmp_path / "extraction"
+    extraction.mkdir()
+    for name in ("matched_roi_log_ratio_metrics_complete.csv", "matched_daywise_green_red_linear_fit_summary.csv"):
+        (extraction / name).touch()
+    assert not _has_current_extraction(extraction)
+    (extraction / "run_log.json").write_text(json.dumps({"analysis_version": "0.3.0", "normalization": {"population": "all_valid_session_rois"}}))
+    for name in ("matched_session_population_roi_metrics.csv", "matched_session_population_signal_qc_summary.csv", "matched_roi_metrics_with_session_normalized_residuals_all_observed.csv", "matched_roi_trajectory_eligibility.csv"):
+        (extraction / name).touch()
+    assert _has_current_extraction(extraction)
 
 
 def test_run_daywise_master_pipeline_config_defaults() -> None:

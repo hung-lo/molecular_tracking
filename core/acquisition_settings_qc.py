@@ -36,7 +36,7 @@ def acquisition_settings_qc(rows: list[dict], session_ids: list[str], laser_nm: 
     if len(versions) > 1:
         informational.append("software_version")
     return frame, {
-        "status": "warning" if changed else "pass",
+        "status": "warning" if changed or informational else "pass",
         "laser_nm": int(laser_nm), "numeric_tolerance": tolerance,
         "changed_required_fields": changed, "informational_changes": informational,
         "n_sessions": len(frame),

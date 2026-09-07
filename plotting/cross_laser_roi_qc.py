@@ -125,10 +125,12 @@ def fixed_coverage_by_long_axis(
             n_candidate_but_rejected=("_status", lambda values: int(values.eq("candidate_but_rejected").sum())),
             n_no_candidate=("_status", lambda values: int(values.eq("no_candidate").sum())),
             n_edge_clipped=("_edge", "sum"),
+            n_common_volume_partial=("common_volume_status", lambda values: int(values.astype(str).eq("partially_inside_common_volume").sum())),
         )
         .reset_index()
     )
     output = output.merge(total_by_bin, on="bin", how="left")
+    output["n_native_edge_clipped"] = output["n_edge_clipped"]
     output["n_observable_1050"] = output["n_1050_observable"]
     output["n_high"] = output["n_primary_high"]
     for count, fraction in (
@@ -145,10 +147,21 @@ def fixed_coverage_by_long_axis(
 def moving_density_by_long_axis(moving_coverage: pd.DataFrame, *, image_shape_yx: tuple[int, int], bins: int = 5) -> pd.DataFrame:
     """Count moving detections after mapping their centroids into fixed space."""
     if moving_coverage.empty:
-        return pd.DataFrame(columns=["bin", "n_920_detections"])
-    moving = _with_long_axis_position(moving_coverage, image_shape_yx=image_shape_yx)
+        return pd.DataFrame(columns=["bin", "n_920_detections", "n_920_outside_fixed_xy"])
+    moving = moving_coverage.copy()
+    height, width = image_shape_yx
+    x = pd.to_numeric(moving["centroid_1050_x"], errors="coerce")
+    y = pd.to_numeric(moving["centroid_1050_y"], errors="coerce")
+    inside = x.between(0, width - 1) & y.between(0, height - 1)
+    outside_count = int((~inside).sum())
+    moving = moving.loc[inside].copy()
+    if moving.empty:
+        return pd.DataFrame({"bin": range(bins), "n_920_detections": 0, "n_920_outside_fixed_xy": outside_count})
+    moving = _with_long_axis_position(moving, image_shape_yx=image_shape_yx)
     moving["bin"] = np.minimum((moving["long_axis_position_normalized"].clip(0, 0.999999) * bins).astype(int), bins - 1)
-    return moving.groupby("bin", sort=True).size().rename("n_920_detections").reset_index()
+    output = moving.groupby("bin", sort=True).size().rename("n_920_detections").reset_index()
+    output["n_920_outside_fixed_xy"] = outside_count
+    return output
 
 
 def source_comparison_counts(identity_resolution: pd.DataFrame) -> pd.DataFrame:
@@ -258,6 +271,8 @@ def generate_cross_laser_qc(
             coverage = coverage.merge(density, on="bin", how="left")
             count = f"n_920_{source}_detections"
             coverage[count] = coverage[count].fillna(0).astype(int)
+            outside = int(density.get("n_920_outside_fixed_xy", pd.Series([0])).iloc[0])
+            coverage[f"n_920_{source}_outside_fixed_xy"] = outside
             coverage[f"920_{source}_to_1050_detection_count_ratio"] = coverage[count] / coverage["n_1050_observable"]
     medians_path = root / "high_residual_long_axis_medians.csv"
     coverage_path = root / "fixed_coverage_by_long_axis.csv"

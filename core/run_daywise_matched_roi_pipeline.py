@@ -1002,6 +1002,10 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
     metrics_table = _concat("metrics_table")
     all_metrics_table = _concat("all_metrics_table")
     sensitivity_fit_summary = _concat("fit_summary")
+    fit_metadata = session_population[["day", "session_index", "session_id", "acquisition_date", "elapsed_days"]].drop_duplicates("day")
+    sensitivity_fit_summary = sensitivity_fit_summary.merge(
+        fit_metadata, on="day", how="left", validate="many_to_one"
+    )
     sensitivity_residual_table = _concat("residual_table")
     geometry_long = _concat("geometry_long")
     matched_tracks = _concat("matched_tracks")

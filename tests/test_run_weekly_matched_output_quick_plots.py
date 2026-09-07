@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 
 from run_weekly_matched_output_quick_plots import _filter_table_by_policy, _resolve_output_dir
+import run_daywise_green_red_linear_fit_summary as fit_plots
 from run_ranked_roi_quick_views import _resolve_run_inputs
 from roi_log_ratio_analysis import select_top_changing_rois
 
@@ -73,3 +74,20 @@ def test_final_directional_ranking_is_sign_correct_and_not_random() -> None:
     assert decreasing.roi_id.tolist() == [2]
     assert set(increasing.selection_mode) == {"final"}
     assert set(decreasing.selection_metric_column) == {"day_last_delta_log2_green_over_red"}
+
+
+def test_fit_plots_use_supplied_summary_without_refitting(tmp_path: Path, monkeypatch) -> None:
+    metrics = pd.DataFrame({
+        "day": [0, 0, 1, 1], "session_id": ["s0"] * 2 + ["s1"] * 2,
+        "red": [1., 2., 1., 2.], "green": [1., 2., 1., 2.],
+        "red_signal_qc_pass": [True] * 4, "green_signal_qc_pass": [True] * 4,
+        "acquisition_date": ["2026-01-01"] * 2 + ["2026-01-03"] * 2,
+    })
+    fits = pd.DataFrame({
+        "day": [0, 1], "slope": [9., 9.], "intercept": [0., 0.], "r_squared": [0.1, 0.1], "n_rois": [2, 2],
+        "slope_ci_low": [8., 8.], "slope_ci_high": [10., 10.], "intercept_ci_low": [-1., -1.], "intercept_ci_high": [1., 1.],
+    })
+    monkeypatch.setattr(fit_plots, "summarize_daily_green_red_linear_fits", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected refit")))
+    fit_plots.plot_daywise_scatter_summary(metrics, fits, tmp_path / "scatter.png", start_date="20260101")
+    fit_plots.plot_fit_parameter_summary(fits, tmp_path / "params.png", roi_metrics=metrics, start_date="20260101")
+    assert (tmp_path / "scatter.png").is_file() and (tmp_path / "params.png").is_file()

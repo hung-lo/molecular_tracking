@@ -403,6 +403,25 @@ def _has_files(run_dir: Path) -> bool:
     return any(path.is_file() for path in run_dir.rglob("*"))
 
 
+def _has_current_extraction(extraction_dir: Path) -> bool:
+    required = [
+        "matched_session_population_roi_metrics.csv",
+        "matched_session_population_signal_qc_summary.csv",
+        "matched_daywise_green_red_linear_fit_summary.csv",
+        "matched_roi_metrics_with_session_normalized_residuals_all_observed.csv",
+        "matched_roi_trajectory_eligibility.csv",
+    ]
+    log_path = extraction_dir / "run_log.json"
+    if not log_path.is_file() or any(not (extraction_dir / name).is_file() for name in required):
+        return False
+    try:
+        payload = json.loads(log_path.read_text(encoding="utf-8"))
+        version = tuple(int(part) for part in str(payload.get("analysis_version", "0.0.0")).split(".")[:3])
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return version >= (0, 3, 0) and payload.get("normalization", {}).get("population") == "all_valid_session_rois"
+
+
 def _verify_resume_session_selection(
     run_dir: Path,
     *,
@@ -812,10 +831,13 @@ def plot_wrapped_daywise_linear_relationships(
     """Plot one red-vs-green panel per session, wrapping after max_columns."""
 
     metrics = _read_csv(metrics_path)
-    if "match_policy" in metrics.columns:
-        metrics = metrics.loc[metrics["match_policy"].astype(str).eq("graph")].copy()
+    if {"red_signal_qc_pass", "green_signal_qc_pass"}.issubset(metrics.columns):
+        metrics = metrics.loc[
+            metrics["red_signal_qc_pass"].eq(True)
+            & metrics["green_signal_qc_pass"].eq(True)
+        ].copy()
     if metrics.empty:
-        raise ValueError("No graph-policy metrics were available for wrapped linear-fit plotting.")
+        raise ValueError("No signal-valid native session ROIs were available for wrapped plotting.")
 
     fit_summary = _read_csv(fit_summary_path)
     fit_summary["day"] = pd.to_numeric(fit_summary["day"], errors="raise").astype(int)
@@ -841,8 +863,6 @@ def plot_wrapped_daywise_linear_relationships(
     excluded_total = 0
     for day_value in day_values:
         columns = ["red", "green"]
-        if "track_match_source" in metrics.columns:
-            columns.append("track_match_source")
         if "acquisition_date" in metrics.columns:
             columns.append("acquisition_date")
         day_table_raw = (
@@ -851,11 +871,7 @@ def plot_wrapped_daywise_linear_relationships(
             .dropna(subset=["red", "green"])
             .reset_index(drop=True)
         )
-        day_table, excluded_count = _filter_green_artifacts(day_table_raw, green_artifact_threshold)
-        if day_table.empty and not day_table_raw.empty:
-            day_table = day_table_raw.copy()
-            excluded_count = 0
-        excluded_total += excluded_count
+        day_table, excluded_count = day_table_raw, 0
         if not day_table.empty:
             x_min = min(x_min, float(day_table["red"].min()))
             x_max = max(x_max, float(day_table["red"].max()))
@@ -878,51 +894,7 @@ def plot_wrapped_daywise_linear_relationships(
             y_low = np.asarray([], dtype=float)
             y_high = np.asarray([], dtype=float)
 
-        if "track_match_source" in day_table.columns:
-            consensus = day_table["track_match_source"].eq("consensus")
-            graph_only = day_table["track_match_source"].eq("graph_only")
-            other = ~(consensus | graph_only)
-            axis.scatter(
-                day_table.loc[consensus, "red"],
-                day_table.loc[consensus, "green"],
-                s=10,
-                alpha=0.22,
-                color="#1f3b4d",
-                edgecolors="none",
-                rasterized=True,
-                label="Consensus",
-            )
-            axis.scatter(
-                day_table.loc[graph_only, "red"],
-                day_table.loc[graph_only, "green"],
-                s=18,
-                alpha=0.70,
-                facecolors="none",
-                edgecolors="#d97706",
-                linewidths=0.7,
-                rasterized=True,
-                label="Graph only",
-            )
-            if other.any():
-                axis.scatter(
-                    day_table.loc[other, "red"],
-                    day_table.loc[other, "green"],
-                    s=9,
-                    alpha=0.18,
-                    color="0.5",
-                    edgecolors="none",
-                    rasterized=True,
-                )
-        else:
-            axis.scatter(
-                x_values,
-                y_values,
-                s=10,
-                alpha=0.2,
-                color="#1f3b4d",
-                edgecolors="none",
-                rasterized=True,
-            )
+        axis.scatter(x_values, y_values, s=10, alpha=0.2, color="#1f3b4d", edgecolors="none", rasterized=True)
 
         if len(x_grid) > 0 and np.all(np.isfinite(y_hat)):
             if np.all(np.isfinite(y_low)) and np.all(np.isfinite(y_high)):
@@ -937,22 +909,6 @@ def plot_wrapped_daywise_linear_relationships(
             axis.plot(x_grid, y_hat, color="#d62828", linewidth=1.8)
 
         date_label = _actual_date_label(day_table, day_value, start_date)
-        consensus_n = int(
-            day_table.get("track_match_source", pd.Series(dtype=str)).eq("consensus").sum()
-        )
-        graph_only_n = int(
-            day_table.get("track_match_source", pd.Series(dtype=str)).eq("graph_only").sum()
-        )
-        source_text = (
-            f"\nconsensus={consensus_n}, graph-only={graph_only_n}"
-            if "track_match_source" in day_table.columns
-            else ""
-        )
-        artifact_text = (
-            f"\nexcluded green>{green_artifact_threshold:g}: {excluded_count}"
-            if excluded_count
-            else ""
-        )
         axis.set_title(f"Session {day_value} | {date_label}", fontsize=10)
         axis.set_xlabel("Corrected red", fontsize=9)
         axis.set_ylabel("Corrected green", fontsize=9)
@@ -963,7 +919,7 @@ def plot_wrapped_daywise_linear_relationships(
             (
                 f"slope={fit_row['slope']:.3f}\n"
                 f"R²={fit_row['r_squared']:.3f}\n"
-                f"n={int(fit_row['n_rois'])}{source_text}{artifact_text}"
+                f"n={int(fit_row['n_rois'])}"
             ),
             transform=axis.transAxes,
             ha="left",
@@ -986,7 +942,7 @@ def plot_wrapped_daywise_linear_relationships(
     if handles:
         figure.legend(handles, labels, loc="upper right", frameon=False)
     figure.suptitle(
-        "Daywise corrected red-green relationships: graph final assignments",
+        "Daywise corrected red-green relationships: all signal-valid native session ROIs",
         fontsize=14,
         y=0.995,
     )
@@ -994,8 +950,8 @@ def plot_wrapped_daywise_linear_relationships(
         0.5,
         0.01,
         (
-            f"Green values above {green_artifact_threshold:g} were excluded from the fit; "
-            f"total excluded rows = {excluded_total}."
+            "Points are all signal-valid native session ROIs; the red line is the "
+            "saved canonical session-population fit."
         ),
         ha="center",
         va="bottom",
@@ -1101,7 +1057,7 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         )
         acquisition_table.to_csv(run_dir / "acquisition_settings_by_session.csv", index=False)
         _write_json(run_dir / "acquisition_settings_qc.json", acquisition_qc)
-        if config.require_acquisition_settings_consistent and acquisition_qc["status"] == "warning":
+        if config.require_acquisition_settings_consistent and acquisition_qc["changed_required_fields"]:
             raise ValueError("Required acquisition settings changed across selected sessions: " + ", ".join(acquisition_qc["changed_required_fields"]))
     else:
         acquisition_table, acquisition_qc = acquisition_settings_qc([], [], 1050)
@@ -1207,11 +1163,7 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
     _log(start_seconds, "Annotating graph tracks by agreement with balanced affine matches")
     agreement_summary = annotate_graph_affine_agreement(match_dir)
 
-    required_extraction_files = [
-        extraction_dir / "matched_roi_log_ratio_metrics_complete.csv",
-        extraction_dir / "matched_daywise_green_red_linear_fit_summary.csv",
-    ]
-    if config.resume and all(path.exists() for path in required_extraction_files):
+    if config.resume and _has_current_extraction(extraction_dir):
         _log(start_seconds, f"Reusing existing extraction output: {extraction_dir}")
     else:
         _log(start_seconds, "Extracting graph-policy matched ROI intensities")

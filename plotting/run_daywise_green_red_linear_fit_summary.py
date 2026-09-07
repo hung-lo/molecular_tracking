@@ -229,20 +229,22 @@ def plot_daywise_scatter_summary(
     start_date : str, default=None
         Reference date used to convert day offsets into date labels.
     green_artifact_threshold : float, default=1500.0
-        Rows with corrected green values above this threshold are treated as
-        artifacts and excluded from the fitted lines.
+        Retained for API compatibility; it does not alter a supplied canonical
+        fit or its display population.
     """
 
     if roi_metrics.empty:
         raise ValueError("No ROI metrics were available for scatter plotting.")
 
-    filtered_metrics, excluded_total = _filter_green_artifacts(
-        roi_metrics,
-        green_artifact_threshold=green_artifact_threshold,
-    )
-    if filtered_metrics.empty:
-        raise ValueError("No ROI metrics remained after filtering green artifacts.")
-    plot_fit_summary = summarize_daily_green_red_linear_fits(filtered_metrics)
+    plot_fit_summary = fit_summary.copy()
+    if {"red_signal_qc_pass", "green_signal_qc_pass"}.issubset(roi_metrics.columns):
+        roi_metrics = roi_metrics.loc[
+            roi_metrics["red_signal_qc_pass"].eq(True)
+            & roi_metrics["green_signal_qc_pass"].eq(True)
+        ].copy()
+    if roi_metrics.empty:
+        raise ValueError("No signal-valid ROI metrics were available for scatter plotting.")
+    excluded_total = 0
     timing = resolve_plot_day_axis(roi_metrics, start_date=start_date)
     source_to_plot = dict(zip(timing["source_day"], timing["plot_day"], strict=True))
     source_to_date = dict(zip(timing["source_day"], timing["date_label"], strict=True))
@@ -272,13 +274,7 @@ def plot_daywise_scatter_summary(
             .dropna(subset=["red", "green"])
             .reset_index(drop=True)
         )
-        filtered_day_table, excluded_count = _filter_green_artifacts(
-            day_table,
-            green_artifact_threshold=green_artifact_threshold,
-        )
-        if filtered_day_table.empty and not day_table.empty:
-            filtered_day_table = day_table.copy()
-            excluded_count = 0
+        filtered_day_table, excluded_count = day_table, 0
         if not filtered_day_table.empty:
             x_min = min(x_min, float(filtered_day_table["red"].min()))
             x_max = max(x_max, float(filtered_day_table["red"].max()))
@@ -300,17 +296,20 @@ def plot_daywise_scatter_summary(
     for axis, (day_value, day_table, excluded_count), date_label in zip(
         axes, panels, date_labels, strict=True
     ):
+        fit_row = plot_fit_summary.loc[plot_fit_summary["day"].eq(day_value)].iloc[0]
         x_values = day_table["red"].to_numpy(dtype=float)
         y_values = day_table["green"].to_numpy(dtype=float)
         if len(day_table) >= 2:
-            x_grid, y_hat, y_low, y_high = compute_regression_ci_band(x_values, y_values)
+            x_grid = np.linspace(float(x_values.min()), float(x_values.max()), 200)
+            y_hat = float(fit_row["intercept"]) + float(fit_row["slope"]) * x_grid
+            y_low = np.asarray([], dtype=float)
+            y_high = np.asarray([], dtype=float)
         else:
             x_grid = np.asarray([], dtype=float)
             y_hat = np.asarray([], dtype=float)
             y_low = np.asarray([], dtype=float)
             y_high = np.asarray([], dtype=float)
 
-        fit_row = plot_fit_summary.loc[plot_fit_summary["day"].eq(day_value)].iloc[0]
         axis.scatter(
             x_values,
             y_values,
@@ -320,8 +319,7 @@ def plot_daywise_scatter_summary(
             edgecolors="none",
             rasterized=True,
         )
-        if len(x_grid) > 0 and np.all(np.isfinite(y_low)) and np.all(np.isfinite(y_high)):
-            axis.fill_between(x_grid, y_low, y_high, color="#8ecae6", alpha=0.35, linewidth=0)
+        if len(x_grid) > 0:
             axis.plot(x_grid, y_hat, color="#d62828", linewidth=2.0)
 
         axis.set_title(f"Day {int(source_to_plot[int(day_value)])}\n{source_to_date[int(day_value)]}", fontsize=11)
@@ -365,12 +363,9 @@ def plot_daywise_scatter_summary(
         0.5,
         0.02,
         (
-            "Each panel shows one imaging day from the current mean-merge SAM "
-            "size+shape-filtered ROI set. The red line is the fitted linear "
-            "relationship between corrected red and green values, and the blue "
-            "band is the 95% confidence interval of the mean fit. "
-            f"Green values above {green_artifact_threshold:g} were excluded from the fit; "
-            f"total excluded rows = {excluded_total}."
+            "Each panel shows all signal-valid native session ROIs. The red line "
+            "is the saved canonical session-population fit; no display filter "
+            "recomputes or changes that fit."
         ),
         ha="center",
         va="bottom",
@@ -404,20 +399,15 @@ def plot_fit_parameter_summary(
     start_date : str, default=None
         Reference date used to convert day offsets into date labels.
     green_artifact_threshold : float, default=1500.0
-        Rows with corrected green values above this threshold are treated as
-        artifacts and excluded from the plotted fit summary.
+        Retained for API compatibility; it does not alter a supplied fit.
     """
 
     plot_fit_summary = fit_summary.copy()
-    excluded_total = 0
-    if roi_metrics is not None and not roi_metrics.empty:
-        filtered_metrics, excluded_total = _filter_green_artifacts(
-            roi_metrics,
-            green_artifact_threshold=green_artifact_threshold,
-        )
-        if not filtered_metrics.empty:
-            plot_fit_summary = summarize_daily_green_red_linear_fits(filtered_metrics)
-            roi_metrics = filtered_metrics
+    if roi_metrics is not None and {"red_signal_qc_pass", "green_signal_qc_pass"}.issubset(roi_metrics.columns):
+        roi_metrics = roi_metrics.loc[
+            roi_metrics["red_signal_qc_pass"].eq(True)
+            & roi_metrics["green_signal_qc_pass"].eq(True)
+        ].copy()
 
     day_values = plot_fit_summary["day"].to_numpy(dtype=int)
     date_labels = _resolve_day_date_labels(
@@ -487,7 +477,7 @@ def plot_fit_parameter_summary(
         edgecolor="#6c757d",
     )
     n_axis.set_title("ROI count by day", fontsize=11)
-    n_axis.set_ylabel("Number of filtered ROIs", fontsize=10)
+    n_axis.set_ylabel("Number of fit-population ROIs", fontsize=10)
 
     for axis in axes.ravel():
         axis.set_xticks(x_positions, date_labels, rotation=30, ha="right")
@@ -498,11 +488,9 @@ def plot_fit_parameter_summary(
         0.5,
         0.02,
         (
-            "This summary tracks how the fitted corrected green-vs-red "
-            "relationship changes across imaging days for the current mean-merge "
-            "SAM size+shape-filtered ROI set. "
-            f"Green values above {green_artifact_threshold:g} were excluded from the plotted fit; "
-            f"total excluded rows = {excluded_total}."
+            "This summary uses the saved canonical fit from all signal-valid "
+            "native session ROIs. Plotting does not refit or apply an artifact "
+            "threshold to the canonical fit."
         ),
         ha="center",
         va="bottom",

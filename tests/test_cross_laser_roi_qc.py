@@ -8,6 +8,7 @@ from cross_laser_roi_qc import (
     fixed_coverage_by_long_axis,
     generate_cross_laser_qc,
     high_confidence_long_axis_statistics,
+    moving_density_by_long_axis,
     select_cross_laser_examples,
 )
 
@@ -67,6 +68,13 @@ def test_high_scatter_and_bin_medians_use_exact_same_high_population() -> None:
     assert high["label_1050"].tolist() == [1, 2]
     assert int(medians["n_high"].sum()) == 2
     assert medians.loc[medians["bin"].eq(0), "median_raw_delta_z_planes"].item() == 2.0
+
+
+def test_moving_density_excludes_centroids_outside_fixed_xy() -> None:
+    moving = pd.DataFrame({"centroid_1050_x": [-1, 2, 11], "centroid_1050_y": [2, 2, 2]})
+    density = moving_density_by_long_axis(moving, image_shape_yx=(10, 10), bins=2)
+    assert int(density["n_920_detections"].sum()) == 1
+    assert int(density["n_920_outside_fixed_xy"].iloc[0]) == 2
 
 
 def test_example_selection_is_deterministic_and_spatially_distributed() -> None:

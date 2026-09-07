@@ -19,3 +19,17 @@ def test_eligibility_and_centering_preserve_missingness() -> None:
     assert np.allclose(centered.mean(), 0)
     assert np.array_equal(matrices["mask"][["s0", "s1", "s2"]].to_numpy(), matrices["raw"][["s0", "s1", "s2"]].notna().astype(int).to_numpy())
     assert matrices["complete_centered"][["s0", "s1", "s2"]].isna().sum().sum() == 0
+
+
+def test_signal_invalid_is_not_tracking_missingness() -> None:
+    observations = pd.DataFrame([
+        {"track_uid": "d", "roi_id": 4, "session_index": i, "session_id": f"s{i}", "elapsed_days": i, "ratio_qc_pass": i != 1, "green_fit_signed_distance": float(i) if i != 1 else np.nan}
+        for i in range(3)
+    ])
+    tracks = pd.DataFrame({"track_uid": ["d"], "roi_id": [4], "cluster_id": [4], "has_cycle_conflict": [False]})
+    eligibility, _ = build_trajectory_eligibility(observations, tracks, ["s0", "s1", "s2"], TrajectoryEligibilityConfig(min_sessions=2))
+    row = eligibility.iloc[0]
+    assert row["n_track_labels_present"] == 3
+    assert row["n_signal_valid_sessions"] == 2
+    assert row["n_usable_trajectory_sessions"] == 2
+    assert row["n_track_present_but_signal_invalid"] == 1

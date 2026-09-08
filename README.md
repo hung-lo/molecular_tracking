@@ -104,6 +104,7 @@ molecular_tracking/
 - `docs/daywise_spatial_graph_matching.md`: experimental graph refinement overview.
 - `docs/daywise_pipeline.md`: daywise extraction and completeness rules.
 - `docs/output_schema.md`: public CSV schema reference.
+- `docs/fucci_color_state_postprocessing.md`: Dead-referenced Fucci color-state, trajectory, PCA, and event analysis.
 - `docs/qc_interpretation.md`: how to read matching QC.
 - `docs/troubleshooting.md`: common failure modes and checks.
 - `examples/daywise_session_manifest.csv`: starter manifest template.
@@ -141,6 +142,7 @@ pytest tests/
 - Use the legacy weekly workflow when you have weekly average masks plus the daywise registered `*_SyN.tif` images that came out of the `weeklyRegister` notebook.
 - Use the new daywise workflow when you segment each day separately, for example with Cellpose or SAM, and want matching to run directly on those daily masks.
 - The new daywise workflow does not replace the weekly workflow. It runs alongside it and reuses the same downstream dark-correction and green/red metric helpers.
+- Fucci color-state analysis is an additive postprocessing layer. It consumes an explicit master-run directory and never runs automatically from the matching/extraction pipeline.
 
 ## Weekly workflow example (`crop_512`)
 

@@ -41,3 +41,12 @@ Empty files keep the same headers as populated files.
 - `matched_roi_trajectory_missingness_by_session.csv`: per-session missingness summary.
 - `matched_roi_trajectory_signed_distance_matrix_centered_with_nan.csv`: observed values centered by session, with `NaN` retained.
 - `matched_roi_pca_complete_case_raw.csv` and `matched_roi_pca_complete_case_centered.csv`: complete-case PCA inputs; the centered file has no imputation or variance scaling.
+
+## Fucci color-state postprocessing
+
+- `postprocess/fucci_color_state/normalization/matched_roi_color_state_all_observed.csv`: matched observations with modal expected green, log2 residual, fixed Dead-referenced `color_z`, and state labels.
+- `postprocess/fucci_color_state/normalization/color_state_session_fits.csv`: per-session native-population modal fits and diagnostics.
+- `postprocess/fucci_color_state/trajectory/`: color-Z eligibility and NaN-preserving trajectory matrices.
+- `postprocess/fucci_color_state/pca/`: complete-case NumPy SVD scores, loadings, and explained variance.
+- `postprocess/fucci_color_state/events/`: hysteretic middle-to-low/high entry events and event-aligned summaries.
+- `postprocess/fucci_color_state/run_manifest.json`: source hashes, reference hash, settings, and output provenance.

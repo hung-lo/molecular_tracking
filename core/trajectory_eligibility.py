@@ -30,11 +30,14 @@ def build_trajectory_eligibility(
     tracks: pd.DataFrame,
     session_ids: list[str],
     config: TrajectoryEligibilityConfig,
+    feature_column: str = "green_fit_signed_distance",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows = []
+    if feature_column not in observations:
+        raise ValueError(f"Trajectory observations are missing feature column: {feature_column}")
     usable_observations = observations.loc[
         observations["ratio_qc_pass"].eq(True)
-        & observations["green_fit_signed_distance"].notna()
+        & observations[feature_column].notna()
     ].copy()
     if "geometry_qc_pass" in usable_observations and not usable_observations["geometry_qc_pass"].isna().all():
         usable_observations = usable_observations.loc[usable_observations["geometry_qc_pass"].eq(True)]
@@ -112,11 +115,15 @@ def build_trajectory_eligibility(
 
 
 def build_trajectory_matrices(
-    observations: pd.DataFrame, session_ids: list[str]
+    observations: pd.DataFrame,
+    session_ids: list[str],
+    feature_column: str = "green_fit_signed_distance",
 ) -> dict[str, pd.DataFrame]:
+    if feature_column not in observations:
+        raise ValueError(f"Trajectory observations are missing feature column: {feature_column}")
     index_columns = [column for column in ["match_policy", "track_uid", "roi_id"] if column in observations]
     raw = observations.pivot_table(
-        index=index_columns, columns="session_id", values="green_fit_signed_distance", aggfunc="first"
+        index=index_columns, columns="session_id", values=feature_column, aggfunc="first"
     ).reindex(columns=session_ids)
     mask = raw.notna().astype(int)
     centered = raw - raw.mean(axis=0)

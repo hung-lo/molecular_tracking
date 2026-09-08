@@ -408,19 +408,19 @@ def test_master_pipeline_skips_ranked_roi_views_and_records_null_outputs(
 
 
 def test_wrapped_plot_skips_empty_confidence_interval(tmp_path: Path) -> None:
-    metrics_path = tmp_path / "metrics.csv"
-    fit_summary_path = tmp_path / "fit_summary.csv"
-    output_path = tmp_path / "wrapped.png"
+    metrics_path = tmp_path / 'metrics.csv'
+    fit_summary_path = tmp_path / 'fit_summary.csv'
+    output_path = tmp_path / 'wrapped.png'
     pd.DataFrame(
-        {"day": [0, 0], "red": [1.0, 2.0], "green": [2.0, 4.0]}
+        {'day': [0, 0], 'red': [1.0, 2.0], 'green': [2.0, 4.0]}
     ).to_csv(metrics_path, index=False)
     pd.DataFrame(
         {
-            "day": [0],
-            "slope": [2.0],
-            "intercept": [0.0],
-            "r_squared": [1.0],
-            "n_rois": [2],
+            'day': [0],
+            'slope': [2.0],
+            'intercept': [0.0],
+            'r_squared': [1.0],
+            'n_rois': [2],
         }
     ).to_csv(fit_summary_path, index=False)
 
@@ -428,7 +428,7 @@ def test_wrapped_plot_skips_empty_confidence_interval(tmp_path: Path) -> None:
         metrics_path=metrics_path,
         fit_summary_path=fit_summary_path,
         output_path=output_path,
-        start_date="20260819",
+        start_date='20260819',
     )
 
     assert output_path.is_file()

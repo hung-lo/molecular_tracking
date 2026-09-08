@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="/mnt/d/Codex_folder/molecular_tracking"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$SCRIPT_DIR"
 PROJECT_CONFIG="config/project.local.toml"
 
 cd "$REPO"

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import shutil
 import sys
 from typing import Any
 
@@ -23,12 +24,23 @@ from plotting.fucci_color_state_plots import plot_comparison_distributions, plot
 def _label(color_dir: Path, log: dict[str, Any], index: int, labels: list[str] | None) -> str:
     if labels and index < len(labels):
         return labels[index]
-    source = Path(log.get("source_master_run_dir", color_dir)).name
     if log.get("mouse_id"):
         return str(log["mouse_id"])
     if isinstance(log.get("project"), dict) and log["project"].get("mouse_id"):
         return str(log["project"]["mouse_id"])
-    return source
+    return color_dir.name
+
+
+def _validate_output(output: Path, inputs: list[Path]) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    home = Path.home()
+    if output == Path("/") or output == home or home.is_relative_to(output):
+        raise ValueError(f"Refusing dangerous comparison output directory: {output}")
+    if output == repo_root or repo_root.is_relative_to(output):
+        raise ValueError(f"Refusing repository or ancestor as comparison output: {output}")
+    for input_dir in inputs:
+        if output.is_relative_to(input_dir) or input_dir.is_relative_to(output):
+            raise ValueError(f"Comparison output cannot overlap input color-state directory: {output}")
 
 
 def _parse_overrides(values: list[str]) -> dict[str, int]:
@@ -52,12 +64,14 @@ def compare_color_state_runs(
     if not color_state_dirs:
         raise ValueError("At least one --color-state-dir is required")
     overrides = _parse_overrides(session_overrides or [])
+    inputs = [Path(value).expanduser().resolve() for value in color_state_dirs]
+    output = Path(output_dir).expanduser().resolve()
+    _validate_output(output, inputs)
     runs: list[dict[str, Any]] = []
-    for index, value in enumerate(color_state_dirs):
-        directory = Path(value).expanduser().resolve()
+    for index, directory in enumerate(inputs):
         log = json.loads((directory / "run_manifest.json").read_text(encoding="utf-8"))
         label = _label(directory, log, index, labels)
-        scored = pd.read_csv(directory / "normalization/matched_roi_color_state_all_observed.csv")
+        native_scored = pd.read_csv(directory / "normalization/session_population_eclipse_state.csv")
         occupancy = pd.read_csv(directory / "normalization/eclipse_state_occupancy_by_session.csv")
         fits = pd.read_csv(directory / "normalization/color_state_session_fits.csv")
         occupancy = occupancy.merge(fits[["session_id", "session_index"]], on="session_id", how="left", validate="one_to_one")
@@ -70,22 +84,18 @@ def compare_color_state_runs(
         else:
             chosen = occupancy.iloc[(occupancy["pct_strong_low"] - median_low).abs().argmin()]
         fit = fits.loc[fits["session_id"].astype(str).eq(str(chosen["session_id"]))].iloc[0]
-        native_path = Path(log["source_master_run_dir"]) / "extraction/matched_session_population_roi_metrics.csv"
-        native = pd.read_csv(native_path)
-        runs.append({"label": label, "scored": scored, "occupancy": occupancy, "chosen": chosen, "fit": fit, "native": native})
+        runs.append({"label": label, "native_scored": native_scored, "occupancy": occupancy, "chosen": chosen, "fit": fit})
 
-    output = Path(output_dir).expanduser().resolve()
     if output.exists():
         if not overwrite:
             raise FileExistsError(f"Comparison output already exists: {output}; use --overwrite")
         if not output.is_dir():
             raise ValueError(f"Comparison output is not a directory: {output}")
-        import shutil
         shutil.rmtree(output)
     output.mkdir(parents=True)
-    distribution_tables = [(run["label"], run["scored"]) for run in runs]
+    distribution_tables = [(run["label"], run["native_scored"]) for run in runs]
     plot_comparison_distributions(distribution_tables, output / "comparison_color_z_distributions.png")
-    plot_comparison_modal_fits([(run["label"], run["native"].loc[run["native"]["session_id"].astype(str).eq(str(run["chosen"]["session_id"]))], run["fit"]) for run in runs], output / "comparison_green_red_sd_zones.png")
+    plot_comparison_modal_fits([(run["label"], run["native_scored"].loc[run["native_scored"]["session_id"].astype(str).eq(str(run["chosen"]["session_id"]))], run["fit"]) for run in runs], output / "comparison_green_red_sd_zones.png")
 
     occupancy_rows = []
     for run in runs:
@@ -96,7 +106,7 @@ def compare_color_state_runs(
     occupancy_table.to_csv(output / "comparison_session_state_occupancy.csv", index=False)
     plot_comparison_state_percentages(occupancy_table, output / "comparison_state_bin_percentages.png")
     chosen_sessions = {run["label"]: {"session_id": str(run["chosen"]["session_id"]), "session_index": int(run["chosen"]["session_index"]), "strong_low_percentage": float(run["chosen"]["pct_strong_low"])} for run in runs}
-    result = {"schema_version": "fucci_color_state_comparison_v1", "representative_sessions": chosen_sessions}
+    result = {"schema_version": "fucci_color_state_comparison_v1", "representative_sessions": chosen_sessions, "native_observation_counts": {run["label"]: int(len(run["native_scored"])) for run in runs}}
     (output / "run_log.json").write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
     return result
 

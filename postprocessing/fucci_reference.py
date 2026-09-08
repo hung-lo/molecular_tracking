@@ -102,8 +102,10 @@ def build_dead_reference(
 ) -> dict[str, Any]:
     """Fit every control session and write one immutable reference bundle."""
 
-    if len(reference_run_dirs) < 2:
-        raise ValueError("At least two --reference-run-dir values are required")
+    if not reference_run_dirs:
+        raise ValueError("At least one --reference-run-dir value is required")
+    if len(reference_run_dirs) < 2 and not allow_single_reference_mouse:
+        raise ValueError("At least two --reference-run-dir values are required unless allow_single_reference_mouse is enabled")
     inputs = [resolve_fucci_master_run(path, require_matched=False) for path in reference_run_dirs]
     mouse_ids = {item.mouse_id for item in inputs}
     if len(mouse_ids) < 2 and not allow_single_reference_mouse:

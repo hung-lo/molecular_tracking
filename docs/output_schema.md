@@ -45,6 +45,7 @@ Empty files keep the same headers as populated files.
 ## Fucci color-state postprocessing
 
 - `postprocess/fucci_color_state/normalization/session_population_eclipse_state.csv`: all native session ROIs scored with modal expected reporter, ECLIPSE deviation, fixed Dead-referenced `eclipse_z`, and state labels.
+- Canonical ECLIPSE score columns include `eclipse_ratio`, `log2_eclipse_ratio`, `eclipse_deviation_log2`, `eclipse_z`, `eclipse_state_bin`, `eclipse_core_state`, `eclipse_state_qc_pass`, and `eclipse_state_qc_reason`; current green is reporter and red is reference.
 - `postprocess/fucci_color_state/normalization/matched_roi_color_state_all_observed.csv`: matched observations with the same canonical `eclipse_*` fields; legacy `color_*` aliases remain during the transition release.
 - `postprocess/fucci_color_state/normalization/eclipse_state_occupancy_by_session.csv`: primary state occupancy from all valid native session ROIs.
 - `postprocess/fucci_color_state/normalization/matched_only_eclipse_state_occupancy_by_session.csv`: explicitly matched-only occupancy diagnostic.

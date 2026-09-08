@@ -89,10 +89,13 @@ def _merge_geometry(observations: pd.DataFrame, geometry: pd.DataFrame) -> pd.Da
 
 def _occupancy(scored: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     bins = ["strong_low", "low_transition", "middle", "high_transition", "strong_high"]
+    state_column = "eclipse_state_bin" if "eclipse_state_bin" in scored else "color_state_bin"
+    qc_column = "eclipse_state_qc_pass" if "eclipse_state_qc_pass" in scored else "color_state_qc_pass"
+    reason_column = "eclipse_state_qc_reason" if "eclipse_state_qc_reason" in scored else "color_state_qc_reason"
     occupancy_rows: list[dict[str, Any]] = []
     qc_rows: list[dict[str, Any]] = []
     for session_id, group in scored.groupby("session_id", sort=False):
-        valid = group.loc[group["eclipse_state_qc_pass"].eq(True)]
+        valid = group.loc[group[qc_column].eq(True)]
         total = len(valid)
         source = group.iloc[0]
         row: dict[str, Any] = {
@@ -103,7 +106,7 @@ def _occupancy(scored: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
             "n_valid_observations": int(total),
         }
         for state in bins:
-            count = int(valid["color_state_bin"].eq(state).sum())
+            count = int(valid[state_column].eq(state).sum())
             row[f"n_{state}"] = count
             row[f"pct_{state}"] = float(100 * count / total) if total else np.nan
         occupancy_rows.append(row)
@@ -115,7 +118,7 @@ def _occupancy(scored: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
             "n_total_observations": int(len(group)),
             "n_valid_observations": int(total),
             "n_invalid_observations": int(len(group) - total),
-            "invalid_reason_counts": json.dumps(group.loc[~group["eclipse_state_qc_pass"], "eclipse_state_qc_reason"].value_counts().to_dict(), sort_keys=True),
+            "invalid_reason_counts": json.dumps(group.loc[~group[qc_column], reason_column].value_counts().to_dict(), sort_keys=True),
         })
     return pd.DataFrame(occupancy_rows), pd.DataFrame(qc_rows)
 
@@ -196,6 +199,8 @@ def run_color_state(
         "git_commit": _git_commit(),
         "python_version": sys.version,
         "package_versions": _package_versions(),
+        "mouse_id": source.mouse_id,
+        "laser_nm": source.laser_nm,
         "source_master_run_dir": str(source.run_dir),
         "source_master_run_manifest_sha256": input_hashes["run_manifest.json"],
         "source_extraction_run_log_sha256": input_hashes["extraction/run_log.json"],

@@ -44,9 +44,18 @@ def test_robust_sd_mad_and_invalid_score() -> None:
     assert robust == 1.4826
     assert robust < np.std(values, ddof=1)
     fits = pd.DataFrame({"session_id": ["s0"], "modal_slope": [-1.0], "modal_intercept": [1.0], "modal_bandwidth_green_units": [1.0]})
-    scored = score_color_state_table(pd.DataFrame({"session_id": ["s0"], "green": [5.0], "red": [2.0], "ratio_qc_pass": [True]}), fits, 0.2)
+    scored = score_color_state_table(pd.DataFrame({
+        "session_id": ["s0", "s0", "s0"],
+        "green": [5.0, 5.0, 5.0],
+        "red": [2.0, 0.0, 2.0],
+        "ratio_qc_pass": [True, True, False],
+    }), fits, 0.2)
     assert pd.isna(scored.loc[0, "color_z"])
     assert scored.loc[0, "color_state_qc_reason"] == "nonpositive_or_nonfinite_predicted_green"
+    assert np.isclose(scored.loc[0, "eclipse_ratio"], 2.5)
+    assert np.isclose(scored.loc[0, "log2_eclipse_ratio"], np.log2(2.5))
+    assert pd.isna(scored.loc[1, "eclipse_ratio"])
+    assert pd.isna(scored.loc[2, "log2_eclipse_ratio"])
 
 
 def test_color_state_boundaries() -> None:

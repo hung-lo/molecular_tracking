@@ -16,6 +16,8 @@ tracks:
 ```text
 predicted_green = modal_intercept + modal_slope * red
 log2_green_over_expected = log2(green / predicted_green)
+eclipse_ratio = green / red
+log2_eclipse_ratio = log2(green / red)
 ```
 
 The fit uses an OLS initialization followed by a deterministic Gaussian-kernel
@@ -36,9 +38,11 @@ mouse.
 Z_E = eclipse_deviation_log2 / dead_reference_robust_sd_log2
 ```
 
-The public score is `eclipse_z` (also written as `Z_E`). The current construct
-uses green as reporter and red as reference; the ECLIPSE names remain
-fluorophore-agnostic. The five bins are `strong_low` (`Z_E < -2`),
+The public raw ratio fields are `eclipse_ratio` and `log2_eclipse_ratio`; the
+public score is `eclipse_z` (also written as `Z_E`). The current construct
+uses green as reporter and red as reference. Future constructs may map
+different fluorescence channels to reporter and reference, while the ECLIPSE
+names remain fluorophore-agnostic. The five bins are `strong_low` (`Z_E < -2`),
 `low_transition` (`-2 <= Z_E < -1`), `middle` (`-1 <= Z_E <= 1`),
 `high_transition` (`1 < Z_E <= 2`), and `strong_high` (`Z_E > 2`). Only strong low, middle, and strong high are core states. Transition
 zones therefore provide hysteresis for entry events without being forced into a

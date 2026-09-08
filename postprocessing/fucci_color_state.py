@@ -305,6 +305,11 @@ def score_color_state_table(
         reasons.loc[~ratio_valid] = "ratio_qc_fail"
     valid_signal = np.isfinite(green) & (green > 0) & np.isfinite(red) & (red > 0)
     reasons.loc[ratio_valid & ~valid_signal] = "nonpositive_or_nonfinite_signal"
+    raw_ratio_valid = ratio_valid & valid_signal
+    result["eclipse_ratio"] = np.nan
+    result["log2_eclipse_ratio"] = np.nan
+    result.loc[raw_ratio_valid, "eclipse_ratio"] = green[raw_ratio_valid] / red[raw_ratio_valid]
+    result.loc[raw_ratio_valid, "log2_eclipse_ratio"] = np.log2(result.loc[raw_ratio_valid, "eclipse_ratio"])
     valid_prediction = np.isfinite(predicted) & (predicted > 0)
     reasons.loc[ratio_valid & valid_signal & ~valid_prediction] = "nonpositive_or_nonfinite_predicted_green"
     valid = ratio_valid & valid_signal & valid_prediction

@@ -41,7 +41,7 @@ def test_color_state_output_is_additive_and_protected(tmp_path: Path) -> None:
     native = pd.read_csv(output / "normalization/session_population_eclipse_state.csv")
     occupancy = pd.read_csv(output / "normalization/eclipse_state_occupancy_by_session.csv")
     matched_occupancy = pd.read_csv(output / "normalization/matched_only_eclipse_state_occupancy_by_session.csv")
-    assert {"predicted_green_modal", "eclipse_deviation_log2", "eclipse_z"}.issubset(scored.columns)
+    assert {"predicted_green_modal", "eclipse_ratio", "log2_eclipse_ratio", "eclipse_deviation_log2", "eclipse_z"}.issubset(scored.columns)
     assert len(scored) == 3
     assert len(native) == 180
     assert occupancy["n_valid_observations"].tolist() == [60, 60, 60]

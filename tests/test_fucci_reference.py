@@ -44,6 +44,14 @@ def test_build_dead_reference_writes_equal_mouse_reference_bundle(tmp_path: Path
     assert (output / "plots/dead_reference_robust_sd_by_session.png").is_file()
 
 
+def test_build_dead_reference_allows_one_run_when_requested(tmp_path: Path) -> None:
+    run = _reference_run(tmp_path, "Dead_single", 3)
+    with pytest.raises(ValueError, match="At least two"):
+        build_dead_reference([run], tmp_path / "reference_default")
+    reference = build_dead_reference([run], tmp_path / "reference_single", allow_single_reference_mouse=True)
+    assert reference["reference_runs"][0]["mouse_id"] == "Dead_single"
+
+
 def test_reference_overwrite_rejects_input_or_filesystem_root(tmp_path: Path) -> None:
     first = _reference_run(tmp_path, "Dead_1", 1)
     second = _reference_run(tmp_path, "Dead_2", 2)

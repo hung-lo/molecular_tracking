@@ -24,8 +24,9 @@ def _z_column(observations: pd.DataFrame) -> str:
 
 
 def _usable_count(group: pd.DataFrame) -> int:
-    if "color_state_qc_pass" in group:
-        valid = group["color_state_qc_pass"].astype(str).str.lower().isin({"true", "1", "yes"})
+    qc_column = "eclipse_state_qc_pass" if "eclipse_state_qc_pass" in group else "color_state_qc_pass" if "color_state_qc_pass" in group else None
+    if qc_column is not None:
+        valid = group[qc_column].astype(str).str.lower().isin({"true", "1", "yes"})
     else:
         valid = pd.to_numeric(group[_z_column(group)], errors="coerce").notna()
     return int(group.loc[valid, "session_id"].astype(str).nunique()) if "session_id" in group else int(valid.sum())

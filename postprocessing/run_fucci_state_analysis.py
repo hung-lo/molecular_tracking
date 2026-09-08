@@ -20,7 +20,7 @@ for _path in (_ROOT, _ROOT / "core", _ROOT / "postprocessing", _ROOT / "plotting
         sys.path.insert(0, str(_path))
 
 from fucci_pca import compute_color_z_pca, pca_output_tables
-from fucci_run_io import file_sha256, resolve_fucci_master_run
+from fucci_run_io import file_sha256, is_filesystem_root, resolve_fucci_master_run
 from fucci_state_events import build_event_aligned_observations, detect_middle_entry_events, summarize_event_aligned_observations
 from plotting.fucci_color_state_plots import plot_event_summary, plot_pca, plot_pca_loadings
 from trajectory_eligibility import TrajectoryEligibilityConfig, build_trajectory_eligibility, build_trajectory_matrices
@@ -90,6 +90,12 @@ def run_state_analysis(
     """Generate all downstream color-Z products under an existing color-state run."""
 
     color_dir = Path(color_state_dir).expanduser().resolve()
+    repo_root = Path(__file__).resolve().parent.parent
+    home = Path.home()
+    if is_filesystem_root(color_dir) or color_dir == home or home.is_relative_to(color_dir):
+        raise ValueError(f"Refusing dangerous state-analysis output directory: {color_dir}")
+    if color_dir == repo_root or repo_root.is_relative_to(color_dir):
+        raise ValueError(f"Refusing repository or ancestor as state-analysis output: {color_dir}")
     if not color_dir.is_dir():
         raise FileNotFoundError(f"Color-state directory was not found: {color_dir}")
     if event_axis not in {"elapsed_days", "session_index"}:

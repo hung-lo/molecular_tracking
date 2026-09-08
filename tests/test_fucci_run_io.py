@@ -1,10 +1,21 @@
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pandas as pd
 import pytest
 
-from fucci_run_io import resolve_fucci_master_run
+from fucci_run_io import is_filesystem_root, resolve_fucci_master_run
+
+
+def test_filesystem_root_detection_is_platform_independent() -> None:
+    assert is_filesystem_root(PurePosixPath("/"))
+    assert is_filesystem_root(PureWindowsPath("C:/"))
+    assert is_filesystem_root(PureWindowsPath("D:/"))
+    assert is_filesystem_root(PureWindowsPath("F:/"))
+    assert not is_filesystem_root(PureWindowsPath("C:"))
+    assert not is_filesystem_root(PurePosixPath("/tmp/output"))
+    assert not is_filesystem_root(PureWindowsPath("C:/data"))
+    assert not is_filesystem_root(PureWindowsPath("D:/analysis/output"))
 
 
 def _run(tmp_path: Path, *, version: str = "0.3.1", population: str = "all_valid_session_rois", with_manifest: bool = True) -> Path:

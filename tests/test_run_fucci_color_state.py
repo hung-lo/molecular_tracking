@@ -52,10 +52,14 @@ def test_color_state_output_is_additive_and_protected(tmp_path: Path) -> None:
         run_color_state(root, reference)
     with pytest.raises(ValueError, match="protected"):
         run_color_state(root, reference, output_dir=tmp_path, overwrite=True)
+    with pytest.raises(ValueError, match="dangerous"):
+        run_color_state(root, reference, output_dir="/", overwrite=True)
 
 
 def test_state_analysis_writes_color_z_trajectory_and_pca_outputs(tmp_path: Path) -> None:
     root, reference = _master_run(tmp_path)
+    with pytest.raises(ValueError, match="dangerous"):
+        run_state_analysis("/", overwrite=True)
     result = run_color_state(root, reference)
     output = Path(result["output_paths"]["observations"]).parent.parent
     moved = tmp_path / "moved_master"

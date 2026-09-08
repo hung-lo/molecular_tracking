@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 import pandas as pd
@@ -41,6 +41,12 @@ def file_sha256(path: str | Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def is_filesystem_root(path: PurePath) -> bool:
+    """Return whether a platform-native or pure path is a filesystem root."""
+
+    return bool(path.root) and path.parent == path
 
 
 def _version_tuple(value: Any) -> tuple[int, int, int]:

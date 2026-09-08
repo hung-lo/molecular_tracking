@@ -19,6 +19,7 @@ for _path in (_ROOT, _ROOT / "postprocessing", _ROOT / "plotting"):
         sys.path.insert(0, str(_path))
 
 from plotting.fucci_color_state_plots import plot_comparison_distributions, plot_comparison_modal_fits, plot_comparison_state_percentages
+from fucci_run_io import is_filesystem_root
 
 
 def _label(color_dir: Path, log: dict[str, Any], index: int, labels: list[str] | None) -> str:
@@ -34,7 +35,7 @@ def _label(color_dir: Path, log: dict[str, Any], index: int, labels: list[str] |
 def _validate_output(output: Path, inputs: list[Path]) -> None:
     repo_root = Path(__file__).resolve().parent.parent
     home = Path.home()
-    if output == Path("/") or output == home or home.is_relative_to(output):
+    if is_filesystem_root(output) or output == home or home.is_relative_to(output):
         raise ValueError(f"Refusing dangerous comparison output directory: {output}")
     if output == repo_root or repo_root.is_relative_to(output):
         raise ValueError(f"Refusing repository or ancestor as comparison output: {output}")

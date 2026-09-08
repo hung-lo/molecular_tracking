@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 from fucci_color_state import MODAL_BANDWIDTH_SCALE, MODAL_METHOD, STATE_THRESHOLDS, fit_session_modal_fits, robust_sd_mad
-from fucci_run_io import file_sha256, resolve_fucci_master_run
+from fucci_run_io import file_sha256, is_filesystem_root, resolve_fucci_master_run
 from plotting.fucci_color_state_plots import plot_dead_reference_residuals, plot_dead_reference_robust_sd
 
 
@@ -82,7 +82,7 @@ def _prepare_output(output_dir: Path, overwrite: bool) -> None:
 def _validate_reference_output(output_dir: Path, inputs: list[Any]) -> None:
     repo_root = Path(__file__).resolve().parent.parent
     home = Path.home()
-    if output_dir == Path("/") or output_dir == home or home.is_relative_to(output_dir):
+    if is_filesystem_root(output_dir) or output_dir == home or home.is_relative_to(output_dir):
         raise ValueError(f"Refusing dangerous reference output directory: {output_dir}")
     if output_dir == repo_root or repo_root.is_relative_to(output_dir):
         raise ValueError(f"Refusing repository or ancestor as reference output: {output_dir}")

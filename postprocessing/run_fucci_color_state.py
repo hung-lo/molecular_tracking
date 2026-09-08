@@ -21,7 +21,7 @@ for _path in (_ROOT, _ROOT / "core", _ROOT / "matching", _ROOT / "plotting", _RO
         sys.path.insert(0, str(_path))
 
 from fucci_color_state import MODAL_BANDWIDTH_SCALE, fit_session_modal_fits, score_color_state_table
-from fucci_run_io import file_sha256, resolve_fucci_master_run
+from fucci_run_io import file_sha256, is_filesystem_root, resolve_fucci_master_run
 from plotting.fucci_color_state_plots import plot_color_z_distribution, plot_modal_fit_sd_zones
 
 
@@ -164,6 +164,12 @@ def run_color_state(
     occupancy, native_qc = _occupancy(native_scored)
     matched_only_occupancy, matched_qc = _occupancy(scored)
     output = Path(output_dir).expanduser().resolve() if output_dir else source.run_dir / "postprocess" / "fucci_color_state"
+    repo_root = Path(__file__).resolve().parent.parent
+    home = Path.home()
+    if is_filesystem_root(output) or output == home or home.is_relative_to(output):
+        raise ValueError(f"Refusing dangerous color-state output directory: {output}")
+    if output == repo_root or repo_root.is_relative_to(output):
+        raise ValueError(f"Refusing repository or ancestor as color-state output: {output}")
     protected = (source.run_dir, source.extraction_dir, source.run_dir / "postprocess")
     if any(output == path or path.is_relative_to(output) for path in protected):
         raise ValueError("Color-state output cannot equal or contain a protected master-run ancestor")

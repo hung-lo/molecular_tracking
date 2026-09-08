@@ -898,7 +898,14 @@ def plot_wrapped_daywise_linear_relationships(
         axis.scatter(x_values, y_values, s=10, alpha=0.2, color="#1f3b4d", edgecolors="none", rasterized=True)
 
         if len(x_grid) > 0 and np.all(np.isfinite(y_hat)):
-            if np.all(np.isfinite(y_low)) and np.all(np.isfinite(y_high)):
+            ci_available = (
+                y_low.size == x_grid.size
+                and y_high.size == x_grid.size
+                and x_grid.size > 0
+                and np.all(np.isfinite(y_low))
+                and np.all(np.isfinite(y_high))
+            )
+            if ci_available:
                 axis.fill_between(
                     x_grid,
                     y_low,

@@ -35,3 +35,6 @@ env/
 
 # chatgpt related data exploration
 /chatgpt_related/
+notebooks/cellposeSAM_1050_red_sessions_windows_20260831.ipynb
+notebooks/cellposeSAM_920_green_sessions_windows_20260903.ipynb
+run_fucci_primary_1050_all_zradius1_fucci_tri3.sh

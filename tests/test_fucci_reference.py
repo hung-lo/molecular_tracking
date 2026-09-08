@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import json
 from pathlib import Path
+import pytest
 
 from fucci_reference import aggregate_equal_mouse_reference, build_dead_reference
 
@@ -41,3 +42,12 @@ def test_build_dead_reference_writes_equal_mouse_reference_bundle(tmp_path: Path
     assert len(reference["reference_runs"]) == 2
     assert (output / "fucci_dead_reference_sessions.csv").is_file()
     assert (output / "plots/dead_reference_robust_sd_by_session.png").is_file()
+
+
+def test_reference_overwrite_rejects_input_or_filesystem_root(tmp_path: Path) -> None:
+    first = _reference_run(tmp_path, "Dead_1", 1)
+    second = _reference_run(tmp_path, "Dead_2", 2)
+    with pytest.raises(ValueError, match="overlap input"):
+        build_dead_reference([first, second], first, overwrite=True)
+    with pytest.raises(ValueError, match="dangerous"):
+        build_dead_reference([first, second], "/", overwrite=True)

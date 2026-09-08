@@ -33,12 +33,14 @@ frozen Dead-derived scale; it is not re-centered or re-scaled using the target
 mouse.
 
 ```text
-color_z = log2_green_over_expected / dead_reference_robust_sd_log2
+Z_E = eclipse_deviation_log2 / dead_reference_robust_sd_log2
 ```
 
-The five bins are `strong_low` (`z < -2`), `low_transition` (`-2 <= z < -1`),
-`middle` (`-1 <= z <= 1`), `high_transition` (`1 < z <= 2`), and `strong_high`
-(`z > 2`). Only strong low, middle, and strong high are core states. Transition
+The public score is `eclipse_z` (also written as `Z_E`). The current construct
+uses green as reporter and red as reference; the ECLIPSE names remain
+fluorophore-agnostic. The five bins are `strong_low` (`Z_E < -2`),
+`low_transition` (`-2 <= Z_E < -1`), `middle` (`-1 <= Z_E <= 1`),
+`high_transition` (`1 < Z_E <= 2`), and `strong_high` (`Z_E > 2`). Only strong low, middle, and strong high are core states. Transition
 zones therefore provide hysteresis for entry events without being forced into a
 core state.
 
@@ -70,6 +72,8 @@ python postprocessing/run_fucci_state_analysis.py \
   --event-axis elapsed_days
 ```
 
+For a non-canonical copied output, add `--run-dir /path/to/master_run`.
+
 Events are detected from compressed core-state sequences, so
 `middle -> low_transition -> low` is one middle-to-low entry. The full aligned
 table retains all observations; default summaries and plots use the first event
@@ -85,3 +89,5 @@ Every run records the source master/extraction hashes, input table hashes,
 reference JSON hash, fit settings, thresholds, and row counts in
 `run_manifest.json`. Input resolution is structural under the explicit run
 directory, so copied runs do not depend on stale absolute manifest paths.
+The trajectory/PCA filenames retain `color_z` during this transition, but their
+feature column and public scored coordinate are `eclipse_z`.

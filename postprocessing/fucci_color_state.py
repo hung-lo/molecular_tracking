@@ -315,4 +315,11 @@ def score_color_state_table(
     result.loc[valid, "color_state_bin"] = result.loc[valid, "color_z"].map(color_state_bin)
     result.loc[valid, "color_core_state"] = result.loc[valid, "color_z"].map(color_core_state)
     result["color_state_qc_reason"] = reasons.replace("", "valid")
+    # Keep the original color_* names as transition aliases; ECLIPSE names are canonical.
+    result["eclipse_deviation_log2"] = result["log2_green_over_expected"]
+    result["eclipse_z"] = result["color_z"]
+    result["eclipse_state_bin"] = result["color_state_bin"]
+    result["eclipse_core_state"] = result["color_core_state"]
+    result["eclipse_state_qc_pass"] = result["color_state_qc_pass"]
+    result["eclipse_state_qc_reason"] = result["color_state_qc_reason"]
     return result

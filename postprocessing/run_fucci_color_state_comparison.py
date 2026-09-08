@@ -58,7 +58,7 @@ def compare_color_state_runs(
         log = json.loads((directory / "run_manifest.json").read_text(encoding="utf-8"))
         label = _label(directory, log, index, labels)
         scored = pd.read_csv(directory / "normalization/matched_roi_color_state_all_observed.csv")
-        occupancy = pd.read_csv(directory / "normalization/color_state_occupancy_by_session.csv")
+        occupancy = pd.read_csv(directory / "normalization/eclipse_state_occupancy_by_session.csv")
         fits = pd.read_csv(directory / "normalization/color_state_session_fits.csv")
         occupancy = occupancy.merge(fits[["session_id", "session_index"]], on="session_id", how="left", validate="one_to_one")
         median_low = float(occupancy["pct_strong_low"].median())

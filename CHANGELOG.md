@@ -8,3 +8,4 @@
 - Added canonical empty schemas for matcher outputs.
 - Added documentation for the daywise and graph workflows.
 - Added additive Fucci color-state postprocessing with Dead-derived modal residual scaling, trajectories, PCA, and state-entry events.
+- Follow-up: native-population occupancy, portable moved-run validation, ECLIPSE naming, and protected overwrite paths.

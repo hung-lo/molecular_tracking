@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import importlib.metadata
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from typing import Any
@@ -72,11 +73,22 @@ def _prepare_output(output_dir: Path, overwrite: bool) -> None:
             raise ValueError(f"Reference output is not a directory: {output_dir}")
         for child in output_dir.iterdir():
             if child.is_dir():
-                import shutil
                 shutil.rmtree(child)
             else:
                 child.unlink()
     output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _validate_reference_output(output_dir: Path, inputs: list[Any]) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    home = Path.home()
+    if output_dir == Path("/") or output_dir == home or home.is_relative_to(output_dir):
+        raise ValueError(f"Refusing dangerous reference output directory: {output_dir}")
+    if output_dir == repo_root or repo_root.is_relative_to(output_dir):
+        raise ValueError(f"Refusing repository or ancestor as reference output: {output_dir}")
+    for item in inputs:
+        if output_dir.is_relative_to(item.run_dir) or item.run_dir.is_relative_to(output_dir):
+            raise ValueError(f"Reference output cannot overlap input master run: {output_dir}")
 
 
 def build_dead_reference(
@@ -96,6 +108,8 @@ def build_dead_reference(
     mouse_ids = {item.mouse_id for item in inputs}
     if len(mouse_ids) < 2 and not allow_single_reference_mouse:
         raise ValueError("Reference runs must contain at least two control mice")
+    output = Path(output_dir).expanduser().resolve()
+    _validate_reference_output(output, inputs)
 
     session_tables: list[pd.DataFrame] = []
     run_records: list[dict[str, Any]] = []
@@ -142,7 +156,6 @@ def build_dead_reference(
     pooled_centered_sd = robust_sd_mad(np.concatenate(centered_residuals)) if centered_residuals else np.nan
 
     sessions = sessions.sort_values(["mouse_id", "session_index"]).reset_index(drop=True)
-    output = Path(output_dir).expanduser().resolve()
     _prepare_output(output, overwrite)
     sessions.to_csv(output / "fucci_dead_reference_sessions.csv", index=False)
     mice.to_csv(output / "fucci_dead_reference_mice.csv", index=False)
@@ -171,6 +184,8 @@ def build_dead_reference(
             "median_all_session_robust_sd_log2": float(sessions["residual_robust_sd_log2"].median()),
             "mean_all_session_robust_sd_log2": float(sessions["residual_robust_sd_log2"].mean()),
             "pooled_session_centered_residual_robust_sd_log2": float(pooled_centered_sd),
+            "n_reference_mice": int(len(mice)),
+            "n_reference_sessions": int(len(sessions)),
         },
         "state_thresholds_z": STATE_THRESHOLDS,
         "reference_runs": run_records,

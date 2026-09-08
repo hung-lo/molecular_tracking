@@ -62,11 +62,11 @@ def plot_modal_fit_sd_zones(
 
 def plot_color_z_distribution(scored: pd.DataFrame, path: str | Path) -> None:
     figure, axis = plt.subplots(figsize=(7, 4))
-    values = pd.to_numeric(scored.get("color_z", pd.Series(dtype=float)), errors="coerce").dropna()
+    values = pd.to_numeric(scored.get("eclipse_z", scored.get("color_z", pd.Series(dtype=float))), errors="coerce").dropna()
     axis.hist(values, bins=40, color="#457b9d", alpha=0.85)
     for threshold in (-2, -1, 1, 2):
         axis.axvline(threshold, color="#d62828", linewidth=0.8)
-    axis.set(xlabel="color_z", ylabel="Observations", title="Fucci color-state distribution")
+    axis.set(xlabel="ECLIPSE Z-score (Z_E)", ylabel="Observations", title="Fucci ECLIPSE state distribution")
     _save(figure, path)
 
 
@@ -93,22 +93,24 @@ def plot_event_summary(summary: pd.DataFrame, path: str | Path, *, title: str, a
     figure, axis = plt.subplots(figsize=(7, 4))
     if not summary.empty:
         x = summary["relative_elapsed_days"] if axis_label == "elapsed_days" else summary["relative_session_index"]
-        mean = summary["mean_color_z"].to_numpy(dtype=float)
-        sem = summary["sem_color_z"].to_numpy(dtype=float)
+        mean_column = "mean_eclipse_z" if "mean_eclipse_z" in summary else "mean_color_z"
+        sem_column = "sem_eclipse_z" if "sem_eclipse_z" in summary else "sem_color_z"
+        mean = summary[mean_column].to_numpy(dtype=float)
+        sem = summary[sem_column].to_numpy(dtype=float)
         axis.plot(x, mean, color="#1d3557")
         axis.fill_between(x, mean - sem, mean + sem, color="#457b9d", alpha=0.25)
     axis.axvline(0, color="#d62828", linewidth=0.8)
-    axis.set(xlabel=f"Relative {axis_label}", ylabel="color_z", title=title)
+    axis.set(xlabel=f"Relative {axis_label}", ylabel="ECLIPSE Z-score (Z_E)", title=title)
     _save(figure, path)
 
 
 def plot_comparison_distributions(tables: list[tuple[str, pd.DataFrame]], path: str | Path) -> None:
     figure, axis = plt.subplots(figsize=(8, 4))
     for label, table in tables:
-        values = pd.to_numeric(table.get("color_z", pd.Series(dtype=float)), errors="coerce").dropna()
+        values = pd.to_numeric(table.get("eclipse_z", table.get("color_z", pd.Series(dtype=float))), errors="coerce").dropna()
         if len(values):
             axis.hist(values, bins=40, density=True, histtype="step", linewidth=1.5, label=label)
-    axis.set(xlabel="color_z", ylabel="Density", title="Color-Z distributions")
+    axis.set(xlabel="ECLIPSE Z-score (Z_E)", ylabel="Density", title="ECLIPSE Z-score distributions")
     axis.legend()
     _save(figure, path)
 

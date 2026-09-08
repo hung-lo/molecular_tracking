@@ -92,7 +92,7 @@ def _occupancy(scored: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     occupancy_rows: list[dict[str, Any]] = []
     qc_rows: list[dict[str, Any]] = []
     for session_id, group in scored.groupby("session_id", sort=False):
-        valid = group.loc[group["color_state_qc_pass"].eq(True)]
+        valid = group.loc[group["eclipse_state_qc_pass"].eq(True)]
         total = len(valid)
         source = group.iloc[0]
         row: dict[str, Any] = {
@@ -115,7 +115,7 @@ def _occupancy(scored: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
             "n_total_observations": int(len(group)),
             "n_valid_observations": int(total),
             "n_invalid_observations": int(len(group) - total),
-            "invalid_reason_counts": json.dumps(group.loc[~group["color_state_qc_pass"], "color_state_qc_reason"].value_counts().to_dict(), sort_keys=True),
+            "invalid_reason_counts": json.dumps(group.loc[~group["eclipse_state_qc_pass"], "eclipse_state_qc_reason"].value_counts().to_dict(), sort_keys=True),
         })
     return pd.DataFrame(occupancy_rows), pd.DataFrame(qc_rows)
 
@@ -156,26 +156,31 @@ def run_color_state(
         min_fit_rois=min_fit_rois,
         modal_bandwidth_scale=bandwidth_scale,
     )
+    native_scored = score_color_state_table(native, session_fits, reference_sd)
     scored = score_color_state_table(selected, session_fits, reference_sd)
-    occupancy, qc = _occupancy(scored)
+    occupancy, native_qc = _occupancy(native_scored)
+    matched_only_occupancy, matched_qc = _occupancy(scored)
     output = Path(output_dir).expanduser().resolve() if output_dir else source.run_dir / "postprocess" / "fucci_color_state"
-    if output in {source.run_dir, source.extraction_dir}:
-        raise ValueError("Color-state output cannot be the master run or extraction directory")
+    protected = (source.run_dir, source.extraction_dir, source.run_dir / "postprocess")
+    if any(output == path or path.is_relative_to(output) for path in protected):
+        raise ValueError("Color-state output cannot equal or contain a protected master-run ancestor")
     _prepare_output(output, overwrite)
     normalization = output / "normalization"
     normalization.mkdir()
     plots = output / "plots"
     plots.mkdir()
     session_fits.to_csv(normalization / "color_state_session_fits.csv", index=False)
+    native_scored.to_csv(normalization / "session_population_eclipse_state.csv", index=False)
     scored.to_csv(normalization / "matched_roi_color_state_all_observed.csv", index=False)
-    occupancy.to_csv(normalization / "color_state_occupancy_by_session.csv", index=False)
-    qc.to_csv(normalization / "color_state_qc_summary_by_session.csv", index=False)
+    occupancy.to_csv(normalization / "eclipse_state_occupancy_by_session.csv", index=False)
+    matched_only_occupancy.to_csv(normalization / "matched_only_eclipse_state_occupancy_by_session.csv", index=False)
+    native_qc.to_csv(normalization / "eclipse_state_qc_summary_by_session.csv", index=False)
+    matched_qc.to_csv(normalization / "matched_only_eclipse_state_qc_summary_by_session.csv", index=False)
     first_fit = session_fits.iloc[0]
     first_id = str(first_fit["session_id"])
     first_native = native.loc[native["session_id"].astype(str).eq(first_id)]
-    first_scored = scored.loc[scored["session_id"].astype(str).eq(first_id)]
     plot_modal_fit_sd_zones(first_native, first_fit, reference_sd, plots / "green_red_modal_fit_sd_zones_example.png")
-    plot_color_z_distribution(scored, plots / "color_z_distribution.png")
+    plot_color_z_distribution(native_scored, plots / "eclipse_z_distribution.png")
 
     input_hashes = {
         "run_manifest.json": file_sha256(source.run_manifest_path),
@@ -202,8 +207,9 @@ def run_color_state(
         "fit": {"method": "linear_gaussian_kernel_modal", "min_fit_rois": min_fit_rois, "bandwidth_scale": bandwidth_scale, "predictor": "red", "response": "green", "optimizer": "Nelder-Mead"},
         "state_thresholds_z": reference_json.get("state_thresholds_z"),
         "policy": str(selected["match_policy"].iloc[0]) if len(selected) else policy,
-        "output_paths": {"session_fits": str(normalization / "color_state_session_fits.csv"), "observations": str(normalization / "matched_roi_color_state_all_observed.csv"), "occupancy": str(normalization / "color_state_occupancy_by_session.csv"), "qc": str(normalization / "color_state_qc_summary_by_session.csv")},
-        "row_counts": {"native": int(len(native)), "matched_observations": int(len(scored)), "valid_scored_observations": int(scored["color_state_qc_pass"].sum()), "sessions": int(len(session_fits))},
+        "occupancy_basis": "all_valid_native_session_rois",
+        "output_paths": {"session_fits": str(normalization / "color_state_session_fits.csv"), "native_state": str(normalization / "session_population_eclipse_state.csv"), "matched_observations": str(normalization / "matched_roi_color_state_all_observed.csv"), "observations": str(normalization / "matched_roi_color_state_all_observed.csv"), "occupancy": str(normalization / "eclipse_state_occupancy_by_session.csv"), "matched_only_occupancy": str(normalization / "matched_only_eclipse_state_occupancy_by_session.csv")},
+        "row_counts": {"native": int(len(native)), "native_valid_scored_observations": int(native_scored["eclipse_state_qc_pass"].sum()), "matched_observations": int(len(scored)), "matched_valid_scored_observations": int(scored["eclipse_state_qc_pass"].sum()), "sessions": int(len(session_fits))},
         "warnings": [],
     }
     (normalization / "run_log.json").write_text(json.dumps(log, indent=2, sort_keys=True), encoding="utf-8")
@@ -214,7 +220,7 @@ def run_color_state(
         f"- Source master run: `{source.run_dir}`",
         f"- Policy: `{log['policy']}`",
         f"- Dead reference robust SD: `{reference_sd:.8g}` log2 units",
-        f"- Valid scored observations: `{int(scored['color_state_qc_pass'].sum())} / {len(scored)}`",
+        f"- Valid native observations: `{int(native_scored['eclipse_state_qc_pass'].sum())} / {len(native_scored)}`",
         "- Session backbones use all ratio-valid native ROIs; no target re-scaling was applied.",
     ]
     (output / "SUMMARY.md").write_text("\n".join(summary) + "\n", encoding="utf-8")

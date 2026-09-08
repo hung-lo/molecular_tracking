@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import sys
 from typing import Any
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -47,9 +48,40 @@ def _window(summary: pd.DataFrame, axis: str, window_days: float) -> pd.DataFram
     return summary.loc[summary["relative_elapsed_days"].abs() <= window_days]
 
 
+def _resolve_source_dir(color_dir: Path, log: dict[str, Any], run_dir: str | Path | None) -> tuple[Path, str]:
+    if run_dir is not None:
+        return Path(run_dir).expanduser().resolve(), "explicit"
+    if color_dir.name == "fucci_color_state" and color_dir.parent.name == "postprocess":
+        return color_dir.parent.parent, "structural"
+    stored = log.get("source_master_run_dir")
+    if not stored:
+        raise ValueError("Color-state manifest has no source master run directory")
+    warnings.warn(
+        "Using legacy source_master_run_dir because color-state output is not at the canonical location; pass --run-dir to avoid absolute-path dependence.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return Path(stored).expanduser().resolve(), "legacy_absolute"
+
+
+def _validate_source_hashes(source: Any, log: dict[str, Any]) -> None:
+    expected_manifest = log.get("source_master_run_manifest_sha256")
+    expected_extraction = log.get("source_extraction_run_log_sha256")
+    if not expected_manifest or not expected_extraction:
+        raise ValueError("Color-state manifest is missing source master/extraction hashes")
+    actual_manifest = file_sha256(source.run_manifest_path)
+    actual_extraction = file_sha256(source.extraction_run_log_path)
+    if actual_manifest != expected_manifest or actual_extraction != expected_extraction:
+        raise ValueError(
+            "Explicit source run does not match the color-state manifest hashes; "
+            "refusing to analyze a different run."
+        )
+
+
 def run_state_analysis(
     color_state_dir: str | Path,
     *,
+    run_dir: str | Path | None = None,
     event_min_sessions: int = 8,
     event_axis: str = "elapsed_days",
     event_window_days: float = 7,
@@ -66,8 +98,9 @@ def run_state_analysis(
     if not log_path.is_file():
         raise FileNotFoundError(f"Missing color-state run manifest: {log_path}")
     log = json.loads(log_path.read_text(encoding="utf-8"))
-    source_dir = Path(log["source_master_run_dir"]).expanduser().resolve()
+    source_dir, source_resolution = _resolve_source_dir(color_dir, log, run_dir)
     source = resolve_fucci_master_run(source_dir, require_matched=True)
+    _validate_source_hashes(source, log)
     scored_path = color_dir / "normalization/matched_roi_color_state_all_observed.csv"
     fit_path = color_dir / "normalization/color_state_session_fits.csv"
     if not scored_path.is_file() or not fit_path.is_file():
@@ -107,8 +140,8 @@ def run_state_analysis(
         require_first_session=bool(source_trajectory.get("require_first_session", False)),
         require_last_session=bool(source_trajectory.get("require_last_session", False)),
     )
-    eligibility, eligible = build_trajectory_eligibility(scored, tracks, session_ids, eligibility_config, feature_column="color_z")
-    matrices = build_trajectory_matrices(eligible, session_ids, feature_column="color_z")
+    eligibility, eligible = build_trajectory_eligibility(scored, tracks, session_ids, eligibility_config, feature_column="eclipse_z")
+    matrices = build_trajectory_matrices(eligible, session_ids, feature_column="eclipse_z")
     matrix_names = {
         "raw": "color_z_trajectory_matrix.csv",
         "mask": "color_z_trajectory_observation_mask.csv",
@@ -132,7 +165,7 @@ def run_state_analysis(
         "schema_version": "fucci_color_z_pca_v1",
         "reference_json_sha256": log.get("reference_json_sha256"),
         "reference_robust_sd_log2": log.get("reference_robust_sd_log2"),
-        "feature_column": "color_z",
+        "feature_column": "eclipse_z",
         "session_ids": session_ids,
         "centering": "column_mean_complete_case_population",
         "scaling": "none",
@@ -149,8 +182,8 @@ def run_state_analysis(
     aligned.to_csv(events_dir / "color_state_event_aligned_observations.csv", index=False)
     event_summaries: dict[str, pd.DataFrame] = {}
     for event_type, filename, title in (
-        ("middle_to_low", "middle_to_low_event_summary.csv", "Middle-to-low color-Z entries"),
-        ("middle_to_high", "middle_to_high_event_summary.csv", "Middle-to-high color-Z entries"),
+        ("middle_to_low", "middle_to_low_event_summary.csv", "Middle-to-low ECLIPSE entries"),
+        ("middle_to_high", "middle_to_high_event_summary.csv", "Middle-to-high ECLIPSE entries"),
     ):
         subset = events.loc[events["event_type"].eq(event_type)]
         subset_aligned = aligned.loc[aligned["event_id"].isin(subset["event_id"])]
@@ -166,7 +199,8 @@ def run_state_analysis(
         "reference_json_sha256": log.get("reference_json_sha256"),
         "reference_robust_sd_log2": log.get("reference_robust_sd_log2"),
         "source_master_run_dir": str(source.run_dir),
-        "feature_column": "color_z",
+        "source_resolution": source_resolution,
+        "feature_column": "eclipse_z",
         "trajectory_eligibility": {"min_sessions": eligibility_config.min_sessions, "missing_values": "preserved_as_nan", "geometry_qc_merged": True},
         "pca": {"centering": "complete_case_column_mean", "scaling": "none", "sign_convention": "largest_absolute_loading_positive"},
         "events": {"min_usable_sessions": event_min_sessions, "axis": event_axis, "window_days_for_plot": event_window_days, "all_observations_retained_in_event_table": True},
@@ -181,6 +215,7 @@ def parse_args(argv: list[str] | None = None) -> Any:
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--color-state-dir", required=True)
+    parser.add_argument("--run-dir", default=None, help="Explicit source master run directory")
     parser.add_argument("--event-min-sessions", type=int, default=8)
     parser.add_argument("--event-axis", choices=("elapsed_days", "session_index"), default="elapsed_days")
     parser.add_argument("--event-window-days", type=float, default=7)
@@ -190,7 +225,7 @@ def parse_args(argv: list[str] | None = None) -> Any:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    run_state_analysis(args.color_state_dir, event_min_sessions=args.event_min_sessions, event_axis=args.event_axis, event_window_days=args.event_window_days, overwrite=args.overwrite)
+    run_state_analysis(args.color_state_dir, run_dir=args.run_dir, event_min_sessions=args.event_min_sessions, event_axis=args.event_axis, event_window_days=args.event_window_days, overwrite=args.overwrite)
     return 0
 
 

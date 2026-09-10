@@ -30,11 +30,13 @@ def _build_dataset(tmp_path: Path) -> Path:
 
 def test_run_daywise_graph_matching_exports_graph_tables(tmp_path: Path) -> None:
     manifest_path = _build_dataset(tmp_path)
+    stages: list[tuple[str, float]] = []
     output_dir = run_daywise_graph_matching(
         manifest_path=manifest_path,
         output_dir=tmp_path / "graph_out",
         overwrite=True,
         skip_qc=True,
+        stage_callback=lambda key, duration: stages.append((key, duration)),
     )
 
     assert (output_dir / "pairwise_matches_graph.csv").exists()
@@ -45,3 +47,8 @@ def test_run_daywise_graph_matching_exports_graph_tables(tmp_path: Path) -> None
     assert run_log["graph_matcher_algorithm_version"] == "local_spatial_graph_v1"
     assert run_log["graph_row_counts"]["tracks_graph"] > 0
     assert run_log["graph_output_paths"]["tracks_graph"].endswith("tracks_graph.csv")
+    assert [key for key, _duration in stages] == [
+        "daywise_affine_roi_matching",
+        "graph_roi_matching",
+    ]
+    assert all(duration >= 0 for _key, duration in stages)

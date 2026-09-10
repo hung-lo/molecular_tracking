@@ -105,6 +105,7 @@ class MasterPipelineConfig:
     skip_quick_plots: bool = False
     skip_ranked_roi_views: bool = False
     ranked_roi_z_radius: int = 3
+    render_z_radius: int = 0
     require_qc_success: bool = False
     qc_dpi: int = 150
     qc_max_examples: int = 20
@@ -229,6 +230,32 @@ def _format_duration(seconds: float) -> str:
 
 def _log(start_seconds: float, message: str) -> None:
     print(f"[{_format_duration(time.perf_counter() - start_seconds)}] {message}", flush=True)
+
+
+def _log_stage(
+    master_start_seconds: float,
+    stage_start_seconds: float,
+    stage_durations_seconds: dict[str, float],
+    stage_key: str,
+    message: str,
+) -> float:
+    duration = time.perf_counter() - stage_start_seconds
+    stage_durations_seconds[stage_key] = float(duration)
+    _log(
+        master_start_seconds,
+        f"{message} | stage_duration={_format_duration(duration)}",
+    )
+    return duration
+
+
+def _effective_render_z_radius(config: MasterPipelineConfig) -> int:
+    """Resolve the new rendering setting while accepting the old field."""
+
+    if int(config.render_z_radius) != 0:
+        return int(config.render_z_radius)
+    if int(config.ranked_roi_z_radius) != 3:
+        return int(config.ranked_roi_z_radius)
+    return 0
 
 
 def _safe_name(value: str) -> str:
@@ -1028,6 +1055,7 @@ def _write_master_summary(
             if ranked_roi_views_dir is not None
             else "- Ranked individual ROI views: \x60skipped\x60"
         ),
+        f"- Ranked-view render z radius: `{_effective_render_z_radius(config)}`",
         "",
         (
             f"Ranked views select the top {int(config.top_n)} final-session increasing "
@@ -1043,9 +1071,12 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
     for name, value in (("xy_um_per_px", config.xy_um_per_px), ("z_um_per_plane", config.z_um_per_plane)):
         if not math.isfinite(float(value)) or float(value) <= 0:
             raise ValueError(f"{name} must be finite and positive")
-    if int(config.ranked_roi_z_radius) < 0:
-        raise ValueError("ranked_roi_z_radius must be at least 0")
+    render_z_radius = _effective_render_z_radius(config)
+    if render_z_radius < 0:
+        setting_name = "render_z_radius" if int(config.render_z_radius) != 0 else "ranked_roi_z_radius"
+        raise ValueError(f"{setting_name} must be at least 0")
     start_seconds = time.perf_counter()
+    stage_durations_seconds: dict[str, float] = {}
     source_manifest_path = Path(config.manifest).expanduser().resolve()
     dataset_dir = resolve_dataset_dir(config.dataset)
     source_records = load_session_manifest(source_manifest_path)
@@ -1145,7 +1176,20 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
                 f"session_id={record.session_id}",
             )
         _log(start_seconds, f"Effective manifest: {effective_manifest_path}")
-    _log(start_seconds, "Running affine-overlap baseline plus graph refinement")
+    def report_matching_stage(stage_key: str, duration: float) -> None:
+        labels = {
+            "daywise_affine_roi_matching": "Daywise affine ROI matching",
+            "graph_roi_matching": "Graph ROI matching",
+        }
+        stage_durations_seconds[stage_key] = float(duration)
+        _log(
+            start_seconds,
+            f"{labels[stage_key]} completed | stage_duration={_format_duration(duration)}",
+        )
+        if stage_key == "daywise_affine_roi_matching":
+            _log(start_seconds, "Running graph ROI matching")
+
+    _log(start_seconds, "Running daywise affine ROI matching")
     spacing = VoxelSpacing(
         z_um=float(config.z_um_per_plane),
         y_um=float(config.xy_um_per_px),
@@ -1166,11 +1210,21 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         qc_max_total_examples=int(config.qc_max_total_examples),
         qc_random_seed=int(config.qc_random_seed),
         require_qc_success=bool(config.require_qc_success),
+        stage_callback=report_matching_stage,
     )
 
+    agreement_stage_start = time.perf_counter()
     _log(start_seconds, "Annotating graph tracks by agreement with balanced affine matches")
     agreement_summary = annotate_graph_affine_agreement(match_dir)
+    _log_stage(
+        start_seconds,
+        agreement_stage_start,
+        stage_durations_seconds,
+        "graph_affine_agreement_annotation",
+        "Graph/affine agreement annotation completed",
+    )
 
+    extraction_stage_start = time.perf_counter()
     if config.resume and _has_current_extraction(extraction_dir):
         _log(start_seconds, f"Reusing existing extraction output: {extraction_dir}")
     else:
@@ -1208,14 +1262,30 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         extraction_dir = _relocate_extraction_output(
             Path(temporary_extraction_dir), extraction_dir
         )
+    _log_stage(
+        start_seconds,
+        extraction_stage_start,
+        stage_durations_seconds,
+        "matched_roi_intensity_extraction",
+        "Matched ROI intensity extraction completed",
+    )
 
+    annotation_stage_start = time.perf_counter()
     _log(start_seconds, "Propagating consensus and graph-only labels into extraction tables")
     extraction_annotation = annotate_extraction_outputs(
         extraction_dir, match_dir / "tracks_graph.csv"
     )
+    _log_stage(
+        start_seconds,
+        annotation_stage_start,
+        stage_durations_seconds,
+        "label_propagation",
+        "Label propagation completed",
+    )
 
     graph_plot_dir = plots_dir / "graph"
     if not config.skip_quick_plots:
+        quick_plot_stage_start = time.perf_counter()
         _log(start_seconds, "Rendering existing matched-output quick plots")
         build_quick_plots(
             analysis_dir=extraction_dir,
@@ -1224,24 +1294,39 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
             policy="graph",
             output_dir=plots_dir,
         )
+        _log_stage(
+            start_seconds,
+            quick_plot_stage_start,
+            stage_durations_seconds,
+            "matched_output_quick_plots",
+            "Matched-output quick plots completed",
+        )
 
     ranked_roi_views_dir: Path | None = None
     ranked_roi_batch_index: Path | None = None
     if not config.skip_ranked_roi_views:
+        ranked_stage_start = time.perf_counter()
         _log(
             start_seconds,
-            f"Rendering ranked individual ROI views: top/bottom {int(config.top_n)}",
+            f"Rendering ranked individual ROI views: top/bottom {int(config.top_n)} | render_z_radius={render_z_radius}",
         )
         ranked_roi_views_dir = build_ranked_roi_views(
             run_dir=run_dir,
             policy="graph",
             top_n=int(config.top_n),
             directions=("increasing", "decreasing"),
-            z_radius=int(config.ranked_roi_z_radius),
+            z_radius=render_z_radius,
         )
         ranked_roi_batch_index = ranked_roi_views_dir / "ranked_roi_batch_index.csv"
-        _log(start_seconds, f"Ranked individual ROI views: {ranked_roi_views_dir}")
+        _log_stage(
+            start_seconds,
+            ranked_stage_start,
+            stage_durations_seconds,
+            "ranked_individual_roi_validation",
+            f"Ranked individual ROI views completed: {ranked_roi_views_dir}",
+        )
 
+    wrapped_stage_start = time.perf_counter()
     _log(start_seconds, "Rendering wrapped daywise red-green linear-fit panels")
     wrapped_plot_path = (
         graph_plot_dir
@@ -1256,9 +1341,17 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         start_date=str(manifest_meta["start_date"]),
         max_columns=int(config.plot_columns),
     )
+    _log_stage(
+        start_seconds,
+        wrapped_stage_start,
+        stage_durations_seconds,
+        "wrapped_daywise_red_green_fit_panels",
+        "Wrapped daywise red-green fit panels completed",
+    )
 
     finished_utc = datetime.now(timezone.utc).isoformat()
     total_seconds = time.perf_counter() - start_seconds
+    stage_durations_seconds["total"] = float(total_seconds)
     outputs = {
         "run_dir": str(run_dir),
         "matching_dir": str(match_dir),
@@ -1287,7 +1380,10 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         "run_finished_utc": finished_utc,
         "duration_seconds": float(total_seconds),
         "duration_hms": _format_duration(total_seconds),
-        "config": asdict(config),
+        "total_duration_seconds": float(total_seconds),
+        "total_duration_hms": _format_duration(total_seconds),
+        "stage_durations_seconds": stage_durations_seconds,
+        "config": {**asdict(config), "render_z_radius": render_z_radius},
         "dataset_dir": str(dataset_dir),
         "manifest_path": str(effective_manifest_path),
         "source_manifest_path": str(source_manifest_path),
@@ -1326,7 +1422,7 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         ranked_roi_views_dir=ranked_roi_views_dir,
     )
 
-    _log(start_seconds, f"Master pipeline completed in {_format_duration(total_seconds)}")
+    _log(start_seconds, f"Master pipeline completed | total_duration={_format_duration(total_seconds)}")
     print(f"output_dir={run_dir}", flush=True)
     return run_dir
 
@@ -1371,7 +1467,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-matching-qc", action="store_true")
     parser.add_argument("--skip-quick-plots", action="store_true")
     parser.add_argument("--skip-ranked-roi-views", action="store_true")
-    parser.add_argument("--ranked-roi-z-radius", type=int, default=3)
+    parser.add_argument("--render-z-radius", type=int, default=0)
+    parser.add_argument("--ranked-roi-z-radius", type=int, default=3, help=argparse.SUPPRESS)
     parser.add_argument("--require-qc-success", action="store_true")
     parser.add_argument("--qc-dpi", type=int, default=150)
     parser.add_argument("--qc-max-examples", type=int, default=20)
@@ -1432,6 +1529,8 @@ def main(argv: list[str] | None = None) -> Path:
         raise ValueError("Choose only one of --overwrite or --resume.")
     if int(args.plot_columns) < 1:
         raise ValueError("--plot-columns must be at least 1.")
+    if int(args.render_z_radius) < 0:
+        raise ValueError("--render-z-radius must be at least 0.")
     if int(args.ranked_roi_z_radius) < 0:
         raise ValueError("--ranked-roi-z-radius must be at least 0.")
     config = MasterPipelineConfig(
@@ -1456,6 +1555,7 @@ def main(argv: list[str] | None = None) -> Path:
         skip_quick_plots=bool(args.skip_quick_plots),
         skip_ranked_roi_views=bool(args.skip_ranked_roi_views),
         ranked_roi_z_radius=int(args.ranked_roi_z_radius),
+        render_z_radius=int(args.render_z_radius),
         require_qc_success=bool(args.require_qc_success),
         qc_dpi=args.qc_dpi,
         qc_max_examples=args.qc_max_examples,

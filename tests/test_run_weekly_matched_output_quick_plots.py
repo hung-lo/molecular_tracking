@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+import tifffile
 
 from run_weekly_matched_output_quick_plots import _filter_table_by_policy, _resolve_output_dir
 import run_daywise_green_red_linear_fit_summary as fit_plots
+import run_matched_roi_quick_view as raw_view
 from run_ranked_roi_quick_views import _resolve_run_inputs
 from roi_log_ratio_analysis import select_top_changing_rois
 
@@ -59,6 +62,47 @@ def test_ranked_view_resolves_nested_master_run_and_manifest_fallback(tmp_path: 
     assert manifest.parent == matching
     (extraction / "session_manifest_resolved.csv").touch()
     assert _resolve_run_inputs(tmp_path)[2].parent == extraction
+
+
+def test_raw_view_reads_only_requested_z_planes(tmp_path: Path, monkeypatch) -> None:
+    mask = np.zeros((3, 5, 5), dtype=np.uint16)
+    mask[0, 2, 2] = 1
+    red = np.ones_like(mask, dtype=np.uint16)
+    green = np.full_like(mask, 2, dtype=np.uint16)
+    paths = {
+        "mask": tmp_path / "mask.tif",
+        "red": tmp_path / "red.tif",
+        "green": tmp_path / "green.tif",
+    }
+    tifffile.imwrite(paths["mask"], mask, photometric="minisblack")
+    tifffile.imwrite(paths["red"], red, photometric="minisblack")
+    tifffile.imwrite(paths["green"], green, photometric="minisblack")
+    tracks = pd.DataFrame({"cluster_id": [1], "roi_id": [1], "track_uid": ["t1"], "s0_roi": [1]})
+    sessions = pd.DataFrame({
+        "session_index": [0], "session_id": ["s0"], "acquisition_date": ["2026-01-01"],
+        "elapsed_days": [0], "mask_path": [str(paths["mask"])],
+        "red_image_path": [str(paths["red"])], "green_image_path": [str(paths["green"])],
+    })
+    real_imread = raw_view.tifffile.imread
+    calls: list[int | None] = []
+
+    def read(path, *args, **kwargs):
+        calls.append(kwargs.get("key"))
+        return real_imread(path, *args, **kwargs)
+
+    monkeypatch.setattr(raw_view.tifffile, "imread", read)
+    raw_view.plot_matched_roi_raw_slices(
+        cluster_id=1, tracks_table=tracks, session_table=sessions,
+        output_path=tmp_path / "one_plane.png", render_z_radius=0,
+    )
+    assert calls == [None, 0, 0]
+
+    calls.clear()
+    raw_view.plot_matched_roi_raw_slices(
+        cluster_id=1, tracks_table=tracks, session_table=sessions,
+        output_path=tmp_path / "two_planes.png", render_z_radius=1,
+    )
+    assert calls == [None, 1, 1, 0, 0]
 
 
 def test_final_directional_ranking_is_sign_correct_and_not_random() -> None:

@@ -66,13 +66,18 @@ def build_ranked_roi_views(
     policy: str = "graph",
     top_n: int = 30,
     directions: tuple[str, ...] = ("increasing", "decreasing"),
-    z_radius: int = 3,
+    render_z_radius: int = 0,
+    z_radius: int | None = None,
     output_dir: str | Path | None = None,
 ) -> Path:
     """Rank current metrics and render each selected track with the existing viewer."""
     root = Path(run_dir).resolve()
     if top_n <= 0:
         raise ValueError("top_n must be positive")
+    if z_radius is not None:
+        render_z_radius = z_radius
+    if render_z_radius < 0:
+        raise ValueError("render_z_radius must be >= 0")
     metrics_path, raw_path, manifest_path = _resolve_run_inputs(root)
     metrics = _filter_policy(pd.read_csv(metrics_path), policy)
     raw = _filter_policy(pd.read_csv(raw_path), policy)
@@ -96,7 +101,7 @@ def build_ranked_roi_views(
             png_path = direction_dir / f"{stem}.png"
             plot_matched_roi_raw_slices(
                 cluster_id=str(cluster_id), tracks_table=tracks, session_table=manifest,
-                output_path=png_path, z_radius=z_radius,
+                output_path=png_path, z_radius=render_z_radius,
             )
             metadata_path = png_path.with_name(png_path.stem + "_metadata.csv")
             index_rows.append({
@@ -118,13 +123,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--policy", choices=["high", "balanced", "graph"], default="graph")
     parser.add_argument("--top-n", type=int, default=30)
     parser.add_argument("--directions", default="increasing,decreasing")
-    parser.add_argument("--z-radius", type=int, default=3)
+    parser.add_argument("--render-z-radius", "--z-radius", dest="render_z_radius", type=int, default=0)
     parser.add_argument("--output-dir", default=None)
     args = parser.parse_args(argv)
     output = build_ranked_roi_views(
         args.run_dir, policy=args.policy, top_n=args.top_n,
         directions=tuple(part.strip() for part in args.directions.split(",") if part.strip()),
-        z_radius=args.z_radius, output_dir=args.output_dir,
+        render_z_radius=args.render_z_radius, output_dir=args.output_dir,
     )
     print(f"ranked_roi_output_dir={output}")
 

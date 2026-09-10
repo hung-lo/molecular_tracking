@@ -17,8 +17,10 @@ from run_daywise_master_pipeline import (
     _verify_resume_session_selection,
     _has_current_extraction,
     _write_selected_session_manifest,
+    _format_duration,
     parse_args,
 )
+from run_matched_roi_quick_view import select_render_z_indices
 from session_manifest import SessionRecord, load_session_manifest
 
 
@@ -42,6 +44,7 @@ def test_run_daywise_master_pipeline_parse_args_and_defaults() -> None:
     assert args.sessions is None
     assert args.skip_ranked_roi_views is False
     assert args.ranked_roi_z_radius == 3
+    assert args.render_z_radius == 0
     assert args.trajectory_min_sessions == 2
     assert args.require_acquisition_settings_consistent is False
 
@@ -70,6 +73,7 @@ def test_run_daywise_master_pipeline_config_defaults() -> None:
     assert config.segmentation_qc_mode == "all_required"
     assert config.skip_ranked_roi_views is False
     assert config.ranked_roi_z_radius == 3
+    assert config.render_z_radius == 0
 
 
 def _build_records(tmp_path: Path, count: int = 6) -> list[SessionRecord]:
@@ -112,6 +116,28 @@ def test_run_daywise_master_pipeline_parser_accepts_ranked_roi_options() -> None
     assert args.ranked_roi_z_radius == 0
 
 
+def test_run_daywise_master_pipeline_parser_accepts_render_z_radius() -> None:
+    args = parse_args([
+        "--dataset", "/tmp/dataset", "--manifest", "/tmp/manifest.csv",
+        "--render-z-radius", "1",
+    ])
+    assert args.render_z_radius == 1
+
+
+def test_render_z_indices_clip_to_stack_boundaries() -> None:
+    assert select_render_z_indices(5, 11, 0) == (5,)
+    assert select_render_z_indices(5, 11, 1) == (4, 5, 6)
+    assert select_render_z_indices(0, 11, 1) == (0, 1)
+    assert select_render_z_indices(10, 11, 1) == (9, 10)
+
+
+def test_master_duration_formatting() -> None:
+    assert _format_duration(0) == "00:00:00"
+    assert _format_duration(11) == "00:00:11"
+    assert _format_duration(61) == "00:01:01"
+    assert _format_duration(3025) == "00:50:25"
+
+
 def test_run_daywise_master_pipeline_rejects_negative_ranked_roi_z_radius() -> None:
     with pytest.raises(ValueError, match="ranked_roi_z_radius"):
         master.run_master_pipeline(
@@ -119,6 +145,17 @@ def test_run_daywise_master_pipeline_rejects_negative_ranked_roi_z_radius() -> N
                 dataset="/tmp/dataset",
                 manifest="/tmp/manifest.csv",
                 ranked_roi_z_radius=-1,
+            )
+        )
+
+
+def test_run_daywise_master_pipeline_rejects_negative_render_z_radius() -> None:
+    with pytest.raises(ValueError, match="render_z_radius"):
+        master.run_master_pipeline(
+            MasterPipelineConfig(
+                dataset="/tmp/dataset",
+                manifest="/tmp/manifest.csv",
+                render_z_radius=-1,
             )
         )
 
@@ -382,6 +419,8 @@ def test_master_pipeline_integrates_ranked_roi_views_and_manifest(
         "z_radius": 2,
     }
     manifest = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["config"]["render_z_radius"] == 2
+    assert "stage_durations_seconds" in manifest
     expected_dir = run_dir / "plots" / "graph" / "single_roi_raw_validation"
     assert manifest["outputs"]["ranked_roi_views_dir"] == str(expected_dir)
     assert manifest["outputs"]["ranked_roi_batch_index"] == str(

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -168,6 +169,7 @@ def run_daywise_graph_matching(
     qc_max_total_examples: int = 100,
     qc_random_seed: int = 0,
     require_qc_success: bool = False,
+    stage_callback: Callable[[str, float], None] | None = None,
 ) -> Path:
     manifest_path = Path(manifest_path).resolve()
     output_dir = Path(output_dir).resolve()
@@ -175,6 +177,7 @@ def run_daywise_graph_matching(
     params = params or AffineOverlapParams()
     graph_params = graph_params or SpatialGraphParams()
 
+    affine_stage_start = time.perf_counter()
     baseline_output_dir = run_daywise_roi_matching(
         manifest_path=manifest_path,
         output_dir=output_dir,
@@ -193,6 +196,8 @@ def run_daywise_graph_matching(
         qc_random_seed=qc_random_seed,
         require_qc_success=require_qc_success,
     )
+    if stage_callback is not None:
+        stage_callback("daywise_affine_roi_matching", time.perf_counter() - affine_stage_start)
 
     run_start_seconds = time.perf_counter()
     manifest_records = load_session_manifest(manifest_path)
@@ -354,6 +359,8 @@ def run_daywise_graph_matching(
             _export_json(output_dir / "run_log.json", run_log_payload)
 
     total_duration_seconds = time.perf_counter() - run_start_seconds
+    if stage_callback is not None:
+        stage_callback("graph_roi_matching", total_duration_seconds)
     print(f"[{format_duration_seconds(total_duration_seconds)}] Graph ROI matching completed", flush=True)
     return baseline_output_dir
 

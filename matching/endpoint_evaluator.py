@@ -979,24 +979,21 @@ def _merge_extraction_enrichment(endpoints: pd.DataFrame, extraction_dir: str | 
         table = _read_csv(root / name)
         if table.empty or not {"track_uid", "session_index"}.issubset(table.columns):
             continue
-        source = table.copy()
-        source["track_uid"] = source["track_uid"].astype(str)
-        source["session_index"] = source["session_index"].astype(int)
-        source = source.drop_duplicates(["track_uid", "session_index"])
-        source = source.rename(columns={column: f"_enrichment_{column}" for column in source.columns if column not in {"track_uid", "session_index"}})
-        output["_enrichment_track_uid"] = output["track_uid"].astype(str)
-        output["_enrichment_session_index"] = output["end_session_index"].astype(int)
-        output = output.merge(source, left_on=["_enrichment_track_uid", "_enrichment_session_index"], right_on=["track_uid", "session_index"], how="left")
-        output = output.drop(columns=[column for column in ("track_uid_y", "session_index_y") if column in output.columns], errors="ignore")
-        output = output.rename(columns={"track_uid_x": "track_uid", "session_index_x": "end_session_index"})
+        source = table.drop_duplicates(["track_uid", "session_index"]).copy()
+        lookup = source.set_index([source["track_uid"].astype(str), source["session_index"].astype(int)])
         for column in ("green", "red", "eclipse_z", "eclipse_core_state"):
-            enrichment_column = f"_enrichment_{column}"
-            if enrichment_column in output.columns:
-                if column not in output.columns:
-                    output[column] = output[enrichment_column]
-                else:
-                    output[column] = output[column].where(output[column].notna() & output[column].astype(str).ne(""), output[enrichment_column])
-        output = output.drop(columns=[column for column in output.columns if column.startswith("_enrichment_") or column in {"track_uid_y", "session_index_y"}], errors="ignore")
+            if column not in source.columns:
+                continue
+            if column not in output.columns:
+                output[column] = np.nan
+            for index, row in output.iterrows():
+                key = (_text(row.get("track_uid")), _int(row.get("end_session_index"), -1))
+                if key not in lookup.index:
+                    continue
+                value = lookup.loc[key, column]
+                current = output.at[index, column]
+                if pd.notna(value) and (pd.isna(current) or str(current).strip() == ""):
+                    output.at[index, column] = value
     return output
 
 

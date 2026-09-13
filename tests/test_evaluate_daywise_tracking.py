@@ -6,7 +6,7 @@ import pandas as pd
 import subprocess
 import sys
 
-from endpoint_evaluator import evaluate_daywise_tracking
+from endpoint_evaluator import _merge_extraction_enrichment, evaluate_daywise_tracking
 
 
 def _matching_fixture(tmp_path: Path) -> Path:
@@ -72,3 +72,19 @@ def test_evaluator_cli_path_is_deterministic_and_read_only(tmp_path: Path) -> No
     )
     assert result.returncode == 0, result.stderr
     assert (cli_output / "evaluation_run_log.json").is_file()
+
+
+def test_optional_extraction_tables_merge_without_duplicate_key_failure(tmp_path: Path) -> None:
+    extraction = tmp_path / "extraction"
+    extraction.mkdir()
+    for filename, column, value in (
+        ("matched_track_qc_summary.csv", "green", 2.0),
+        ("matched_roi_geometry_qc_long.csv", "red", 3.0),
+        ("graph_affine_agreement_track_metadata.csv", "eclipse_z", -1.0),
+    ):
+        pd.DataFrame({"track_uid": ["track-1"], "session_index": [0], column: [value]}).to_csv(extraction / filename, index=False)
+    endpoints = pd.DataFrame({"track_uid": ["track-1"], "end_session_index": [0], "green": [pd.NA], "red": [pd.NA], "eclipse_z": [pd.NA], "eclipse_core_state": [""]})
+    merged = _merge_extraction_enrichment(endpoints, extraction)
+    assert merged.loc[0, "green"] == 2.0
+    assert merged.loc[0, "red"] == 3.0
+    assert merged.loc[0, "eclipse_z"] == -1.0

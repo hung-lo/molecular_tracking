@@ -187,3 +187,62 @@ def test_optional_extraction_tables_merge_without_duplicate_key_failure(tmp_path
     assert merged.loc[0, "green"] == 2.0
     assert merged.loc[0, "red"] == 3.0
     assert merged.loc[0, "eclipse_z"] == -1.0
+
+
+def test_optional_extraction_enrichment_accepts_string_qc_state_in_all_missing_column(tmp_path: Path) -> None:
+    extraction = tmp_path / "extraction"
+    extraction.mkdir()
+    pd.DataFrame(
+        {
+            "track_uid": ["track-1"],
+            "session_index": [0],
+            "segmentation_qc_status": ["not_configured"],
+            "geometry_qc_pass": [pd.NA],
+        }
+    ).to_csv(extraction / "matched_roi_geometry_qc_long.csv", index=False)
+
+    # Mirrors endpoint_events.csv construction: a fixed optional column with no
+    # observed values is inferred as float64 before enrichment.
+    endpoints = pd.DataFrame(
+        {
+            "track_uid": ["track-1"],
+            "end_session_index": [0],
+            "segmentation_qc_status": [float("nan")],
+            "geometry_qc_pass": [float("nan")],
+        }
+    )
+
+    merged = _merge_extraction_enrichment(endpoints, extraction)
+    assert merged.loc[0, "segmentation_qc_status"] == "not_configured"
+    assert pd.isna(merged.loc[0, "geometry_qc_pass"])
+
+
+def test_optional_extraction_enrichment_accepts_boolean_qc_state_in_all_missing_column(tmp_path: Path) -> None:
+    extraction = tmp_path / "extraction"
+    extraction.mkdir()
+    pd.DataFrame(
+        {
+            "track_uid": ["track-1"],
+            "segmentation_failure": [False],
+            "edge_heavy": [False],
+            "review_required": [False],
+            "has_graph_only_edge": [False],
+        }
+    ).to_csv(extraction / "matched_track_qc_summary.csv", index=False)
+
+    endpoints = pd.DataFrame(
+        {
+            "track_uid": ["track-1"],
+            "end_session_index": [0],
+            "segmentation_failure": [float("nan")],
+            "edge_heavy": [float("nan")],
+            "review_required": [float("nan")],
+            "has_graph_only_edge": [float("nan")],
+        }
+    )
+
+    merged = _merge_extraction_enrichment(endpoints, extraction)
+    assert merged.loc[0, "segmentation_failure"] is False or merged.loc[0, "segmentation_failure"] == False
+    assert merged.loc[0, "edge_heavy"] is False or merged.loc[0, "edge_heavy"] == False
+    assert merged.loc[0, "review_required"] is False or merged.loc[0, "review_required"] == False
+    assert merged.loc[0, "has_graph_only_edge"] is False or merged.loc[0, "has_graph_only_edge"] == False

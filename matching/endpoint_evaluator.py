@@ -807,6 +807,7 @@ def _search_candidates_for_pair(
     target_indices: dict[str, tuple[pd.DataFrame, np.ndarray, cKDTree | None]],
     spacing: VoxelSpacing,
     search_radius_um: float,
+    mask_shape_cache: dict[str, tuple[int, ...] | None] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     projected = _forward_transform(source_position, target_position, sessions, transform_map)
     if projected is None:
@@ -824,14 +825,21 @@ def _search_candidates_for_pair(
     predicted = apply_transform_b_to_a(source_coords, forward)
     target_id = str(sessions.iloc[target_position]["session_id"])
     out_of_fov = False
-    mask_path = _value(sessions.iloc[target_position], "mask_path", "")
-    mask_path_text = "" if mask_path is None or pd.isna(mask_path) else str(mask_path)
-    if mask_path_text and Path(mask_path_text).is_file():
-        try:
-            shape = tuple(tifffile.memmap(Path(mask_path_text)).shape)
-            out_of_fov = any(value < 0 or value >= limit for value, limit in zip(predicted, shape, strict=True))
-        except Exception:
-            out_of_fov = False
+    shape: tuple[int, ...] | None = None
+    if mask_shape_cache is not None and target_id in mask_shape_cache:
+        shape = mask_shape_cache[target_id]
+    else:
+        mask_path = _value(sessions.iloc[target_position], "mask_path", "")
+        mask_path_text = "" if mask_path is None or pd.isna(mask_path) else str(mask_path)
+        if mask_path_text and Path(mask_path_text).is_file():
+            try:
+                shape = tuple(int(value) for value in tifffile.memmap(Path(mask_path_text)).shape)
+            except Exception:
+                shape = None
+        if mask_shape_cache is not None:
+            mask_shape_cache[target_id] = shape
+    if shape is not None:
+        out_of_fov = any(value < 0 or value >= limit for value, limit in zip(predicted, shape, strict=True))
     target_features, target_physical, tree = target_indices.get(
         target_id,
         (pd.DataFrame(), np.empty((0, 3), dtype=float), None),
@@ -958,6 +966,7 @@ def search_endpoint_candidates(
     target_indices = _build_target_indices(features, sessions, spacing)
     rows: list[dict[str, Any]] = []
     status: dict[str, list[str]] = {}
+    mask_shape_cache: dict[str, tuple[int, ...] | None] = {}
     for _, endpoint in endpoints.iterrows():
         endpoint_id = _text(endpoint.get("endpoint_id"))
         source_position = int(sessions.index[sessions["session_index"].astype(int).eq(int(endpoint["end_session_index"]))][0])
@@ -975,6 +984,7 @@ def search_endpoint_candidates(
                 transform_map=transform_map, candidate_map=candidate_map, high_keys=high_keys,
                 balanced_keys=balanced_keys, graph_keys=graph_keys, owner_map=owner_map,
                 target_indices=target_indices, spacing=spacing, search_radius_um=search_radius_um,
+                mask_shape_cache=mask_shape_cache,
             )
             rows.extend(pair_rows)
             endpoint_status.append(pair_status)
@@ -1081,6 +1091,16 @@ def build_synthetic_gap_benchmark(
     transform_map = _transform_row_map(transforms)
     owner_map = _owner_map(tracks, sessions)
     target_indices = _build_target_indices(features, sessions, spacing)
+    feature_lookup: dict[tuple[str, int], pd.Series] = {
+        (str(row["session_id"]), int(row["label"])): row
+        for _, row in features.iterrows()
+    }
+    target_labels: dict[str, np.ndarray] = {
+        session_id: table["label"].to_numpy(dtype=np.int64, copy=True)
+        for session_id, (table, _, _) in target_indices.items()
+        if not table.empty
+    }
+    mask_shape_cache: dict[str, tuple[int, ...] | None] = {}
     rows: list[dict[str, Any]] = []
     for track_index, (_, track) in enumerate(tracks.iterrows()):
         for gap in (2, 3):
@@ -1102,8 +1122,8 @@ def build_synthetic_gap_benchmark(
                 target_value = track.get(_roi_column(target_id), pd.NA)
                 if not (_present(source_value) and _present(target_value)):
                     continue
-                source_feature = _feature_row(features, source_id, int(source_value))
-                target_feature = _feature_row(features, target_id, int(target_value))
+                source_feature = feature_lookup.get((source_id, int(source_value)))
+                target_feature = feature_lookup.get((target_id, int(target_value)))
                 if source_feature is None or target_feature is None:
                     continue
                 source_edge = _bool(source_feature.get("touches_z_edge")) or _bool(source_feature.get("touches_xy_edge"))
@@ -1117,6 +1137,7 @@ def build_synthetic_gap_benchmark(
                     source_feature=source_feature, tracks=tracks, features=features, sessions=sessions,
                     transform_map=transform_map, candidate_map={}, high_keys=set(), balanced_keys=set(), graph_keys=set(),
                     owner_map=owner_map, target_indices=target_indices, spacing=spacing, search_radius_um=search_radius_um,
+                    mask_shape_cache=mask_shape_cache,
                 )
                 true_label = int(target_value)
                 ranked = sorted(pair_rows, key=lambda row: (float(row["projected_distance_um"]), int(row["target_label"])))
@@ -1133,12 +1154,22 @@ def build_synthetic_gap_benchmark(
                     target_table, target_physical, target_tree = target_indices[target_id]
                     all_distances = np.linalg.norm(target_physical - prediction, axis=1)
                     if len(all_distances):
-                        order = sorted(range(len(all_distances)), key=lambda idx: (float(all_distances[idx]), int(target_table.iloc[idx]["label"])))
-                        true_indices = [idx for idx in order if int(target_table.iloc[idx]["label"]) == true_label]
-                        if true_indices:
-                            true_index = true_indices[0]
-                            true_rank = int(order.index(true_index) + 1)
-                            projected_distance = float(all_distances[true_index])
+                        labels = target_labels.get(target_id)
+                        if labels is None:
+                            labels = target_table["label"].to_numpy(dtype=np.int64, copy=True)
+                            target_labels[target_id] = labels
+                        matching_indices = np.flatnonzero(labels == true_label)
+                        if len(matching_indices):
+                            true_index = int(matching_indices[0])
+                            true_distance = float(all_distances[true_index])
+                            # Exact rank under the historical ordering
+                            # (distance, label), without sorting every ROI for
+                            # every pseudo-gap case. Labels are unique within a
+                            # session, so ties are resolved by label value.
+                            closer = int(np.count_nonzero(all_distances < true_distance))
+                            tied_before = int(np.count_nonzero((all_distances == true_distance) & (labels < true_label)))
+                            true_rank = closer + tied_before + 1
+                            projected_distance = true_distance
                             in_radius = projected_distance <= float(search_radius_um)
                         if target_tree is not None:
                             nearest, _ = target_tree.query(prediction, k=min(2, len(target_table)))
@@ -1553,6 +1584,24 @@ def _merge_extraction_enrichment(endpoints: pd.DataFrame, extraction_dir: str | 
         if column not in output.columns:
             output[column] = default
 
+    def assign_enrichment_value(index: object, column: str, value: object) -> None:
+        nonlocal output
+        if pd.isna(value):
+            return
+        if column not in output.columns:
+            output[column] = pd.Series([pd.NA] * len(output), index=output.index, dtype=object)
+        dtype = output[column].dtype
+        if pd.api.types.is_numeric_dtype(dtype) and isinstance(
+            value, (str, np.str_, bool, np.bool_)
+        ):
+            # Fixed-schema endpoint tables can infer all-missing optional QC
+            # columns as float64. Real extraction tables may later provide
+            # strings (for example ``not_configured``) or booleans. Pandas 3
+            # rejects those assignments instead of silently widening the dtype,
+            # so widen only the affected evaluator column before assignment.
+            output[column] = output[column].astype(object)
+        output.at[index, column] = value
+
     def fill_session_table(name: str, columns: tuple[str, ...]) -> None:
         nonlocal output
         table = _read_csv(root / name)
@@ -1575,7 +1624,7 @@ def _merge_extraction_enrichment(endpoints: pd.DataFrame, extraction_dir: str | 
                 current = output.at[index, column] if column in output.columns else np.nan
                 missing = pd.isna(current) or (isinstance(current, str) and not current.strip())
                 if missing:
-                    output.at[index, column] = row[column]
+                    assign_enrichment_value(index, column, row[column])
 
     def fill_track_table(name: str, columns: tuple[str, ...]) -> None:
         nonlocal output
@@ -1595,7 +1644,7 @@ def _merge_extraction_enrichment(endpoints: pd.DataFrame, extraction_dir: str | 
                 current = output.at[index, column] if column in output.columns else np.nan
                 missing = pd.isna(current) or (isinstance(current, str) and not current.strip())
                 if missing:
-                    output.at[index, column] = row[column]
+                    assign_enrichment_value(index, column, row[column])
 
     fill_session_table(
         "matched_roi_geometry_qc_long.csv",

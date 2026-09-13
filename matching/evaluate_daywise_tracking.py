@@ -27,6 +27,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--state-csv", default=None)
     parser.add_argument("--max-review-panels", type=int, default=100)
     parser.add_argument("--random-seed", type=int, default=0)
+    parser.add_argument("--synthetic-min-score", type=float, default=0.35)
+    parser.add_argument("--synthetic-min-dice", type=float, default=0.10)
+    parser.add_argument("--synthetic-max-distance-um", type=float, default=5.0)
+    parser.add_argument("--synthetic-max-ambiguity", type=float, default=0.85)
+    parser.add_argument(
+        "--synthetic-require-consensus",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require graph tracks annotated as affine-balanced consensus when that metadata exists.",
+    )
+    parser.add_argument(
+        "--synthetic-require-no-cycle-conflict",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--synthetic-require-no-transform-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--synthetic-require-interior",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
 
@@ -38,6 +63,13 @@ def main(argv: list[str] | None = None) -> int:
         search_radius_um=args.search_radius_um, crop_radius_um=args.crop_radius_um,
         z_radius=args.z_radius, extraction_dir=args.extraction_dir, state_csv=args.state_csv,
         max_review_panels=args.max_review_panels, random_seed=args.random_seed, overwrite=args.overwrite,
+        synthetic_min_score=args.synthetic_min_score, synthetic_min_dice=args.synthetic_min_dice,
+        synthetic_max_distance_um=args.synthetic_max_distance_um,
+        synthetic_max_ambiguity=args.synthetic_max_ambiguity,
+        synthetic_require_consensus=args.synthetic_require_consensus,
+        synthetic_require_no_cycle_conflict=args.synthetic_require_no_cycle_conflict,
+        synthetic_require_no_transform_fallback=args.synthetic_require_no_transform_fallback,
+        synthetic_require_interior=args.synthetic_require_interior,
     )
     print(f"Evaluator completed: {args.output_dir}")
     print(f"Endpoints: {summary['n_endpoints']} | candidates: {summary['n_endpoint_candidates']}")

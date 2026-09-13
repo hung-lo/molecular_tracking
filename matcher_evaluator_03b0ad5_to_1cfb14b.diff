@@ -1,0 +1,76 @@
+diff --git a/matching/endpoint_evaluator.py b/matching/endpoint_evaluator.py
+index 4115542..32180f5 100644
+--- a/matching/endpoint_evaluator.py
++++ b/matching/endpoint_evaluator.py
+@@ -979,24 +979,21 @@ def _merge_extraction_enrichment(endpoints: pd.DataFrame, extraction_dir: str |
+         table = _read_csv(root / name)
+         if table.empty or not {"track_uid", "session_index"}.issubset(table.columns):
+             continue
+-        source = table.copy()
+-        source["track_uid"] = source["track_uid"].astype(str)
+-        source["session_index"] = source["session_index"].astype(int)
+-        source = source.drop_duplicates(["track_uid", "session_index"])
+-        source = source.rename(columns={column: f"_enrichment_{column}" for column in source.columns if column not in {"track_uid", "session_index"}})
+-        output["_enrichment_track_uid"] = output["track_uid"].astype(str)
+-        output["_enrichment_session_index"] = output["end_session_index"].astype(int)
+-        output = output.merge(source, left_on=["_enrichment_track_uid", "_enrichment_session_index"], right_on=["track_uid", "session_index"], how="left")
+-        output = output.drop(columns=[column for column in ("track_uid_y", "session_index_y") if column in output.columns], errors="ignore")
+-        output = output.rename(columns={"track_uid_x": "track_uid", "session_index_x": "end_session_index"})
++        source = table.drop_duplicates(["track_uid", "session_index"]).copy()
++        lookup = source.set_index([source["track_uid"].astype(str), source["session_index"].astype(int)])
+         for column in ("green", "red", "eclipse_z", "eclipse_core_state"):
+-            enrichment_column = f"_enrichment_{column}"
+-            if enrichment_column in output.columns:
+-                if column not in output.columns:
+-                    output[column] = output[enrichment_column]
+-                else:
+-                    output[column] = output[column].where(output[column].notna() & output[column].astype(str).ne(""), output[enrichment_column])
+-        output = output.drop(columns=[column for column in output.columns if column.startswith("_enrichment_") or column in {"track_uid_y", "session_index_y"}], errors="ignore")
++            if column not in source.columns:
++                continue
++            if column not in output.columns:
++                output[column] = np.nan
++            for index, row in output.iterrows():
++                key = (_text(row.get("track_uid")), _int(row.get("end_session_index"), -1))
++                if key not in lookup.index:
++                    continue
++                value = lookup.loc[key, column]
++                current = output.at[index, column]
++                if pd.notna(value) and (pd.isna(current) or str(current).strip() == ""):
++                    output.at[index, column] = value
+     return output
+ 
+ 
+diff --git a/tests/test_evaluate_daywise_tracking.py b/tests/test_evaluate_daywise_tracking.py
+index edc5885..88bbb9a 100644
+--- a/tests/test_evaluate_daywise_tracking.py
++++ b/tests/test_evaluate_daywise_tracking.py
+@@ -6,7 +6,7 @@ import pandas as pd
+ import subprocess
+ import sys
+ 
+-from endpoint_evaluator import evaluate_daywise_tracking
++from endpoint_evaluator import _merge_extraction_enrichment, evaluate_daywise_tracking
+ 
+ 
+ def _matching_fixture(tmp_path: Path) -> Path:
+@@ -72,3 +72,19 @@ def test_evaluator_cli_path_is_deterministic_and_read_only(tmp_path: Path) -> No
+     )
+     assert result.returncode == 0, result.stderr
+     assert (cli_output / "evaluation_run_log.json").is_file()
++
++
++def test_optional_extraction_tables_merge_without_duplicate_key_failure(tmp_path: Path) -> None:
++    extraction = tmp_path / "extraction"
++    extraction.mkdir()
++    for filename, column, value in (
++        ("matched_track_qc_summary.csv", "green", 2.0),
++        ("matched_roi_geometry_qc_long.csv", "red", 3.0),
++        ("graph_affine_agreement_track_metadata.csv", "eclipse_z", -1.0),
++    ):
++        pd.DataFrame({"track_uid": ["track-1"], "session_index": [0], column: [value]}).to_csv(extraction / filename, index=False)
++    endpoints = pd.DataFrame({"track_uid": ["track-1"], "end_session_index": [0], "green": [pd.NA], "red": [pd.NA], "eclipse_z": [pd.NA], "eclipse_core_state": [""]})
++    merged = _merge_extraction_enrichment(endpoints, extraction)
++    assert merged.loc[0, "green"] == 2.0
++    assert merged.loc[0, "red"] == 3.0
++    assert merged.loc[0, "eclipse_z"] == -1.0

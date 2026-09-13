@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -32,7 +33,10 @@ def _load_array(value: Any) -> np.ndarray | None:
     path = Path(_text(value))
     if not path.is_file():
         return None
-    return np.asarray(tifffile.imread(path))
+    try:
+        return tifffile.memmap(path)
+    except Exception:
+        return np.asarray(tifffile.imread(path))
 
 
 def _manifest_rows(manifest: pd.DataFrame) -> pd.DataFrame:
@@ -70,6 +74,15 @@ def _coordinate_in_session(
         if stored is None:
             return None
         return apply_transform_b_to_a(coordinate, stored)
+    source_id = str(sessions.iloc[source_position].session_id)
+    target_id = str(sessions.iloc[target_position].session_id)
+    if target_position - source_position <= 2:
+        direct = lookup.get((source_id, target_id))
+        if direct is not None:
+            try:
+                return apply_transform_b_to_a(coordinate, invert_restricted_transform(direct))
+            except ValueError:
+                return None
     components: list[pd.Series] = []
     for position in range(source_position, target_position):
         stored = lookup.get((str(sessions.iloc[position].session_id), str(sessions.iloc[position + 1].session_id)))
@@ -83,6 +96,69 @@ def _coordinate_in_session(
         return apply_transform_b_to_a(coordinate, invert_restricted_transform(composed))
     except ValueError:
         return None
+
+
+def _abbr(value: Any, width: int = 12) -> str:
+    text = _text(value)
+    if len(text) <= width:
+        return text
+    half = max(3, (width - 1) // 2)
+    return f"{text[:half]}…{text[-half:]}"
+
+
+def _fmt(value: Any, digits: int = 2, default: str = "NA") -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not np.isfinite(number):
+        return default
+    return f"{number:.{digits}f}"
+
+
+def _candidate_role(candidate: pd.Series, source_track_uid: str) -> str:
+    target_uid = _text(candidate.get("target_track_uid"))
+    if target_uid and target_uid == source_track_uid:
+        return "same"
+    if bool(candidate.get("target_is_singleton", False)):
+        return "singleton"
+    if bool(candidate.get("target_track_starts_here", False)):
+        return "new-start"
+    return "existing"
+
+
+def _review_footer(endpoint: Mapping[str, Any] | pd.Series, candidates: pd.DataFrame) -> str:
+    state = _text(endpoint.get("eclipse_core_state")) or "NA"
+    source = _text(endpoint.get("track_match_source")) or "NA"
+    triage = _text(endpoint.get("classification")) or "unclassified"
+    line1 = (
+        f"track={_text(endpoint.get('track_uid'))} | triage={triage} | source={source} | "
+        f"ECLIPSE={state} z={_fmt(endpoint.get('eclipse_z'))} | G={_fmt(endpoint.get('green'), 1)} "
+        f"R={_fmt(endpoint.get('red'), 1)} | volume={_fmt(endpoint.get('volume_um3'), 1)} um^3 | "
+        f"edge(z/xy)={bool(endpoint.get('touches_z_edge', False))}/{bool(endpoint.get('touches_xy_edge', False))}"
+    )
+    line2 = (
+        f"preceding edge: gap={_fmt(endpoint.get('preceding_pair_gap'), 0)} "
+        f"score={_fmt(endpoint.get('preceding_score'))} dice={_fmt(endpoint.get('preceding_dice'))} "
+        f"dist={_fmt(endpoint.get('preceding_distance_um'))}um amb={_fmt(endpoint.get('preceding_ambiguity'))} | "
+        f"graph={_text(endpoint.get('preceding_graph_status')) or 'NA'} support={_fmt(endpoint.get('preceding_graph_support_fraction'))} | "
+        f"cycle_agree={_fmt(endpoint.get('cycle_agreement_fraction'))} conflict={bool(endpoint.get('has_cycle_conflict', False))}"
+    )
+    if candidates.empty:
+        line3 = "future candidates: none within search radius"
+    else:
+        top = candidates.sort_values(["target_session_index", "target_rank_by_distance"]).head(4)
+        pieces = []
+        source_uid = _text(endpoint.get("track_uid"))
+        for _, row in top.iterrows():
+            pieces.append(
+                f"t+{int(row['session_gap'])} #{int(row['target_rank_by_distance'])} "
+                f"{_candidate_role(row, source_uid)} {_abbr(row.get('target_track_uid'))} "
+                f"d={_fmt(row.get('projected_distance_um'))}um "
+                f"xfm={_text(row.get('transform_source'))}{'' if bool(row.get('transform_reliable', True)) else '!'}"
+            )
+        line3 = "future: " + " | ".join(pieces)
+    return "\n".join([line1, line2, line3])
 
 
 def _crop(
@@ -138,6 +214,8 @@ def plot_endpoint_review_panel(
     crop_radius_um: float = 45.0,
     z_radius: int = 1,
     spacing: VoxelSpacing | None = None,
+    image_cache: OrderedDict[tuple[str, str], np.ndarray | None] | None = None,
+    cache_max_items: int = 18,
 ) -> plt.Figure:
     """Render the t-1…t+3 raw/overlay endpoint panel."""
 
@@ -161,16 +239,22 @@ def plot_endpoint_review_panel(
         source_coordinate = source_feature[["centroid_z", "centroid_y", "centroid_x"]].to_numpy(dtype=float)
     radius_px = (max(1, int(round(crop_radius_um / spacing.y_um))), max(1, int(round(crop_radius_um / spacing.x_um))))
     relative_positions = list(range(-1, 4))
-    fig, axes = plt.subplots(3, 5, figsize=(15, 8), squeeze=False, constrained_layout=True)
+    fig, axes = plt.subplots(3, 5, figsize=(15, 9.2), squeeze=False)
+    fig.subplots_adjust(left=0.045, right=0.995, top=0.88, bottom=0.17, wspace=0.045, hspace=0.10)
     candidate_subset = candidates.loc[candidates["endpoint_id"].astype(str).eq(_text(endpoint.get("endpoint_id")))] if not candidates.empty and "endpoint_id" in candidates else pd.DataFrame()
-    cache: dict[str, dict[str, np.ndarray | None]] = {}
+    cache = image_cache if image_cache is not None else OrderedDict()
 
     def session_array(session: pd.Series, key: str) -> np.ndarray | None:
         session_id = str(session.session_id)
-        cache.setdefault(session_id, {})
-        if key not in cache[session_id]:
-            cache[session_id][key] = _load_array(session.get(f"{key}_image_path", session.get(key)))
-        return cache[session_id][key]
+        cache_key = (session_id, key)
+        if cache_key not in cache:
+            source = session.get("mask_path") if key == "mask" else session.get(f"{key}_image_path", session.get(key))
+            cache[cache_key] = _load_array(source)
+            while len(cache) > max(1, int(cache_max_items)):
+                cache.popitem(last=False)
+        else:
+            cache.move_to_end(cache_key)
+        return cache[cache_key]
 
     for column, relative in enumerate(relative_positions):
         position = source_position + relative
@@ -186,7 +270,7 @@ def plot_endpoint_review_panel(
         z_index = int(round(float(coordinate[0])))
         red = _crop(session_array(session, "red"), coordinate, radius_px, z_index, z_radius)
         green = _crop(session_array(session, "green"), coordinate, radius_px, z_index, z_radius)
-        mask = _load_array(session.get("mask_path"))
+        mask = session_array(session, "mask")
         mask_crop = _crop(mask, coordinate, radius_px, z_index, z_radius)
         for axis, image, cmap in ((axes[0, column], red, "Reds"), (axes[1, column], green, "Greens")):
             vmax = float(np.percentile(image, 99)) if np.any(image) else 1.0
@@ -212,13 +296,20 @@ def plot_endpoint_review_panel(
             if np.any(target_mask):
                 axes[2, column].contour(target_mask, levels=[0.5], colors="magenta", linewidths=0.7)
             axes[2, column].plot(local[2], local[1], "x", color="magenta", markersize=6)
-            axes[2, column].text(local[2] + 2, local[1], f"#{int(candidate['target_rank_by_distance'])}", color="magenta", fontsize=6)
+            role = _candidate_role(candidate, _text(endpoint.get("track_uid")))
+            label = (
+                f"#{int(candidate['target_rank_by_distance'])} "
+                f"{_fmt(candidate.get('projected_distance_um'), 1)}um\n"
+                f"{role} {_abbr(candidate.get('target_track_uid'), 10)}"
+            )
+            axes[2, column].text(local[2] + 2, local[1], label, color="magenta", fontsize=5.5, va="center")
         acquisition = _text(session.get("acquisition_date"))[:10]
         axes[0, column].set_title(f"{relative:+d} {session_id}\n{acquisition}", fontsize=8)
     axes[0, 0].set_ylabel("Red raw")
     axes[1, 0].set_ylabel("Green raw")
     axes[2, 0].set_ylabel("Red + masks")
-    fig.suptitle(f"{_text(endpoint.get('endpoint_id'))} | track {_text(endpoint.get('track_uid'))}", fontsize=11)
+    fig.suptitle(f"{_text(endpoint.get('endpoint_id'))} | track {_text(endpoint.get('track_uid'))}", fontsize=11, y=0.965)
+    fig.text(0.01, 0.015, _review_footer(endpoint, candidate_subset), ha="left", va="bottom", fontsize=7.2, family="monospace")
     return _save(fig, output_path)
 
 
@@ -235,8 +326,14 @@ def plot_endpoint_candidate_overlay(
     fig, axis = plt.subplots(figsize=(5, 5), constrained_layout=True)
     if not table.empty:
         axis.scatter(table["target_x_um"], table["target_y_um"], c=table["session_gap"], cmap="viridis", s=35)
+        source_uid = _text(endpoint.get("track_uid"))
         for _, row in table.iterrows():
-            axis.text(row["target_x_um"], row["target_y_um"], str(int(row["target_rank_by_distance"])), fontsize=8)
+            role = _candidate_role(row, source_uid)
+            axis.text(
+                row["target_x_um"], row["target_y_um"],
+                f"#{int(row['target_rank_by_distance'])} {role}\n{_fmt(row.get('projected_distance_um'), 1)}um",
+                fontsize=7,
+            )
         axis.scatter(table["predicted_x_um"].iloc[0], table["predicted_y_um"].iloc[0], marker="+", c="red", s=100)
     axis.set_xlabel("X (µm)"); axis.set_ylabel("Y (µm)"); axis.set_title(f"Endpoint candidates: {endpoint_id}")
     return _save(fig, output_path)
@@ -261,11 +358,17 @@ def plot_endpoint_contact_sheet(
     selected = endpoints.head(int(max_panels)) if max_panels is not None else endpoints
     paths: list[Path] = []
     thumbnails: list[np.ndarray] = []
+    image_cache: OrderedDict[tuple[str, str], np.ndarray | None] = OrderedDict()
     for _, endpoint in selected.iterrows():
         path = output_dir / f"{_text(endpoint.get('endpoint_id'))}.png"
-        plot_endpoint_review_panel(endpoint, sessions, features, candidates, transforms, output_path=path, crop_radius_um=crop_radius_um, z_radius=z_radius, spacing=spacing)
+        plot_endpoint_review_panel(
+            endpoint, sessions, features, candidates, transforms,
+            output_path=path, crop_radius_um=crop_radius_um, z_radius=z_radius,
+            spacing=spacing, image_cache=image_cache,
+        )
         paths.append(path)
-        thumbnails.append(plt.imread(path))
+        image = plt.imread(path)
+        thumbnails.append(image[::4, ::4] if image.ndim >= 2 else image)
     sheet_path = output_dir / "endpoint_contact_sheet.png"
     if thumbnails:
         ncols = min(4, len(thumbnails)); nrows = int(np.ceil(len(thumbnails) / ncols))

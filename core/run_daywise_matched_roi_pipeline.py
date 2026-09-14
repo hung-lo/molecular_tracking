@@ -777,15 +777,22 @@ def _policy_analysis(
         | matched_tracks["edge_heavy"].fillna(False).astype(bool)
     ].copy()
 
-    filter_rows = []
-    filter_rows.append({"match_policy": policy, "step_order": 0, "step": "all_tracks", "count": int(len(matched_tracks))})
-    filter_rows.append({"match_policy": policy, "step_order": 1, "step": "at_least_two_sessions", "count": int(len(matched_tracks.loc[matched_tracks["n_days_present"].astype(int) >= 2]))})
-    filter_rows.append({"match_policy": policy, "step_order": 2, "step": "complete_required_sessions", "count": int(len(complete_required))})
-    filter_rows.append({"match_policy": policy, "step_order": 3, "step": "zero_hit_complete", "count": int(len(zero_hit_complete))})
-    filter_rows.append({"match_policy": policy, "step_order": 4, "step": "cycle_qc", "count": int(len(cycle_qc))})
-    filter_rows.append({"match_policy": policy, "step_order": 5, "step": "segmentation_qc", "count": int(len(segmentation_qc))})
-    filter_rows.append({"match_policy": policy, "step_order": 6, "step": "primary_final", "count": int(len(primary_final))})
-    filter_rows.append({"match_policy": policy, "step_order": 7, "step": "one_internal_gap", "count": int(len(one_gap_track_set))})
+    filter_rows = [
+        {"match_policy": policy, "step_order": 0, "step": "all_tracks", "count": int(len(matched_tracks)), "step_status": "applied"},
+        {"match_policy": policy, "step_order": 1, "step": "at_least_two_sessions", "count": int(len(matched_tracks.loc[matched_tracks["n_days_present"].astype(int) >= 2])), "step_status": "applied"},
+        {"match_policy": policy, "step_order": 2, "step": "complete_required_sessions", "count": int(len(complete_required)), "step_status": "applied"},
+        {"match_policy": policy, "step_order": 3, "step": "zero_hit_complete", "count": int(len(zero_hit_complete)), "step_status": "applied"},
+        {"match_policy": policy, "step_order": 4, "step": "cycle_qc", "count": int(len(cycle_qc)), "step_status": "applied"},
+        {
+            "match_policy": policy,
+            "step_order": 5,
+            "step": "segmentation_qc",
+            "count": int(len(segmentation_qc)),
+            "step_status": "applied" if qc_config.is_configured else "bypassed_not_configured",
+        },
+        {"match_policy": policy, "step_order": 6, "step": "primary_final", "count": int(len(primary_final)), "step_status": "applied"},
+        {"match_policy": policy, "step_order": 7, "step": "one_internal_gap", "count": int(len(one_gap_track_set)), "step_status": "applied"},
+    ]
     filter_counts = pd.DataFrame(filter_rows)
     if not filter_counts.empty:
         starting_count = float(filter_counts.loc[filter_counts["step_order"] == 0, "count"].iloc[0])
@@ -1126,10 +1133,15 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
     segmentation_counts = filter_counts.loc[
         filter_counts["step"].eq("segmentation_qc"), "count"
     ]
+    cycle_counts = filter_counts.loc[filter_counts["step"].eq("cycle_qc"), "count"]
     if not qc_config.is_configured:
         segmentation_qc_status = "not_configured_bypassed"
     elif not segmentation_counts.empty and segmentation_counts.eq(0).all():
-        segmentation_qc_status = "configured_no_tracks_passed"
+        segmentation_qc_status = (
+            "configured_no_upstream_eligible_tracks"
+            if not cycle_counts.empty and cycle_counts.eq(0).all()
+            else "configured_no_tracks_passed"
+        )
     else:
         segmentation_qc_status = "configured_and_applied"
 

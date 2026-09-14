@@ -84,6 +84,7 @@ def _manual_manifest(proposals: pd.DataFrame, previous: pd.DataFrame) -> pd.Data
     for column in ("manual_class", "manual_confidence", "reviewer_notes"):
         selected[column] = ""
     output = selected.reindex(columns=columns)
+    output["review_sample_reason"] = output["review_sample_reason"].fillna("")
     output["manual_label_transfer_warning"] = ""
     identity_columns = ["source_track_uid", "source_session_index", "source_label", "target_track_uid", "target_session_index", "target_label"]
     if not previous.empty and "stitch_edge_id" in previous:
@@ -198,7 +199,10 @@ def run_endpoint_stitching(
     edge_table(assignments).to_csv(output_dir / "track_stitch_edges.csv", index=False)
     benchmark.to_csv(output_dir / "synthetic_stitch_benchmark.csv", index=False)
     sweep.to_csv(output_dir / "synthetic_stitch_threshold_sweep.csv", index=False)
-    manual = _manual_manifest(review, previous_manual)
+    manual = _manual_manifest(assignments, previous_manual)
+    if not review.empty and "stitch_edge_id" in review:
+        sampled_reasons = review.set_index("stitch_edge_id")["review_sample_reason"]
+        manual["review_sample_reason"] = manual["stitch_edge_id"].map(sampled_reasons).fillna("")
     manual.to_csv(output_dir / "manual_stitch_review_manifest.csv", index=False)
     if wrote_stitched:
         uid_map.to_csv(output_dir / "track_uid_stitch_map.csv", index=False)
@@ -267,6 +271,7 @@ def run_endpoint_stitching(
         "evaluator_input_sha256": _hashes(evaluation_paths),
         "repo_git_commit": git_commit,
         "evaluator_algorithm_version": evaluator_log.get("evaluator_version"),
+        "evaluator_repo_git_commit": evaluator_log.get("evaluator_repo_git_commit"),
         "stage_durations_seconds": {
             "load_inputs_sec": load_inputs_sec, "build_candidates_sec": build_candidates_sec,
             "global_assignment_sec": global_assignment_sec, "benchmark_sec": benchmark_sec,

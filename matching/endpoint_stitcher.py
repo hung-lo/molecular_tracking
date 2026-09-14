@@ -7,7 +7,7 @@ decision function.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 from math import sqrt
@@ -58,6 +58,8 @@ STITCH_EDGE_COLUMNS = [
     "transform_component_residual_median_um_max", "transform_component_residual_p95_um_max",
     "direct_vs_composed_projection_delta_um", "source_touches_z_edge",
     "source_touches_xy_edge", "target_touches_z_edge", "target_touches_xy_edge",
+    "source_feature_row_missing", "target_feature_row_missing",
+    "source_feature_edge_evidence_missing", "target_feature_edge_evidence_missing",
     "source_edge_heavy", "target_edge_heavy",
     "transform_reliable", "source_has_cycle_conflict", "target_has_cycle_conflict",
     "rejection_reasons", "review_reasons", "assignment_cost",
@@ -306,12 +308,59 @@ def _feature_coords_lookup(features: pd.DataFrame) -> dict[tuple[str, int], np.n
 
 
 def _feature_edge_lookup(features: pd.DataFrame) -> dict[tuple[str, int], tuple[bool, bool]]:
+    if not {"touches_z_edge", "touches_xy_edge"}.issubset(features.columns):
+        return {}
     return {
         (str(row.session_id), int(row.label)): (
-            _bool(getattr(row, "touches_z_edge", False)),
-            _bool(getattr(row, "touches_xy_edge", False)),
+            _bool(getattr(row, "touches_z_edge", True)),
+            _bool(getattr(row, "touches_xy_edge", True)),
         )
         for row in features.itertuples(index=False)
+    }
+
+
+def _transform_provenance(
+    source_position: int,
+    target_position: int,
+    source_coords: np.ndarray | None,
+    sessions: pd.DataFrame,
+    transform_map: dict[tuple[str, str], pd.Series],
+    spacing: VoxelSpacing,
+) -> dict[str, Any]:
+    projected = _forward_transform(source_position, target_position, sessions, transform_map)
+    if projected is None:
+        return {
+            "transform_source": "", "transform_reliable": False,
+            "transform_component_methods": "", "transform_component_fallback_reasons": "",
+            "transform_component_residual_median_um_max": np.nan,
+            "transform_component_residual_p95_um_max": np.nan,
+            "direct_vs_composed_projection_delta_um": np.nan,
+        }
+    _, transform_source, reliable, qc = projected
+    delta = np.nan
+    if target_position - source_position == 2 and source_coords is not None:
+        source_id = str(sessions.iloc[source_position]["session_id"])
+        middle_id = str(sessions.iloc[source_position + 1]["session_id"])
+        target_id = str(sessions.iloc[target_position]["session_id"])
+        direct = transform_map.get((source_id, target_id))
+        first = transform_map.get((source_id, middle_id))
+        second = transform_map.get((middle_id, target_id))
+        if direct is not None and first is not None and second is not None:
+            try:
+                direct_prediction = apply_transform_b_to_a(source_coords, invert_restricted_transform(direct))
+                composed = compose_transforms(first, second)
+                composed_prediction = apply_transform_b_to_a(source_coords, invert_restricted_transform(composed))
+                delta = float(np.linalg.norm((direct_prediction - composed_prediction) * spacing.as_zyx_array()))
+            except ValueError:
+                pass
+    return {
+        "transform_source": transform_source,
+        "transform_reliable": bool(reliable),
+        "transform_component_methods": _text(qc.get("methods")),
+        "transform_component_fallback_reasons": _text(qc.get("fallback_reasons")),
+        "transform_component_residual_median_um_max": _float(qc.get("residual_median_um_max")),
+        "transform_component_residual_p95_um_max": _float(qc.get("residual_p95_um_max")),
+        "direct_vs_composed_projection_delta_um": delta,
     }
 
 
@@ -387,8 +436,11 @@ def _cached_longitudinal_distances(
 ) -> dict[str, float | int]:
     scale = spacing.as_zyx_array()
     source_obs, target_obs = observations[source_uid], observations[target_uid]
-    target_start = next(coords for position, _, _, coords in target_obs if position == target_position)
-    source_end = next(coords for position, _, _, coords in source_obs if position == source_position)
+    target_starts = [coords for position, _, _, coords in target_obs if position == target_position]
+    source_ends = [coords for position, _, _, coords in source_obs if position == source_position]
+    if not target_starts or not source_ends:
+        return _distance_summaries("source_history", []) | _distance_summaries("target_future", [])
+    target_start, source_end = target_starts[0], source_ends[0]
     history, future = [], []
     for position, _, _, coords in [obs for obs in source_obs if obs[0] <= source_position][-3:]:
         projected = _project(coords, position, target_position, sessions, transform_map)
@@ -465,8 +517,12 @@ def build_stitch_candidates(
             continue
         source_feature_key = (str(candidate.get("source_session_id")), _int(candidate.get("source_label"), -1))
         target_feature_key = (str(candidate.get("target_session_id")), _int(candidate.get("target_label"), -1))
-        source_touches_z, source_touches_xy = feature_edges.get(source_feature_key, (False, False))
-        target_touches_z, target_touches_xy = feature_edges.get(target_feature_key, (False, False))
+        source_feature_missing = source_feature_key not in feature_coords
+        target_feature_missing = target_feature_key not in feature_coords
+        source_edge_evidence_missing = source_feature_key not in feature_edges
+        target_edge_evidence_missing = target_feature_key not in feature_edges
+        source_touches_z, source_touches_xy = feature_edges.get(source_feature_key, (True, True))
+        target_touches_z, target_touches_xy = feature_edges.get(target_feature_key, (True, True))
         row = candidate.to_dict()
         row.update({
             "edge_type": "endpoint_stitch",
@@ -482,8 +538,12 @@ def build_stitch_candidates(
             "target_has_cycle_conflict": _bool(target_track.get("has_cycle_conflict")),
             "source_touches_z_edge": source_touches_z, "source_touches_xy_edge": source_touches_xy,
             "target_touches_z_edge": target_touches_z, "target_touches_xy_edge": target_touches_xy,
-            "source_edge_heavy": source_touches_z or source_touches_xy,
-            "target_edge_heavy": target_touches_z or target_touches_xy,
+            "source_feature_row_missing": source_feature_missing,
+            "target_feature_row_missing": target_feature_missing,
+            "source_feature_edge_evidence_missing": source_edge_evidence_missing,
+            "target_feature_edge_evidence_missing": target_edge_evidence_missing,
+            "source_edge_heavy": source_feature_missing or source_touches_z or source_touches_xy,
+            "target_edge_heavy": target_feature_missing or target_touches_z or target_touches_xy,
             "source_contains_transform_fallback_edge": _bool(source_track.get("contains_transform_fallback_edge")),
             "target_contains_transform_fallback_edge": _bool(target_track.get("contains_transform_fallback_edge")),
             "source_cycle_agreement_fraction": _float(source_track.get("cycle_agreement_fraction")),
@@ -496,6 +556,10 @@ def build_stitch_candidates(
             "target_has_same_session_conflict": _track_flag(target_track, "has_same_session_conflict", "same_session_conflict", "component_same_session_conflict"),
             "source_endpoint_classification": class_map.get(_text(candidate.get("endpoint_id")), ""),
         })
+        row.update(_transform_provenance(
+            source_position, target_position, feature_coords.get(source_feature_key),
+            sessions, transform_map, spacing,
+        ))
         pair_key = source_position * len(sessions) + target_position
         if pair_key not in anchor_cache:
             anchor_cache[pair_key] = _anchor_context(
@@ -574,6 +638,26 @@ def select_review_samples(
             if limit is not None and count >= limit:
                 break
 
+    def take_spatial(mask: pd.Series, reason: str, limit: int) -> None:
+        columns = ["predicted_z_um", "predicted_y_um", "predicted_x_um"]
+        if not all(column in table for column in columns):
+            return
+        spatial = table.loc[mask, columns + ["stitch_edge_id"]].copy()
+        points = spatial[columns].apply(pd.to_numeric, errors="coerce")
+        spatial = spatial.loc[points.notna().all(axis=1)].copy()
+        if spatial.empty:
+            return
+        bins = np.floor(points.loc[spatial.index].to_numpy(dtype=float) / 25.0).astype(int)
+        spatial["_spatial_bin"] = [tuple(value) for value in bins]
+        chosen_bins: set[tuple[int, int, int]] = set()
+        for index, row in spatial.sort_values(["_spatial_bin", "stitch_edge_id"], kind="mergesort").iterrows():
+            if row["_spatial_bin"] in chosen_bins or index in reasons:
+                continue
+            chosen_bins.add(row["_spatial_bin"])
+            reasons[index] = reason; selected.append(index)
+            if len(chosen_bins) >= limit:
+                return
+
     for gap in (1, 2, 3):
         take(table.get("accepted_by_global_assignment", pd.Series(False, index=table.index)) & table.get("session_gap", pd.Series(-1, index=table.index)).eq(gap), f"auto_accept_gap_{gap}", 1)
     take(table.get("assignment_status", pd.Series(index=table.index, dtype=str)).eq("global_collision_rejection"), "global_collision_rejection", 3)
@@ -584,7 +668,7 @@ def select_review_samples(
     margins = pd.to_numeric(table.get("forward_second_margin_um", pd.Series(index=table.index, dtype=float)), errors="coerce")
     take((distances.ge(limits * .8) | margins.between(config.min_forward_margin_um, config.min_forward_margin_um + 1.5)).fillna(False), "near_threshold_distance_or_margin", 3)
     take(pd.to_numeric(table.get("volume_ratio", pd.Series(index=table.index, dtype=float)), errors="coerce").le(.3), "poor_volume_ratio_state_blind_geometry", 2)
-    take(table.get("accepted_by_global_assignment", pd.Series(False, index=table.index)), "spatially_distributed_accepted", 5)
+    take_spatial(table.get("accepted_by_global_assignment", pd.Series(False, index=table.index)), "spatially_distributed_accepted", 5)
     limit = len(table) if max_panels is None else max(0, int(max_panels))
     if len(selected) < limit:
         remaining = table.index[~table.index.isin(selected)].to_numpy()
@@ -674,6 +758,10 @@ def tier_stitch_candidates(candidates: pd.DataFrame, *, config: StitcherConfig |
             reject.append("transform_unreliable")
         if _bool(row.get("source_edge_heavy")) or _bool(row.get("target_edge_heavy")):
             reject.append("edge_or_out_of_fov")
+        if _bool(row.get("source_feature_row_missing")) or _bool(row.get("target_feature_row_missing")):
+            reject.append("missing_feature_row")
+        if _bool(row.get("source_feature_edge_evidence_missing")) or _bool(row.get("target_feature_edge_evidence_missing")):
+            reject.append("missing_feature_edge_evidence")
         if _text(row.get("source_endpoint_classification")) in {"edge_or_out_of_fov", "transform_unreliable"}:
             reject.append(_text(row.get("source_endpoint_classification")))
         if _bool(row.get("source_has_same_session_conflict")) or _bool(row.get("target_has_same_session_conflict")):
@@ -939,12 +1027,17 @@ def summarize_stitch_benchmark(
     for gap, frame in benchmark.groupby("session_gap", sort=True):
         gap_positive = frame.loc[frame["case_type"].eq("positive")]
         gap_negative = frame.loc[frame["case_type"].ne("positive")]
+        gap_truth_splits = gap_positive.get("canonical_truth_split_id", pd.Series(index=gap_positive.index, dtype=str)).replace("", np.nan).dropna()
+        if gap_truth_splits.empty:
+            gap_truth_splits = pd.Series(gap_positive.index.astype(str), index=gap_positive.index)
         gap_tp = int(correct_column.loc[gap_positive.index].sum())
         gap_wrong = int(false_column.loc[gap_positive.index].sum())
         gap_negative_fp = int(false_column.loc[gap_negative.index].sum())
         gap_accepted = int(accepted_column.loc[frame.index].sum())
         by_gap[str(int(gap))] = {
             "n": int(len(frame)), "n_positive_truth": int(len(gap_positive)),
+            "n_unique_positive_truth_tracks": int(gap_positive.get("canonical_truth_track_uid", pd.Series(index=gap_positive.index, dtype=str)).replace("", np.nan).dropna().nunique()) if not gap_positive.empty else 0,
+            "n_unique_positive_truth_splits": int(gap_truth_splits.nunique()),
             "n_negative_controls": int(len(gap_negative)), "accepted": gap_accepted,
             "true_positive": gap_tp, "wrong_target": gap_wrong,
             "negative_false_links": gap_negative_fp,
@@ -952,12 +1045,22 @@ def summarize_stitch_benchmark(
             "recall": gap_tp / len(gap_positive) if len(gap_positive) else np.nan,
             "negative_fpr": gap_negative_fp / len(gap_negative) if len(gap_negative) else np.nan,
         }
+    truth_tracks = positive.get("canonical_truth_track_uid", pd.Series(index=positive.index, dtype=str)).replace("", np.nan).dropna()
+    truth_splits = positive.get("canonical_truth_split_id", pd.Series(index=positive.index, dtype=str)).replace("", np.nan).dropna()
+    if truth_splits.empty:
+        truth_splits = pd.Series(positive.index.astype(str), index=positive.index)
+    unique_splits_by_gap = {
+        key: int(value.get("n_unique_positive_truth_splits", 0))
+        for key, value in by_gap.items()
+    }
     sample_sufficient = bool(
         len(positive) >= min_positive_cases
+        and truth_splits.nunique() >= min_positive_cases
         and len(negative) >= min_negative_controls
         and all(
             key in by_gap
             and int(by_gap[key]["n_positive_truth"]) >= min_cases_per_gap
+            and unique_splits_by_gap.get(key, 0) >= min_cases_per_gap
             and np.isfinite(float(by_gap[key]["precision"]))
             for key in ("1", "2", "3")
         )
@@ -981,6 +1084,9 @@ def summarize_stitch_benchmark(
     return {
         "n_cases": int(len(benchmark)), "n_positive_truth": int(len(positive)),
         "n_negative_controls": int(len(negative)), "n_accepted": accepted,
+        "n_unique_positive_truth_tracks": int(truth_tracks.nunique()),
+        "n_unique_positive_truth_splits": int(truth_splits.nunique()),
+        "n_unique_positive_truth_splits_by_gap": unique_splits_by_gap,
         "true_positive": tp, "wrong_target_count": wrong_target,
         "false_positive": wrong_target + negative_false_links,
         "negative_false_positive_count": negative_false_links,
@@ -1219,6 +1325,51 @@ def _benchmark_evidence(assigned: pd.DataFrame, source_uid: str, target_uid: str
     return {}
 
 
+def _benchmark_case_rows(assigned: pd.DataFrame, cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    accepted = assigned.loc[assigned.get("accepted_by_global_assignment", pd.Series(False, index=assigned.index)).astype(bool)] if not assigned.empty else pd.DataFrame()
+    auto = assigned.loc[assigned.get("auto_eligible", pd.Series(False, index=assigned.index)).astype(bool)] if not assigned.empty else pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    for case in cases:
+        source_uid, target_uid = case.get("source_uid", ""), case.get("target_uid", "")
+        source_accepted = accepted.loc[accepted["source_track_uid"].astype(str).eq(source_uid)] if source_uid and not accepted.empty else pd.DataFrame()
+        target_accepted = accepted.loc[accepted["target_track_uid"].astype(str).eq(target_uid)] if target_uid and not accepted.empty else pd.DataFrame()
+        assigned_target = str(source_accepted.iloc[0]["target_track_uid"]) if not source_accepted.empty else ""
+        is_positive = case["case_type"] == "positive"
+        correct = bool(is_positive and assigned_target == target_uid)
+        false_positive = bool(
+            (is_positive and not source_accepted.empty and not correct)
+            or (not is_positive and (not source_accepted.empty if source_uid else not target_accepted.empty))
+        )
+        evidence = _benchmark_evidence(assigned, source_uid, target_uid)
+        component = _text(evidence.get("assignment_component_id"))
+        component_edges = auto.loc[auto["assignment_component_id"].astype(str).eq(component)] if component and not auto.empty else pd.DataFrame()
+        competing = component_edges.loc[
+            component_edges["source_track_uid"].astype(str).eq(source_uid)
+            | component_edges["target_track_uid"].astype(str).eq(target_uid)
+        ] if not component_edges.empty else pd.DataFrame()
+        collision = len(competing) > 1
+        accepted_case = bool(not source_accepted.empty if source_uid else not target_accepted.empty)
+        rows.append({
+            "case_id": case["case_id"], "case_type": case["case_type"], "negative_subtype": case.get("negative_subtype", ""),
+            "replicate": case.get("replicate", 0), "session_gap": case["session_gap"], "source_track_uid": source_uid,
+            "true_target_track_uid": target_uid, "accepted": accepted_case,
+            "assigned_target_track_uid": assigned_target, "correct_assignment": correct,
+            "false_positive": false_positive, "collision": collision,
+            "collision_resolved_correctly": bool(collision and (correct or (not is_positive and not false_positive))),
+            "assignment_component_id": component, "n_auto_edges_in_component": int(len(component_edges)),
+            "projected_distance_um": _float(evidence.get("projected_distance_um")),
+            "forward_margin_um": _float(evidence.get("forward_second_margin_um")),
+            "anchor_residual_median_um": _float(evidence.get("anchor_residual_median_um")),
+            "anchor_inlier_fraction": _float(evidence.get("anchor_inlier_fraction")),
+            "source_history_distance_median_um": _float(evidence.get("source_history_distance_median_um")),
+            "target_future_distance_median_um": _float(evidence.get("target_future_distance_median_um")),
+            "forward_rank": _int(evidence.get("forward_rank_all_masks")), "reverse_rank": _int(evidence.get("reverse_rank_source_endpoints")),
+            "canonical_truth_track_uid": case.get("canonical_truth_track_uid", ""),
+            "canonical_truth_split_id": case.get("canonical_truth_split_id", ""),
+        })
+    return rows
+
+
 def build_synthetic_stitch_benchmark(
     tracks: pd.DataFrame,
     features: pd.DataFrame,
@@ -1246,6 +1397,8 @@ def build_synthetic_stitch_benchmark(
         raise ValueError("benchmark replicates and cases per gap must be nonnegative")
     pools = _trusted_split_pool(tracks, features, sessions, transforms, config)
     rng = np.random.default_rng(random_seed)
+    used_truth_units: set[tuple[int, int]] = set()
+    replay_batches: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
     roi_columns = [_roi_column(str(session.session_id)) for session in sessions.itertuples(index=False)]
     for replicate in range(int(replicates)):
@@ -1258,12 +1411,16 @@ def build_synthetic_stitch_benchmark(
             selected_indices: set[int] = set()
             for index in order:
                 item = pool[index]
-                if item[0] in selected_indices:
+                truth_unit = (item[0], gap)
+                if item[0] in selected_indices or truth_unit in used_truth_units:
                     continue
                 selected_indices.add(item[0])
+                used_truth_units.add(truth_unit)
                 chosen.append(item)
                 if len(chosen) >= cases_per_gap:
                     break
+            if not chosen:
+                continue
             remaining = [item for item in pool if item[0] not in selected_indices]
             base_tracks = tracks.drop(index=tracks.index[list(selected_indices)]).copy()
             pseudo_rows: list[pd.Series] = []
@@ -1291,7 +1448,8 @@ def build_synthetic_stitch_benchmark(
                     "case_id": f"positive_r{replicate:03d}_g{gap}_{ordinal:04d}",
                     "source_uid": source_uid, "target_uid": target_uid, "session_gap": gap,
                     "track_index": track_index, "source_position": source_position, "target_position": target_position,
-                    "case_type": "positive",
+                    "case_type": "positive", "canonical_truth_track_uid": _text(base.get("track_uid")),
+                    "canonical_truth_split_id": f"{base.get('track_uid')}|g{gap}|s{source_position}|t{target_position}",
                 })
 
                 # Use an unselected truth track for a true no-successor control
@@ -1360,20 +1518,22 @@ def build_synthetic_stitch_benchmark(
             for column in roi_columns:
                 decoy[column] = pd.NA
             decoy_position = chosen[0][2]
+            base_observations = {position: (session_id, label) for position, session_id, label in _track_observations(base, sessions)}
+            future_positions = [position for position in base_observations if position > decoy_position]
+            if not future_positions:
+                continue
+            future_position = min(future_positions)
             decoy_label = -int(2_000_000 + replicate * 10_000 + gap)
             decoy[roi_columns[decoy_position]] = decoy_label
-            if decoy_position + 1 < len(roi_columns):
-                decoy[roi_columns[decoy_position + 1]] = decoy_label - 1
-            decoy["first_session_index"], decoy["last_session_index"] = decoy_position, min(len(roi_columns) - 1, decoy_position + 1)
-            decoy["n_days_present"], decoy["missing_internal_days"] = 2 if decoy_position + 1 < len(roi_columns) else 1, 0
+            decoy[roi_columns[future_position]] = decoy_label - 1
+            decoy["first_session_index"], decoy["last_session_index"] = decoy_position, future_position
+            decoy["n_days_present"], decoy["missing_internal_days"] = 2, future_position - decoy_position - 1
             pseudo_rows.append(decoy)
-            for position, label in ((decoy_position, decoy_label), (decoy_position + 1, decoy_label - 1)):
-                if position < len(roi_columns):
-                    source_observations = {source_position: (session_id, label) for source_position, session_id, label in _track_observations(base, sessions)}
-                    source_id, source_label = source_observations[position]
-                    copied = _copy_feature_row(features, source_id, source_label, label, y_offset=7.0)
-                    if copied is not None:
-                        feature_table = pd.concat([feature_table, pd.DataFrame([copied])], ignore_index=True)
+            for position, label in ((decoy_position, decoy_label), (future_position, decoy_label - 1)):
+                source_id, source_label = base_observations[position]
+                copied = _copy_feature_row(features, source_id, source_label, label, y_offset=7.0)
+                if copied is not None:
+                    feature_table = pd.concat([feature_table, pd.DataFrame([copied])], ignore_index=True)
             target_only_cases.append({"case_id": f"target_only_r{replicate:03d}_g{gap}", "source_uid": "", "target_uid": decoy_uid, "session_gap": gap, "case_type": "target_only", "negative_subtype": "target_only"})
             pseudo_tracks = pd.concat([base_tracks, pd.DataFrame(pseudo_rows)], ignore_index=True)
             endpoints = pd.DataFrame(endpoint_rows)
@@ -1387,75 +1547,65 @@ def build_synthetic_stitch_benchmark(
                 policy=policy, spacing=spacing, config=config,
             )
             assigned = assign_stitches(candidates, config=config)
-            n_by_component = assigned.loc[assigned.get("auto_eligible", pd.Series(False, index=assigned.index))].groupby("assignment_component_id").size().to_dict() if not assigned.empty else {}
-            accepted = assigned.loc[assigned.get("accepted_by_global_assignment", pd.Series(False, index=assigned.index))] if not assigned.empty else pd.DataFrame()
-            for case in positive_cases + negative_cases + target_only_cases:
-                source_uid, target_uid = case["source_uid"], case["target_uid"]
-                source_accepted = accepted.loc[accepted["source_track_uid"].astype(str).eq(source_uid)] if source_uid and not accepted.empty else pd.DataFrame()
-                target_accepted = accepted.loc[accepted["target_track_uid"].astype(str).eq(target_uid)] if target_uid and not accepted.empty else pd.DataFrame()
-                assigned_target = str(source_accepted.iloc[0]["target_track_uid"]) if not source_accepted.empty else ""
-                is_positive = case["case_type"] == "positive"
-                correct = bool(is_positive and assigned_target == target_uid)
-                false_positive = bool(
-                    (is_positive and not source_accepted.empty and not correct)
-                    or (not is_positive and (not source_accepted.empty if source_uid else not target_accepted.empty))
-                )
-                evidence = _benchmark_evidence(assigned, source_uid, target_uid)
-                component = _text(evidence.get("assignment_component_id"))
-                accepted_case = bool(not source_accepted.empty if source_uid else not target_accepted.empty)
-                rows.append({
-                    "case_id": case["case_id"], "case_type": case["case_type"], "negative_subtype": case.get("negative_subtype", ""),
-                    "replicate": replicate, "session_gap": gap, "source_track_uid": source_uid,
-                    "true_target_track_uid": target_uid, "accepted": accepted_case,
-                    "assigned_target_track_uid": assigned_target, "correct_assignment": correct,
-                    "false_positive": false_positive, "collision": bool(component and n_by_component.get(component, 0) > 1),
-                    "collision_resolved_correctly": bool(component and n_by_component.get(component, 0) > 1 and (correct or (not is_positive and not false_positive))),
-                    "assignment_component_id": component, "n_auto_edges_in_component": int(n_by_component.get(component, 0)),
-                    "projected_distance_um": _float(evidence.get("projected_distance_um")),
-                    "forward_margin_um": _float(evidence.get("forward_second_margin_um")),
-                    "anchor_residual_median_um": _float(evidence.get("anchor_residual_median_um")),
-                    "anchor_inlier_fraction": _float(evidence.get("anchor_inlier_fraction")),
-                    "source_history_distance_median_um": _float(evidence.get("source_history_distance_median_um")),
-                    "target_future_distance_median_um": _float(evidence.get("target_future_distance_median_um")),
-                    "forward_rank": _int(evidence.get("forward_rank_all_masks")), "reverse_rank": _int(evidence.get("reverse_rank_source_endpoints")),
-                })
-    return pd.DataFrame(rows, columns=[
+            cases = positive_cases + negative_cases + target_only_cases
+            for case in cases:
+                case["replicate"] = replicate
+            rows.extend(_benchmark_case_rows(assigned, cases))
+            replay_batches.append({"batch_id": f"synthetic_r{replicate:03d}_g{gap}", "candidates": candidates.copy(), "cases": cases})
+    output = pd.DataFrame(rows, columns=[
         "case_id", "case_type", "negative_subtype", "replicate", "session_gap", "source_track_uid", "true_target_track_uid",
         "accepted", "assigned_target_track_uid", "correct_assignment", "false_positive", "collision", "collision_resolved_correctly",
         "assignment_component_id", "n_auto_edges_in_component", "projected_distance_um", "forward_margin_um",
         "anchor_residual_median_um", "anchor_inlier_fraction", "source_history_distance_median_um",
-        "target_future_distance_median_um", "forward_rank", "reverse_rank",
+        "target_future_distance_median_um", "forward_rank", "reverse_rank", "canonical_truth_track_uid", "canonical_truth_split_id",
     ])
+    output.attrs["threshold_replay_batches"] = replay_batches
+    return output
 
 
 def benchmark_threshold_sweep(benchmark: pd.DataFrame, *, config: StitcherConfig | None = None) -> pd.DataFrame:
-    """Replay actual evidence under a deterministic stitch-threshold grid."""
+    """Replay each saved synthetic batch through tiering and global assignment."""
 
     config = config or StitcherConfig()
-    rows = []
+    batches = benchmark.attrs.get("threshold_replay_batches") if benchmark is not None else None
+    if batches is None:
+        raise ValueError("benchmark_threshold_sweep requires replay batches from build_synthetic_stitch_benchmark")
+    rows: list[dict[str, Any]] = []
     for distance_scale in (0.8, 1.0, 1.2):
         for margin in (1.5, 3.0, 4.5):
-            if benchmark.empty:
-                selected = benchmark
-            else:
-                distance_limit = benchmark["session_gap"].map({1: config.gap1_max_distance_um, 2: config.gap2_max_distance_um, 3: config.gap3_max_distance_um}).fillna(config.gap3_max_distance_um) * distance_scale
-                selected = benchmark.loc[
-                    benchmark["projected_distance_um"].notna()
-                    & benchmark["projected_distance_um"].le(distance_limit)
-                    & benchmark["forward_margin_um"].fillna(-np.inf).ge(margin)
-                    & benchmark["forward_rank"].eq(1) & benchmark["reverse_rank"].eq(1)
-                ]
-            case_types = selected.get("case_type", pd.Series(index=selected.index, dtype=str))
-            accepted = case_types.eq("positive") & selected.get("correct_assignment", pd.Series(False, index=selected.index)).astype(bool)
-            negative_fp = selected.loc[case_types.ne("positive"), "false_positive"].sum() if not selected.empty and "false_positive" in selected else 0
-            positives = int(benchmark.get("case_type", pd.Series(dtype=str)).eq("positive").sum())
+            profile = replace(
+                config,
+                gap1_max_distance_um=config.gap1_max_distance_um * distance_scale,
+                gap2_max_distance_um=config.gap2_max_distance_um * distance_scale,
+                gap3_max_distance_um=config.gap3_max_distance_um * distance_scale,
+                min_forward_margin_um=margin,
+            )
+            replayed: list[dict[str, Any]] = []
+            n_auto_edges = 0
+            for batch in batches:
+                tiered = tier_stitch_candidates(batch["candidates"], config=profile)
+                assigned = assign_stitches(tiered, config=profile)
+                n_auto_edges += int(assigned.get("auto_eligible", pd.Series(False, index=assigned.index)).astype(bool).sum())
+                replayed.extend(_benchmark_case_rows(assigned, batch["cases"]))
+            replayed_frame = pd.DataFrame(replayed)
+            case_types = replayed_frame.get("case_type", pd.Series(dtype=str))
+            positives = int(case_types.eq("positive").sum())
+            accepted_count = int(replayed_frame.get("accepted", pd.Series(dtype=bool)).astype(bool).sum())
+            true_positive = int(replayed_frame.get("correct_assignment", pd.Series(dtype=bool)).astype(bool).sum())
+            negative = replayed_frame.loc[case_types.ne("positive")] if not replayed_frame.empty else replayed_frame
+            negative_fp = int(negative.get("false_positive", pd.Series(dtype=bool)).astype(bool).sum())
+            negative_count = int(len(negative))
+            positive_targets = replayed_frame.loc[case_types.eq("positive"), "assigned_target_track_uid"] if not replayed_frame.empty else pd.Series(dtype=str)
             rows.append({
                 "distance_scale": distance_scale, "min_forward_margin_um": margin,
-                "n_positive_truth": positives, "n_selected_cases": len(selected),
-                "accepted": int(selected["accepted"].sum()) if not selected.empty else 0,
-                "true_positive": int(accepted.sum()), "recall": float(accepted.sum() / positives) if positives else np.nan,
+                "assignment_replayed": True, "n_positive_truth": positives, "n_cases": len(replayed_frame),
+                "n_auto_eligible_edges": n_auto_edges, "n_selected_cases": n_auto_edges,
+                "accepted": accepted_count, "true_positive": true_positive,
+                "recall": float(true_positive / positives) if positives else np.nan,
+                "precision": float(true_positive / accepted_count) if accepted_count else np.nan,
+                "assigned_positive_target_track_uids": ";".join(sorted(set(positive_targets.astype(str)) - {""})),
                 "negative_false_positive_count": int(negative_fp),
-                "negative_fpr": float(negative_fp / max(1, int(benchmark.get("case_type", pd.Series(dtype=str)).ne("positive").sum()))),
+                "negative_fpr": float(negative_fp / negative_count) if negative_count else np.nan,
             })
     return pd.DataFrame(rows)
 

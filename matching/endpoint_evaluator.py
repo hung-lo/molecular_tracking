@@ -389,19 +389,33 @@ def _prepare_tracks(tracks: pd.DataFrame, sessions: pd.DataFrame, policy: str) -
     return table
 
 
-def _feature_lookup(features: pd.DataFrame) -> dict[tuple[str, int], pd.Series]:
+def _feature_lookup(features: pd.DataFrame) -> dict[tuple[str, int], int]:
     if features.empty:
         return {}
     if "session_id" not in features.columns or "label" not in features.columns:
         raise ValueError("roi_features.csv must contain session_id and label columns")
-    return {(str(row.session_id), int(row.label)): row for row in features.itertuples(index=False)}
+    return {
+        (str(row.session_id), int(row.label)): position
+        for position, row in enumerate(features.itertuples(index=False))
+    }
 
 
-def _feature_row(features: pd.DataFrame, session_id: str, label: int) -> pd.Series | None:
+def _feature_row(
+    features: pd.DataFrame,
+    session_id: str,
+    label: int,
+    lookup: dict[tuple[str, int], int] | None = None,
+) -> pd.Series | None:
     if features.empty:
         return None
-    subset = features.loc[(features["session_id"].astype(str) == str(session_id)) & (features["label"].astype(int) == int(label))]
-    return None if subset.empty else subset.iloc[0]
+    if lookup is None:
+        subset = features.loc[
+            (features["session_id"].astype(str) == str(session_id))
+            & (features["label"].astype(int) == int(label))
+        ]
+        return None if subset.empty else subset.iloc[0]
+    position = lookup.get((str(session_id), int(label)))
+    return None if position is None else features.iloc[position]
 
 
 def _owner_map(tracks: pd.DataFrame, sessions: pd.DataFrame) -> dict[tuple[str, int], pd.Series]:
@@ -449,6 +463,7 @@ def detect_endpoint_events(
         raise ValueError("lookahead must be >= 1")
     tracks = _prepare_tracks(tracks, sessions, policy)
     state = state if state is not None else pd.DataFrame()
+    feature_lookup = _feature_lookup(features)
     rows: list[dict[str, Any]] = []
     for track_index, (_, track) in enumerate(tracks.iterrows(), start=1):
         for session_position, session in enumerate(sessions.itertuples(index=False)):
@@ -467,7 +482,7 @@ def detect_endpoint_events(
             if next_present:
                 continue
             label = int(label_value)
-            feature = _feature_row(features, session_id, label)
+            feature = _feature_row(features, session_id, label, feature_lookup)
             endpoint_id = f"endpoint_{track_index:06d}_{session_position:04d}_{label}"
             row: dict[str, Any] = {
                 "endpoint_id": endpoint_id,
@@ -535,27 +550,33 @@ def add_endpoint_local_density(
     if endpoints.empty:
         return endpoints.copy()
     output = endpoints.copy()
+    feature_lookup = _feature_lookup(features)
+    density_indices: dict[str, tuple[pd.DataFrame, np.ndarray, cKDTree | None]] = {}
+    for session_id in endpoints["end_session_id"].astype(str).unique():
+        session_features = _target_feature_table(features, session_id)
+        if session_features.empty:
+            density_indices[session_id] = (session_features, np.empty((0, 3), dtype=float), None)
+            continue
+        physical = session_features[["centroid_z", "centroid_y", "centroid_x"]].to_numpy(dtype=float) * spacing.as_zyx_array()
+        density_indices[session_id] = (session_features, physical, cKDTree(physical))
     densities: list[float] = []
     for _, endpoint in output.iterrows():
         session_id = _text(endpoint.get("end_session_id"))
-        session_features = _target_feature_table(features, session_id)
-        if session_features.empty:
+        session_features, _, tree = density_indices.get(session_id, (pd.DataFrame(), np.empty((0, 3)), None))
+        if session_features.empty or tree is None:
             densities.append(np.nan)
             continue
-        coords = session_features[["centroid_z", "centroid_y", "centroid_x"]].to_numpy(dtype=float)
-        physical = coords * spacing.as_zyx_array()
         source = np.array([
             _float(endpoint.get("centroid_z_um")),
             _float(endpoint.get("centroid_y_um")),
             _float(endpoint.get("centroid_x_um")),
         ])
         if not np.isfinite(source).all():
-            feature = _feature_row(features, session_id, int(endpoint["end_label"]))
+            feature = _feature_row(features, session_id, int(endpoint["end_label"]), feature_lookup)
             if feature is None:
                 densities.append(np.nan)
                 continue
             source = feature[["centroid_z", "centroid_y", "centroid_x"]].to_numpy(dtype=float) * spacing.as_zyx_array()
-        tree = cKDTree(physical)
         count = max(0, len(tree.query_ball_point(source, r=float(radius_um))) - 1)
         volume = (4.0 / 3.0) * np.pi * float(radius_um) ** 3
         densities.append(float(count / volume) if volume > 0 else np.nan)
@@ -856,9 +877,16 @@ def _search_candidates_for_pair(
     predicted_physical = predicted * spacing.as_zyx_array()
     if tree is None:
         return [], "no_mask_near_prediction"
-    nearby = [int(index) for index in tree.query_ball_point(predicted_physical, r=float(search_radius_um))]
-    distances = np.linalg.norm(target_physical - predicted_physical, axis=1)
-    nearby.sort(key=lambda index: (float(distances[index]), int(target_features.iloc[index]["label"])))
+    nearby = np.asarray(
+        tree.query_ball_point(predicted_physical, r=float(search_radius_um)),
+        dtype=np.intp,
+    )
+    nearby_distances = np.linalg.norm(target_physical[nearby] - predicted_physical, axis=1)
+    target_labels = target_features["label"].to_numpy(dtype=np.int64, copy=False)
+    ordered_nearby = sorted(
+        zip(nearby.tolist(), nearby_distances.tolist()),
+        key=lambda item: (float(item[1]), int(target_labels[item[0]])),
+    )
     nearest_distances, _ = tree.query(predicted_physical, k=min(2, len(target_features)))
     nearest_distances = np.atleast_1d(np.asarray(nearest_distances, dtype=float))
     second_margin = float(nearest_distances[1] - nearest_distances[0]) if len(nearest_distances) > 1 else np.nan
@@ -867,14 +895,13 @@ def _search_candidates_for_pair(
     )
     source_id = str(sessions.iloc[source_position]["session_id"])
     rows: list[dict[str, Any]] = []
-    for rank, index in enumerate(nearby, start=1):
+    for rank, (index, distance) in enumerate(ordered_nearby, start=1):
         target = target_features.iloc[index]
         target_label = int(target["label"])
         key = (source_id, target_id, int(source_label), target_label)
         evidence = candidate_map.get(key)
         owner = owner_map.get((target_id, target_label))
         target_track_uid = _text(owner.get("track_uid")) if owner is not None else ""
-        distance = float(distances[index])
         source_volume = _float(source_feature.get("volume_um3"))
         target_volume = _float(target.get("volume_um3"))
         rows.append({
@@ -971,6 +998,7 @@ def search_endpoint_candidates(
     )
     owner_map = _owner_map(tracks, sessions)
     target_indices = _build_target_indices(features, sessions, spacing)
+    feature_lookup = _feature_lookup(features)
     rows: list[dict[str, Any]] = []
     status: dict[str, list[str]] = {}
     mask_shape_cache: dict[str, tuple[int, ...] | None] = {}
@@ -978,7 +1006,7 @@ def search_endpoint_candidates(
         endpoint_id = _text(endpoint.get("endpoint_id"))
         source_position = int(sessions.index[sessions["session_index"].astype(int).eq(int(endpoint["end_session_index"]))][0])
         source_id = str(sessions.iloc[source_position]["session_id"])
-        source_feature = _feature_row(features, source_id, int(endpoint["end_label"]))
+        source_feature = _feature_row(features, source_id, int(endpoint["end_label"]), feature_lookup)
         if source_feature is None:
             status.setdefault(endpoint_id, []).append("insufficient_input")
             continue
@@ -1010,10 +1038,18 @@ def classify_endpoint_events(
     """Assign deterministic triage labels; manual labels remain blank."""
 
     status = status or {}
+    candidate_groups = (
+        {
+            str(endpoint_id): group
+            for endpoint_id, group in candidates.groupby(candidates["endpoint_id"].astype(str), sort=False)
+        }
+        if not candidates.empty
+        else {}
+    )
     rows: list[dict[str, Any]] = []
     for _, endpoint in endpoints.iterrows():
         endpoint_id = _text(endpoint.get("endpoint_id"))
-        subset = candidates.loc[candidates["endpoint_id"].astype(str).eq(endpoint_id)] if not candidates.empty else pd.DataFrame()
+        subset = candidate_groups.get(endpoint_id, pd.DataFrame())
         statuses = status.get(endpoint_id, [])
         reliable_subset = subset.loc[subset["transform_reliable"].map(_bool)] if not subset.empty and "transform_reliable" in subset.columns else subset
         stitch_subset = reliable_subset.loc[reliable_subset["target_track_starts_here"].map(_bool)] if not reliable_subset.empty and "target_track_starts_here" in reliable_subset.columns else reliable_subset
@@ -1207,16 +1243,31 @@ def build_synthetic_gap_benchmark(
     return table
 
 
-def _spatial_stratum(endpoint: pd.Series, features: pd.DataFrame, session_id: str) -> str:
-    feature = _feature_row(features, session_id, int(endpoint["end_label"]))
+def _spatial_stratum(
+    endpoint: pd.Series,
+    features: pd.DataFrame,
+    session_id: str,
+    feature_lookup: dict[tuple[str, int], int] | None = None,
+    spatial_ranges: dict[str, tuple[float, float, float, float]] | None = None,
+) -> str:
+    feature = _feature_row(features, session_id, int(endpoint["end_label"]), feature_lookup)
     if feature is None:
         return "unknown"
     y = _float(feature.get("centroid_y")); x = _float(feature.get("centroid_x"))
-    all_features = features.loc[features["session_id"].astype(str).eq(session_id)] if not features.empty else pd.DataFrame()
-    if all_features.empty:
+    if spatial_ranges is None:
+        spatial_ranges = {}
+        for group_session in features["session_id"].astype(str).unique():
+            all_features = _target_feature_table(features, group_session)
+            if all_features.empty:
+                continue
+            spatial_ranges[group_session] = (
+                _float(all_features["centroid_y"].min(), 0.0), _float(all_features["centroid_y"].max(), 1.0),
+                _float(all_features["centroid_x"].min(), 0.0), _float(all_features["centroid_x"].max(), 1.0),
+            )
+    ranges = spatial_ranges.get(session_id)
+    if ranges is None:
         return "unknown"
-    y0, y1 = _float(all_features["centroid_y"].min(), 0.0), _float(all_features["centroid_y"].max(), 1.0)
-    x0, x1 = _float(all_features["centroid_x"].min(), 0.0), _float(all_features["centroid_x"].max(), 1.0)
+    y0, y1, x0, x1 = ranges
     gy = int(np.clip(np.floor(8 * (y - y0) / max(y1 - y0, 1e-9)), 0, 7))
     gx = int(np.clip(np.floor(8 * (x - x0) / max(x1 - x0, 1e-9)), 0, 7))
     return f"grid_{gy}x{gx}"
@@ -1235,7 +1286,20 @@ def build_manual_review_manifest(
         return pd.DataFrame(columns=["endpoint_id", "sample_type", "sampling_stratum", "spatial_stratum", "state_stratum"])
     rng = np.random.default_rng(int(random_seed))
     work = endpoints.copy()
-    work["spatial_stratum"] = [_spatial_stratum(row, features, str(row["end_session_id"])) for _, row in work.iterrows()]
+    feature_lookup = _feature_lookup(features)
+    spatial_ranges: dict[str, tuple[float, float, float, float]] = {}
+    for group_session in features["session_id"].astype(str).unique():
+        all_features = _target_feature_table(features, group_session)
+        if all_features.empty:
+            continue
+        spatial_ranges[group_session] = (
+            _float(all_features["centroid_y"].min(), 0.0), _float(all_features["centroid_y"].max(), 1.0),
+            _float(all_features["centroid_x"].min(), 0.0), _float(all_features["centroid_x"].max(), 1.0),
+        )
+    work["spatial_stratum"] = [
+        _spatial_stratum(row, features, str(row["end_session_id"]), feature_lookup, spatial_ranges)
+        for _, row in work.iterrows()
+    ]
     state_column = "eclipse_core_state"
     general_indices: list[int] = []
     for _, group in work.groupby("spatial_stratum", sort=True):
@@ -1425,6 +1489,7 @@ def build_state_dropout_stratification(
     track_lookup = {str(row["track_uid"]): row for _, row in prepared_tracks.iterrows()}
     session_lookup = {int(row["session_index"]): row for _, row in sessions.iterrows()}
     target_indices = _build_target_indices(features, sessions, spacing)
+    feature_lookup = _feature_lookup(features)
     density_volume = (4.0 / 3.0) * np.pi * float(local_density_radius_um) ** 3
 
     records: list[dict[str, Any]] = []
@@ -1435,7 +1500,7 @@ def build_state_dropout_stratification(
         session = session_lookup.get(session_index)
         session_id = _text(session.get("session_id")) if session is not None else ""
         label = _int(track.get(_roi_column(session_id))) if track is not None and session_id else None
-        feature = _feature_row(features, session_id, label) if label is not None else None
+        feature = _feature_row(features, session_id, label, feature_lookup) if label is not None else None
         local_density = np.nan
         if feature is not None and session_id in target_indices:
             table, physical, tree = target_indices[session_id]

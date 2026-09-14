@@ -92,6 +92,7 @@ def test_run_daywise_matched_roi_pipeline_exports_expected_tables(tmp_path: Path
     primary_full_qc = pd.read_csv(output_dir / "primary_high_complete_full_qc.csv")
     filter_counts = pd.read_csv(output_dir / "filter_step_counts_with_percentages.csv")
     run_log = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
+    summary = (output_dir / "SUMMARY.md").read_text(encoding="utf-8")
 
     assert raw["channel"].isin(["red", "green"]).all()
     assert complete.shape[0] == 12
@@ -102,10 +103,46 @@ def test_run_daywise_matched_roi_pipeline_exports_expected_tables(tmp_path: Path
     assert tracks.shape[0] == 6
     assert set(primary["match_policy"].astype(str)) == {"high"}
     assert set(balanced["match_policy"].astype(str)) == {"balanced"}
-    assert primary_full_qc.empty
+    assert not primary_full_qc.empty
+    assert set(tracks["segmentation_qc_status"].astype(str)) == {"not_configured"}
+    assert tracks["segmentation_qc_pass_fraction"].isna().all()
+    assert tracks["segmentation_qc_pass_all_required_days"].isna().all()
+    assert not tracks["segmentation_failure"].astype(bool).any()
     assert set(filter_counts["match_policy"].astype(str)) == {"high", "balanced"}
     assert filter_counts["step_order"].min() == 0
+    assert set(filter_counts.loc[filter_counts["step"] == "segmentation_qc", "count"]) == {3}
+    assert run_log["segmentation_qc_status"] == "not_configured_bypassed"
+    assert "segmentation_qc_not_configured" in run_log["warnings"]
+    assert "Segmentation QC status: `not_configured_bypassed`" in summary
     assert run_log["output_paths"]["matched_track_qc_summary"].endswith("matched_track_qc_summary.csv")
+
+
+def test_configured_segmentation_qc_still_filters_tracks(tmp_path: Path) -> None:
+    manifest_path, match_dir = _build_dataset(tmp_path)
+    output_dir = run_daywise_matched_roi_pipeline(
+        DaywiseMatchedPipelineConfig(
+            dataset=str(tmp_path),
+            manifest=str(manifest_path),
+            match_dir=str(match_dir),
+            policies=("high",),
+            green_dark=0.0,
+            red_dark=0.0,
+            min_volume_um3=3.0,
+        )
+    )
+
+    tracks = pd.read_csv(output_dir / "matched_track_qc_summary.csv")
+    primary_full_qc = pd.read_csv(output_dir / "primary_high_complete_full_qc.csv")
+    filter_counts = pd.read_csv(output_dir / "filter_step_counts_with_percentages.csv")
+    run_log = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
+    summary = (output_dir / "SUMMARY.md").read_text(encoding="utf-8")
+
+    assert set(tracks["segmentation_qc_status"].astype(str)) == {"configured"}
+    assert tracks["segmentation_failure"].astype(bool).all()
+    assert primary_full_qc.empty
+    assert filter_counts.loc[filter_counts["step"] == "segmentation_qc", "count"].tolist() == [0]
+    assert run_log["segmentation_qc_status"] == "configured_no_tracks_passed"
+    assert "Segmentation QC status: `configured_no_tracks_passed`" in summary
 
 
 def test_run_daywise_matched_roi_pipeline_accepts_graph_policy(tmp_path: Path) -> None:

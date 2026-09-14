@@ -57,6 +57,19 @@ class SegmentationQCConfig:
     max_volume_ratio_from_track_median: float | None = None
     min_segmentation_pass_fraction: float = 1.0
 
+    @property
+    def is_configured(self) -> bool:
+        return any(
+            value is not None
+            for value in [
+                self.min_volume_um3,
+                self.max_volume_um3,
+                self.min_bbox_depth_planes,
+                self.max_bbox_depth_planes,
+                self.max_volume_ratio_from_track_median,
+            ]
+        ) or self.exclude_xy_edge or self.exclude_z_edge
+
     def __post_init__(self) -> None:
         if self.mode not in {"all_required", "fraction"}:
             raise ValueError("mode must be either 'all_required' or 'fraction'.")
@@ -429,18 +442,8 @@ def _apply_geometry_qc(geometry_long: pd.DataFrame, qc_config: SegmentationQCCon
         table["volume_ratio_to_track_median"],
         1.0 / table["volume_ratio_to_track_median"],
     )
-    configured = any(
-        value is not None
-        for value in [
-            qc_config.min_volume_um3,
-            qc_config.max_volume_um3,
-            qc_config.min_bbox_depth_planes,
-            qc_config.max_bbox_depth_planes,
-            qc_config.max_volume_ratio_from_track_median,
-        ]
-    ) or qc_config.exclude_xy_edge or qc_config.exclude_z_edge
-    table["segmentation_qc_status"] = "configured" if configured else "not_configured"
-    if not configured:
+    table["segmentation_qc_status"] = "configured" if qc_config.is_configured else "not_configured"
+    if not qc_config.is_configured:
         table["geometry_qc_pass"] = pd.NA
         for column in [
             "geometry_min_volume_pass",
@@ -496,24 +499,28 @@ def _track_geometry_summary(geometry_long: pd.DataFrame, qc_config: Segmentation
     for roi_id, group in geometry_long.groupby("roi_id", sort=True):
         required_group = group.loc[group["required"].astype(bool)].copy()
         n_required_sessions = int(required_group["session_id"].nunique())
-        if not required_group.empty and "geometry_qc_pass" in required_group:
-            n_geometry_qc_pass = int(required_group["geometry_qc_pass"].eq(True).sum())
-        else:
-            n_geometry_qc_pass = 0
-        pass_fraction = float(n_geometry_qc_pass / n_required_sessions) if n_required_sessions > 0 else np.nan
-        if qc_config.mode == "fraction":
-            segmentation_qc_pass_all_required_days = bool(pass_fraction >= float(qc_config.min_segmentation_pass_fraction))
-        else:
-            segmentation_qc_pass_all_required_days = bool(n_required_sessions > 0 and n_geometry_qc_pass == n_required_sessions)
-        if group["segmentation_qc_status"].iloc[0] == "not_configured":
+        status = str(group["segmentation_qc_status"].iloc[0])
+        if status == "not_configured":
+            n_geometry_qc_pass = np.nan
+            pass_fraction = np.nan
             segmentation_qc_pass_all_required_days = pd.NA
+        else:
+            if not required_group.empty and "geometry_qc_pass" in required_group:
+                n_geometry_qc_pass = int(required_group["geometry_qc_pass"].eq(True).sum())
+            else:
+                n_geometry_qc_pass = 0
+            pass_fraction = float(n_geometry_qc_pass / n_required_sessions) if n_required_sessions > 0 else np.nan
+            if qc_config.mode == "fraction":
+                segmentation_qc_pass_all_required_days = bool(pass_fraction >= float(qc_config.min_segmentation_pass_fraction))
+            else:
+                segmentation_qc_pass_all_required_days = bool(n_required_sessions > 0 and n_geometry_qc_pass == n_required_sessions)
         n_edge_sessions = int((group["touches_xy_edge"].astype(bool) | group["touches_z_edge"].astype(bool)).sum())
         volumes = pd.to_numeric(group["volume_um3"], errors="coerce").dropna()
         max_volume_fold_change = float(volumes.max() / volumes.min()) if len(volumes) >= 2 and volumes.min() > 0 else np.nan
         rows.append(
             {
                 "roi_id": int(roi_id),
-                "segmentation_qc_status": str(group["segmentation_qc_status"].iloc[0]),
+                "segmentation_qc_status": status,
                 "n_required_sessions": n_required_sessions,
                 "n_geometry_qc_pass": n_geometry_qc_pass,
                 "segmentation_qc_pass_fraction": pass_fraction,
@@ -741,10 +748,10 @@ def _policy_analysis(
     ].copy()
     zero_hit_complete = complete_required.copy()
     cycle_qc = zero_hit_complete.loc[~zero_hit_complete["has_cycle_conflict"].fillna(False).astype(bool)].copy()
-    if qc_config.mode == "fraction" or geometry_long["segmentation_qc_status"].iloc[0] != "not_configured":
+    if qc_config.is_configured:
         segmentation_qc = cycle_qc.loc[cycle_qc["segmentation_qc_pass_all_required_days"].fillna(False).astype(bool)].copy()
     else:
-        segmentation_qc = cycle_qc.iloc[0:0].copy()
+        segmentation_qc = cycle_qc.copy()
     one_gap_candidates = matched_tracks.loc[
         (matched_tracks["n_required_sessions_present"] == max(total_required - 1, 0))
         & (matched_tracks["missing_required_internal_days"] == 1)
@@ -817,6 +824,7 @@ def _write_summary_markdown(
     output_dir: Path,
     config: DaywiseMatchedPipelineConfig,
     qc_config: SegmentationQCConfig,
+    segmentation_qc_status: str,
     filter_counts: pd.DataFrame,
     fit_summary: pd.DataFrame,
     manifest_records: list[SessionRecord],
@@ -836,6 +844,7 @@ def _write_summary_markdown(
         "",
         "Key analysis choices:",
         f"- Segmentation QC mode: `{qc_config.mode}`",
+        f"- Segmentation QC status: `{segmentation_qc_status}`",
         f"- Dark values: green `{config.green_dark}`, red `{config.red_dark}`; epsilon `{config.epsilon}`",
         "",
         "Sessions:",
@@ -1111,17 +1120,18 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         matrices[key].to_csv(output_dir / filename, index=False)
 
     warnings: list[str] = []
-    if qc_config.mode == "all_required" and all(
-        value is None
-        for value in [
-            qc_config.min_volume_um3,
-            qc_config.max_volume_um3,
-            qc_config.min_bbox_depth_planes,
-            qc_config.max_bbox_depth_planes,
-            qc_config.max_volume_ratio_from_track_median,
-        ]
-    ) and not qc_config.exclude_xy_edge and not qc_config.exclude_z_edge:
+    if not qc_config.is_configured:
         warnings.append("segmentation_qc_not_configured")
+
+    segmentation_counts = filter_counts.loc[
+        filter_counts["step"].eq("segmentation_qc"), "count"
+    ]
+    if not qc_config.is_configured:
+        segmentation_qc_status = "not_configured_bypassed"
+    elif not segmentation_counts.empty and segmentation_counts.eq(0).all():
+        segmentation_qc_status = "configured_no_tracks_passed"
+    else:
+        segmentation_qc_status = "configured_and_applied"
 
     output_paths = {
         "session_manifest_resolved": str(output_dir / "session_manifest_resolved.csv"),
@@ -1152,16 +1162,7 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         "matched_roi_trajectory_observations_eligible.csv", *matrix_files.values(),
     ]:
         output_paths[Path(filename).stem] = str(output_dir / filename)
-    if qc_config.mode != "all_required" or any(
-        value is not None
-        for value in [
-            qc_config.min_volume_um3,
-            qc_config.max_volume_um3,
-            qc_config.min_bbox_depth_planes,
-            qc_config.max_bbox_depth_planes,
-            qc_config.max_volume_ratio_from_track_median,
-        ]
-    ) or qc_config.exclude_xy_edge or qc_config.exclude_z_edge:
+    if qc_config.is_configured:
         output_paths["primary_high_complete_full_qc_status"] = "configured"
     else:
         output_paths["primary_high_complete_full_qc_status"] = "not_configured"
@@ -1174,6 +1175,7 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         "run_finished_utc": run_finished_utc,
         "config": asdict(config),
         "segmentation_qc_config": asdict(qc_config),
+        "segmentation_qc_status": segmentation_qc_status,
         "normalization": {"population": "all_valid_session_rois", "regression": "OLS_with_intercept", "signal_validity_rule": "corrected_green_gt_0_and_corrected_red_gt_0", "epsilon": config.epsilon, "green_dark": config.green_dark, "red_dark": config.red_dark},
         "trajectory_eligibility": asdict(trajectory_config),
         "pca_preparation": {"feature": "green_fit_signed_distance", "missing_values": "preserved_as_nan", "imputation": "none", "scaling": "none", "centered_complete_case": True},
@@ -1225,6 +1227,7 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         output_dir=output_dir,
         config=config,
         qc_config=qc_config,
+        segmentation_qc_status=segmentation_qc_status,
         filter_counts=filter_counts,
         fit_summary=fit_summary,
         manifest_records=manifest_records,

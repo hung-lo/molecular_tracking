@@ -48,6 +48,7 @@ def _panel(proposal: pd.Series, path: Path) -> None:
         ("gap", proposal.get("session_gap")), ("tier", proposal.get("candidate_tier")),
         ("distance µm", proposal.get("projected_distance_um")),
         ("forward/reverse rank", f"{_text(proposal.get('forward_rank_track_starts'))}/{_text(proposal.get('reverse_rank_source_endpoints'))}"),
+        ("forward/reverse margin µm", f"{_text(proposal.get('forward_second_margin_um'))}/{_text(proposal.get('reverse_second_margin_um'))}"),
         ("anchor n/median µm", f"{_text(proposal.get('anchor_support_count'))}/{_text(proposal.get('anchor_residual_median_um'))}"),
         ("history/future n", f"{_text(proposal.get('source_history_n'))}/{_text(proposal.get('target_future_n'))}"),
         ("review", proposal.get("review_reasons")), ("reject", proposal.get("rejection_reasons")),
@@ -68,6 +69,7 @@ def _image_panel(
     path: Path,
     spacing: VoxelSpacing,
     crop_radius_um: float,
+    candidate_rows: pd.DataFrame,
 ) -> bool:
     sessions = sessions.sort_values("session_index").reset_index(drop=True)
     source_matches = sessions.index[sessions["session_index"].astype(int).eq(int(proposal["source_session_index"]))]
@@ -80,6 +82,7 @@ def _image_panel(
     if source_features.empty:
         return False
     source_coordinate = source_features.iloc[0][["centroid_z", "centroid_y", "centroid_x"]].to_numpy(dtype=float)
+    candidate_subset = candidate_rows.loc[candidate_rows["endpoint_id"].astype(str).eq(_text(proposal.get("endpoint_id")))] if not candidate_rows.empty and "endpoint_id" in candidate_rows else pd.DataFrame()
     positions = list(range(max(0, source_position - 2), min(len(sessions), target_position + 3)))
     arrays = [_first_array(session.get("red_image_path", session.get("red")), session.get("green_image_path", session.get("green")), session.get("mask_path")) for _, session in sessions.iloc[positions].iterrows()]
     if not any(array is not None for array in arrays):
@@ -99,24 +102,45 @@ def _image_panel(
             vmax = float(np.percentile(image, 99)) if np.any(image) else 1.0
             axes[row, column].imshow(image, cmap=cmap, vmin=0, vmax=max(vmax, 1e-9))
         axes[2, column].imshow(red, cmap="gray")
+        if position == source_position and np.isfinite(source_coordinate).all():
+            axes[2, column].plot(radius[1], radius[0], "x", color="cyan", markersize=8, mew=1.5)
+        current = candidate_subset.loc[candidate_subset["target_session_index"].astype(int).eq(int(session["session_index"]))] if not candidate_subset.empty and "target_session_index" in candidate_subset else pd.DataFrame()
         labels = []
         if position == source_position:
-            labels.append((int(proposal["source_label"]), "cyan"))
+            labels.append((int(proposal["source_label"]), "cyan", 0))
         if position == target_position:
-            labels.append((int(proposal["target_label"]), "magenta"))
-        for label, color in labels:
+            labels.append((int(proposal["target_label"]), "magenta", 1))
+        if not current.empty:
+            rank_column = "target_rank_by_distance" if "target_rank_by_distance" in current else "target_label"
+            for _, candidate in current.sort_values([rank_column, "target_label"], kind="mergesort").iterrows():
+                label = int(candidate["target_label"])
+                color = "magenta" if label == int(proposal["target_label"]) else "orange"
+                rank = int(candidate.get("target_rank_by_distance", 0))
+                labels.append((label, color, rank))
+        if position == target_position and np.isfinite(coordinate).all():
+            axes[2, column].plot(radius[1], radius[0], "x", color="cyan", markersize=8, mew=1.5)
+        for label, color, rank in labels:
             if np.any(mask == label):
                 axes[2, column].contour(mask == label, levels=[.5], colors=color, linewidths=1)
+                target_feature = features.loc[features["session_id"].astype(str).eq(str(session["session_id"])) & features["label"].astype(int).eq(label)]
+                if not target_feature.empty:
+                    target_coordinate = target_feature.iloc[0][["centroid_z", "centroid_y", "centroid_x"]].to_numpy(dtype=float)
+                    local = target_coordinate - coordinate + np.array([0, radius[0], radius[1]])
+                    axes[2, column].text(local[2] + 2, local[1] + 2, f"#{rank}", color=color, fontsize=7)
         for row in range(3):
             axes[row, column].set_xticks([]); axes[row, column].set_yticks([])
-        axes[0, column].set_title(_text(session.get("session_id")), fontsize=9)
+        label = _text(session.get("session_id"))
+        date = _text(session.get("acquisition_date"))
+        axes[0, column].set_title(f"{label}\n{date}" if date else label, fontsize=9)
     axes[0, 0].set_ylabel("Red/raw"); axes[1, 0].set_ylabel("Green"); axes[2, 0].set_ylabel("Mask overlay")
     footer = (
         f"{_text(proposal.get('source_track_uid'))} → {_text(proposal.get('target_track_uid'))} | "
+        f"{_text(proposal.get('source_session_id'))} {_text(proposal.get('source_session_index'))} → {_text(proposal.get('target_session_id'))} {_text(proposal.get('target_session_index'))} | "
         f"gap={_text(proposal.get('session_gap'))} d={_text(proposal.get('projected_distance_um'))} µm | "
         f"rank={_text(proposal.get('forward_rank_track_starts'))}/{_text(proposal.get('reverse_rank_source_endpoints'))} | "
+        f"margin={_text(proposal.get('forward_second_margin_um'))}/{_text(proposal.get('reverse_second_margin_um'))} µm | "
         f"anchors={_text(proposal.get('anchor_support_count'))}, residual={_text(proposal.get('anchor_residual_median_um'))} µm | "
-        f"tier={_text(proposal.get('candidate_tier'))}"
+        f"tier={_text(proposal.get('candidate_tier'))} status={_text(proposal.get('assignment_status'))}"
     )
     fig.suptitle(_text(proposal.get("stitch_edge_id")), fontsize=11)
     fig.text(.02, .02, footer, fontsize=8, wrap=True)
@@ -136,6 +160,7 @@ def plot_stitch_review_panels(
     transforms: pd.DataFrame | None = None,
     spacing: VoxelSpacing | None = None,
     crop_radius_um: float = 45.0,
+    candidate_rows: pd.DataFrame | None = None,
 ) -> list[Path]:
     """Write deterministic individual PNGs and a readable contact sheet."""
 
@@ -147,11 +172,12 @@ def plot_stitch_review_panels(
     if max_panels is not None:
         selected = selected.head(max(0, int(max_panels)))
     paths: list[Path] = []
+    candidate_rows = candidate_rows if candidate_rows is not None else proposals
     for _, proposal in selected.iterrows():
         path = output / f"{proposal['stitch_edge_id']}.png"
         plotted = False
         if sessions is not None and features is not None and transforms is not None:
-            plotted = _image_panel(proposal, sessions, features, transforms, path, spacing or VoxelSpacing(), crop_radius_um)
+            plotted = _image_panel(proposal, sessions, features, transforms, path, spacing or VoxelSpacing(), crop_radius_um, candidate_rows)
         if not plotted:
             _panel(proposal, path)
         paths.append(path)

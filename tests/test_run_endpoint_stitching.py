@@ -9,7 +9,7 @@ import sys
 import pandas as pd
 
 from endpoint_evaluator import detect_endpoint_events, search_endpoint_candidates, classify_endpoint_events
-from run_endpoint_stitching import run_endpoint_stitching
+from run_endpoint_stitching import _manual_manifest, _prepare_output, run_endpoint_stitching
 from test_endpoint_stitcher import stitch_fixture
 
 
@@ -54,8 +54,31 @@ def test_cli_orchestration_is_read_only_and_blocks_failed_benchmark_write(tmp_pa
         "--write-stitched-tracks", "--overwrite", "--max-review-panels", "1",
     ], cwd=Path(__file__).resolve().parent.parent, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
-    assert (cli_output / "tracks_graph_stitched.csv").is_file()
-    assert (cli_output / "track_uid_stitch_map.csv").is_file()
+    assert not (cli_output / "tracks_graph_stitched.csv").exists()
+    assert not (cli_output / "track_uid_stitch_map.csv").exists()
     cli_summary = json.loads((cli_output / "stitch_summary.json").read_text())
-    assert cli_summary["synthetic_benchmark_passed"]
-    assert cli_summary["stitched_tracks_written"]
+    assert not cli_summary["synthetic_benchmark_passed"]
+    assert cli_summary["stitched_write_blocked_by_benchmark"]
+
+
+def test_overwrite_cleans_all_policy_specific_derived_tracks(tmp_path) -> None:
+    output = tmp_path / "stitch"
+    output.mkdir()
+    for policy in ("graph", "balanced", "high"):
+        (output / f"tracks_{policy}_stitched.csv").write_text("stale")
+    _prepare_output(output, overwrite=True, policy="balanced")
+    assert not list(output.glob("tracks_*_stitched.csv"))
+
+
+def test_manual_label_restore_requires_composite_identity(tmp_path) -> None:
+    proposals = pd.DataFrame([{
+        "stitch_edge_id": "stable", "source_track_uid": "source", "source_session_index": 1,
+        "source_label": 10, "target_track_uid": "target", "target_session_index": 2,
+        "target_label": 20, "session_gap": 1, "candidate_tier": "manual_review",
+        "review_reasons": "", "assignment_status": "candidate", "review_sample_reason": "seeded_remainder",
+    }])
+    previous = proposals.assign(manual_class="accept").copy()
+    previous.loc[0, "target_label"] = 99
+    restored = _manual_manifest(proposals, previous)
+    assert restored.loc[0, "manual_class"] == ""
+    assert restored.loc[0, "manual_label_transfer_warning"] == "identity_mismatch_not_restored"

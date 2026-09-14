@@ -406,11 +406,18 @@ def _feature_row(features: pd.DataFrame, session_id: str, label: int) -> pd.Seri
 
 def _owner_map(tracks: pd.DataFrame, sessions: pd.DataFrame) -> dict[tuple[str, int], pd.Series]:
     output: dict[tuple[str, int], pd.Series] = {}
-    for _, track in tracks.iterrows():
-        for row in sessions.itertuples():
-            value = track.get(_roi_column(str(row.session_id)), pd.NA)
+    # Cache each wide track row once; the old track×session iterrows loop
+    # repeatedly materialized the full row and made large endpoint batches
+    # needlessly expensive.
+    track_rows = {index: row for index, row in tracks.iterrows()}
+    for row in sessions.itertuples():
+        session_id = str(row.session_id)
+        column = _roi_column(session_id)
+        if column not in tracks:
+            continue
+        for index, value in tracks[column].items():
             if _present(value):
-                output[(str(row.session_id), int(value))] = track
+                output[(session_id, int(value))] = track_rows[index]
     return output
 
 

@@ -14,6 +14,7 @@ python matching/run_endpoint_stitching.py \
   --search-radius-um 15 \
   --profile conservative_v1 \
   --benchmark-replicates 20 \
+  --benchmark-cases-per-gap 50 \
   --random-seed 0 \
   --max-review-panels 100 \
   --overwrite
@@ -55,10 +56,10 @@ Accepted edges are unioned transitively. The member with the earliest first sess
 - `stitch_assignments.csv`: all candidates plus global assignment status/cost.
 - `track_stitch_edges.csv`: fixed audit schema for stitch decisions.
 - `synthetic_stitch_benchmark.csv`: positive pseudo-fragments plus no-successor and target-only negatives for gaps 1–3.
-- `synthetic_stitch_threshold_sweep.csv`: precision/FPR guardrail table.
+- `synthetic_stitch_threshold_sweep.csv`: diagnostic sweep of stitch distance and forward-margin thresholds over recorded benchmark evidence; it never selects a profile automatically.
 - `manual_stitch_review_manifest.csv`: deterministic review rows; existing manual labels are restored by `stitch_edge_id` on overwrite.
 - `review_panels/*.png` and `review_panels/stitch_contact_sheet.png`: state-blind review artifacts. No PDFs are emitted.
-- `stitch_summary.json`: counts, gap distributions, conservation checks, benchmark metrics, and immutable/state-blind flags.
+- `stitch_summary.json`: counts, gap distributions, conservation checks, benchmark metrics, and immutable/state-blind flags. `n_unresolved_source_endpoints` is the backward-compatible count with retained candidates; `n_unresolved_source_endpoints_total` also includes candidate-free eligible endpoints, with the difference reported explicitly.
 - `stitch_run_log.json`: paths, spacing, configuration, canonical input hashes, and provenance.
 - `tracks_<policy>_stitched.csv` and `track_uid_stitch_map.csv`: optional guarded derived identity outputs.
 
@@ -66,6 +67,10 @@ Important provenance fields in `track_stitch_edges.csv` include source/target ID
 
 ## Benchmark guardrail
 
-The benchmark splits trusted continuous canonical tracks into source/target pseudo-fragments, hides the intervening observations, and runs the same candidate, gate, and assignment code used on real endpoints. It includes gaps 1, 2, and 3, repeated deterministic samples, explicit sources with no successor, and target-only controls. It reports precision, recall by gap, negative false-positive rate, collision outcomes, and a Wilson precision interval.
+The benchmark splits trusted continuous canonical tracks into batched source/target pseudo-fragments, hides the intervening observations, and runs one global assignment for each replicate/gap batch through the same candidate, gate, and assignment code used on real endpoints. Trusted truth excludes pre-existing gaps, cycle/fallback warnings, edge ROIs, missing feature rows, and unreliable transforms. It includes gaps 1, 2, and 3, repeated deterministic samples, explicit no-successor controls (`no_successor_no_mask` and `no_successor_nonstart_mask`), target-only controls, and collision competitors. It reports precision, recall by gap, negative false-positive rate, collision outcomes, and one-sided Wilson intervals.
 
-Default write guardrails are precision ≥99.9% and negative false-positive rate ≤0.1%. An empty benchmark fails closed. These thresholds control derived file writing; they never loosen candidate gates.
+Default write guardrails are empirical precision ≥99.9%, negative false-positive rate ≤0.1%, one-sided 95% Wilson precision lower bound ≥99.5%, and one-sided 95% Wilson negative-FPR upper bound ≤0.1%, with at least 1,000 positive truths, 2,000 negative controls, and 100 positive truths per gap. Any missing or insufficient sample fails closed. These thresholds control derived file writing; they never loosen candidate gates.
+
+## Validation boundary
+
+Tri_1 and Dead_1 are development/check datasets for freezing `conservative_v1`; they are not a substitute for hold-out validation. Before making stitched tracks the primary scientific source, run the frozen profile on an independent mouse, preferably Fucci-Dead_2 and/or Fucci-Tri_3. ECLIPSE, red/green intensity, and `color_z` are never used to tune or assign identities.

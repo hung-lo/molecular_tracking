@@ -7,8 +7,9 @@ import pandas as pd
 from affine_overlap_matcher import VoxelSpacing
 from endpoint_evaluator import search_endpoint_candidates
 from endpoint_stitcher import (
-    StitcherConfig, assign_stitches, build_stitch_candidates, build_stitched_tracks,
-    build_synthetic_stitch_benchmark, summarize_stitch_benchmark, tier_stitch_candidates,
+    StitcherConfig, assign_stitches, benchmark_threshold_sweep, build_stitch_candidates,
+    build_stitched_tracks, build_synthetic_stitch_benchmark, select_review_samples,
+    stable_stitch_edge_id, summarize_stitch_benchmark, tier_stitch_candidates,
 )
 
 
@@ -154,4 +155,86 @@ def test_pseudo_fragment_benchmark_has_all_gaps_and_explicit_negatives() -> None
     assert {1, 2, 3}.issubset(set(benchmark.loc[benchmark["case_type"].eq("positive"), "session_gap"]))
     assert {"no_successor", "target_only"}.issubset(set(benchmark["case_type"]))
     metrics = summarize_stitch_benchmark(benchmark)
+    assert metrics["n_positive_truth"] == 24
+    assert metrics["n_negative_controls"] == 36
+    assert metrics["negative_fpr"] >= 0
+    assert {"no_successor_no_mask", "no_successor_nonstart_mask", "target_only"}.issubset(set(benchmark["negative_subtype"]))
+    assert benchmark["replicate"].nunique() == 2
+    assert benchmark["collision"].any()
+    assert (benchmark.loc[benchmark["collision"], "n_auto_edges_in_component"] >= 2).all()
+    assert not metrics["benchmark_sample_sufficient"]
+    assert not metrics["guardrail_passed"]
+
+
+def test_target_feature_edge_is_rejected_without_track_edge_flag() -> None:
+    sessions, features, transforms, tracks, endpoints, broad, classifications = _fragment_fixture(1)
+    target_label = int(tracks.loc[tracks["track_uid"].eq("target"), "s2_roi"].iloc[0])
+    features.loc[features["session_id"].eq("s2") & features["label"].eq(target_label), "touches_xy_edge"] = True
+    result = build_stitch_candidates(
+        endpoints, broad, classifications, tracks.drop(columns=["edge_heavy"]), features,
+        sessions, transforms, spacing=VoxelSpacing(z_um=1, y_um=1, x_um=1),
+    )
+    target = result.loc[result["target_track_uid"].eq("target")].iloc[0]
+    assert bool(target["target_touches_xy_edge"])
+    assert target["candidate_tier"] == "reject"
+    assert "edge_or_out_of_fov" in target["rejection_reasons"]
+
+
+def test_stable_edge_ids_ignore_unrelated_rows() -> None:
+    edge = {
+        "source_track_uid": "source", "source_session_index": 1, "source_label": 12,
+        "target_track_uid": "target", "target_session_index": 3, "target_label": 34,
+    }
+    assert stable_stitch_edge_id(edge) == stable_stitch_edge_id({**edge, "projected_distance_um": 999})
+    assert stable_stitch_edge_id(edge) != stable_stitch_edge_id({**edge, "target_track_uid": "other"})
+
+
+def test_benchmark_metrics_separate_positive_errors_from_negative_fpr() -> None:
+    benchmark = pd.DataFrame([
+        {"case_type": "positive", "session_gap": 1, "accepted": True, "correct_assignment": True, "false_positive": False},
+        {"case_type": "positive", "session_gap": 1, "accepted": True, "correct_assignment": False, "false_positive": True},
+        {"case_type": "no_successor", "session_gap": 1, "accepted": False, "correct_assignment": False, "false_positive": False},
+    ])
+    metrics = summarize_stitch_benchmark(benchmark)
+    assert metrics["wrong_target_count"] == 1
+    assert metrics["negative_false_positive_count"] == 0
     assert metrics["negative_fpr"] == 0
+    assert metrics["precision"] == .5
+
+
+def test_perfect_sufficient_benchmark_can_pass_statistical_guard() -> None:
+    positives = pd.DataFrame({
+        "case_type": "positive", "session_gap": ([1] * 334) + ([2] * 333) + ([3] * 333),
+        "accepted": True, "correct_assignment": True, "false_positive": False,
+    })
+    negatives = pd.DataFrame({
+        "case_type": "no_successor", "session_gap": ([1] * 1000) + ([2] * 1000) + ([3] * 1000),
+        "accepted": False, "correct_assignment": False, "false_positive": False,
+    })
+    metrics = summarize_stitch_benchmark(pd.concat([positives, negatives], ignore_index=True))
+    assert metrics["benchmark_sample_sufficient"]
+    assert metrics["precision_wilson_lower_onesided_95"] >= .995
+    assert metrics["negative_fpr_wilson_upper_onesided_95"] <= .001
+    assert metrics["guardrail_passed"]
+
+
+def test_threshold_sweep_changes_stitch_evidence_selection() -> None:
+    benchmark = pd.DataFrame([
+        {"case_type": "positive", "session_gap": 1, "accepted": True, "correct_assignment": True, "false_positive": False,
+         "projected_distance_um": 3.0, "forward_margin_um": 3.0, "forward_rank": 1, "reverse_rank": 1},
+        {"case_type": "no_successor", "session_gap": 1, "accepted": False, "correct_assignment": False, "false_positive": False,
+         "projected_distance_um": 3.8, "forward_margin_um": 2.0, "forward_rank": 1, "reverse_rank": 1},
+    ])
+    sweep = benchmark_threshold_sweep(benchmark)
+    assert sweep["n_selected_cases"].nunique() > 1
+
+
+def test_review_sampling_is_deterministic_and_records_reason() -> None:
+    assignments = pd.DataFrame([
+        {"stitch_edge_id": "a", "candidate_tier": "auto_accept_candidate", "accepted_by_global_assignment": True, "assignment_status": "accepted", "session_gap": 1, "review_reasons": "", "volume_ratio": .2},
+        {"stitch_edge_id": "b", "candidate_tier": "auto_accept_candidate", "accepted_by_global_assignment": False, "assignment_status": "global_collision_rejection", "session_gap": 2, "review_reasons": "", "volume_ratio": 1.0},
+    ])
+    first = select_review_samples(assignments, max_panels=2, random_seed=4)
+    second = select_review_samples(assignments, max_panels=2, random_seed=4)
+    pd.testing.assert_frame_equal(first, second)
+    assert set(first["review_sample_reason"]) == {"auto_accept_gap_1", "global_collision_rejection"}

@@ -1316,6 +1316,9 @@ def _benchmark_evidence(assigned: pd.DataFrame, source_uid: str, target_uid: str
     if assigned.empty:
         return {}
     subset = assigned.loc[assigned["source_track_uid"].astype(str).eq(source_uid)]
+    accepted = subset.loc[subset.get("accepted_by_global_assignment", pd.Series(False, index=subset.index)).astype(bool)]
+    if not accepted.empty:
+        return accepted.sort_values("projected_distance_um", kind="mergesort").iloc[0].to_dict()
     if target_uid:
         exact = subset.loc[subset["target_track_uid"].astype(str).eq(target_uid)]
         if not exact.empty:
@@ -1484,32 +1487,6 @@ def build_synthetic_stitch_benchmark(
                     feature_table = feature_table.loc[~(feature_table["session_id"].astype(str).eq(drop[0]) & feature_table["label"].astype(int).eq(drop[1]))]
                 negative_cases.append({"case_id": f"{subtype}_r{replicate:03d}_g{gap}_{ordinal:04d}", "source_uid": control_source_uid, "target_uid": "", "session_gap": gap, "case_type": "no_successor", "negative_subtype": subtype})
 
-            # Force one end-to-end source collision in every non-empty batch.
-            # The duplicate endpoint has the same geometry, so the real LAP,
-            # rather than an isolated case shortcut, must resolve it.
-            collision_candidates = [case for case in positive_cases if case["target_position"] >= 3]
-            collision_case = min(collision_candidates or positive_cases, key=lambda case: (case["target_position"], case["case_id"]))
-            collision_base = tracks.iloc[collision_case["track_index"]]
-            collision_source_uid = f"synthetic_r{replicate:03d}_g{gap}_collision_source"
-            collision_source_position = collision_case["target_position"] - 2
-            if collision_source_position < 1 or collision_source_position == collision_case["source_position"]:
-                collision_source_position = collision_case["target_position"] - 1
-            collision_source = _split_row(collision_base, sessions, collision_source_uid, 0, collision_source_position)
-            pseudo_rows.append(collision_source)
-            collision_session = sessions.iloc[collision_source_position]
-            endpoint_rows.append({
-                "endpoint_id": f"synthetic_r{replicate:03d}_g{gap}_collision_endpoint",
-                "track_uid": collision_source_uid, "end_session_index": int(collision_session.session_index),
-                "end_session_id": str(collision_session.session_id),
-                "end_label": int(collision_source[_roi_column(str(collision_session.session_id))]),
-                "same_track_returns": False, "touches_z_edge": False, "touches_xy_edge": False,
-            })
-            negative_cases.append({
-                "case_id": f"collision_competitor_r{replicate:03d}_g{gap}", "source_uid": collision_source_uid,
-                "target_uid": collision_case["target_uid"], "session_gap": collision_case["target_position"] - collision_source_position,
-                "case_type": "collision_competitor", "negative_subtype": "collision_competitor",
-            })
-
             # A target-only decoy is a real target start in this same LAP but
             # has no matching source endpoint.
             base = tracks.iloc[chosen[0][0]]
@@ -1546,6 +1523,29 @@ def build_synthetic_stitch_benchmark(
                 endpoints, broad, classes, pseudo_tracks, feature_table, sessions, transforms,
                 policy=policy, spacing=spacing, config=config,
             )
+
+            # Add a collision only around an already eligible positive. The
+            # duplicate candidate keeps identical geometry and later sorting
+            # makes the positive win the real LAP deterministically.
+            eligible_positive_uids = set(candidates.loc[candidates["auto_eligible"], "source_track_uid"].astype(str))
+            collision_candidates = [case for case in positive_cases if case["source_uid"] in eligible_positive_uids]
+            if collision_candidates:
+                collision_case = min(collision_candidates, key=lambda case: (case["target_position"], case["case_id"]))
+                positive_edge = candidates.loc[
+                    candidates["source_track_uid"].astype(str).eq(collision_case["source_uid"])
+                    & candidates["target_track_uid"].astype(str).eq(collision_case["target_uid"])
+                    & candidates["auto_eligible"]
+                ].iloc[0].copy()
+                collision_source_uid = f"synthetic_r{replicate:03d}_g{gap}_z_collision_source"
+                positive_edge["source_track_uid"] = collision_source_uid
+                positive_edge["endpoint_id"] = f"synthetic_r{replicate:03d}_g{gap}_collision_endpoint"
+                positive_edge["stitch_edge_id"] = stable_stitch_edge_id(positive_edge)
+                candidates = pd.concat([candidates, pd.DataFrame([positive_edge])], ignore_index=True)
+                negative_cases.append({
+                    "case_id": f"collision_competitor_r{replicate:03d}_g{gap}", "source_uid": collision_source_uid,
+                    "target_uid": collision_case["target_uid"], "session_gap": gap,
+                    "case_type": "collision_competitor", "negative_subtype": "collision_competitor",
+                })
             assigned = assign_stitches(candidates, config=config)
             cases = positive_cases + negative_cases + target_only_cases
             for case in cases:

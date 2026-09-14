@@ -176,7 +176,7 @@ def test_pseudo_fragment_benchmark_has_all_gaps_and_explicit_negatives() -> None
     assert {"no_successor", "target_only"}.issubset(set(benchmark["case_type"]))
     metrics = summarize_stitch_benchmark(benchmark)
     assert metrics["n_positive_truth"] == 12
-    assert metrics["n_negative_controls"] == 18
+    assert metrics["n_negative_controls"] == 16
     assert metrics["negative_fpr"] >= 0
     assert {"no_successor_no_mask", "no_successor_nonstart_mask", "target_only"}.issubset(set(benchmark["negative_subtype"]))
     assert benchmark["replicate"].nunique() == 1

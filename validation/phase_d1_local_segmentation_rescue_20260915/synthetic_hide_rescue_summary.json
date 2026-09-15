@@ -1,0 +1,42 @@
+{
+  "mode": "synthetic_benchmark",
+  "mouse": "Fucci-Tri_1",
+  "run": "1050_20260511_to_20260617_20s_first20_graph_affine_balanced",
+  "n_eligible": 1000,
+  "n_attempted": 1000,
+  "n_with_candidate": 1000,
+  "n_multiple_candidates": 1000,
+  "n_no_candidate": 0,
+  "status_counts": {
+    "multiple_candidates": 1000
+  },
+  "random_seed": 20260915,
+  "proposal_only": true,
+  "segmentation_model": "threshold_connected_components_v1_cpu_fallback",
+  "canonical_outputs_modified": false,
+  "state_variables_used_for_identity": false,
+  "correct_cell_rate": 0.103,
+  "median_centroid_error_um": 15.864818874886101,
+  "p90_centroid_error_um": 24.57955545151099,
+  "median_dice": 0.006109132464702625,
+  "median_iou": 0.003064378002010649,
+  "median_volume_ratio": 0.7916967769908947,
+  "wrong_neighbor_rate": 0.897,
+  "output_dir": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_local_segmentation_rescue_20260915",
+  "output_paths": {
+    "cases": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_local_segmentation_rescue_20260915/synthetic_hide_rescue_cases.csv",
+    "candidates": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_local_segmentation_rescue_20260915/synthetic_hide_rescue_candidates.csv",
+    "metrics": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_local_segmentation_rescue_20260915/synthetic_hide_rescue_metrics.csv",
+    "measurement_bias": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_local_segmentation_rescue_20260915/synthetic_hide_rescue_measurement_bias.csv",
+    "summary": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_local_segmentation_rescue_20260915/synthetic_hide_rescue_summary.json"
+  },
+  "crop_shape_zyx": [
+    25,
+    96,
+    96
+  ],
+  "threshold_percentile": 85.0,
+  "min_voxels": 20,
+  "review_panel_dir": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_local_segmentation_rescue_20260915/review_panels",
+  "summary_plot_dir": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_local_segmentation_rescue_20260915/summary_plots"
+}

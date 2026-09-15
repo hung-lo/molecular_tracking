@@ -1,0 +1,35 @@
+{
+  "mode": "real_proposals",
+  "mouse": "Fucci-Dead_1",
+  "run": "1050_20260819_to_20260824_4s_first4_graph_affine_balanced",
+  "n_eligible": 298,
+  "n_attempted": 298,
+  "n_with_candidate": 298,
+  "n_multiple_candidates": 298,
+  "n_no_candidate": 0,
+  "status_counts": {
+    "multiple_candidates": 298
+  },
+  "random_seed": 20260915,
+  "proposal_only": true,
+  "segmentation_model": "threshold_connected_components_v1_cpu_fallback",
+  "canonical_outputs_modified": false,
+  "state_variables_used_for_identity": false,
+  "output_dir": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_dead1_real_proposals_20260915",
+  "output_paths": {
+    "cases": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_dead1_real_proposals_20260915/local_rescue_real_cases.csv",
+    "candidates": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_dead1_real_proposals_20260915/local_rescue_real_candidates.csv",
+    "metrics": null,
+    "measurement_bias": null,
+    "summary": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_dead1_real_proposals_20260915/local_rescue_real_summary.json"
+  },
+  "crop_shape_zyx": [
+    25,
+    96,
+    96
+  ],
+  "threshold_percentile": 85.0,
+  "min_voxels": 20,
+  "review_panel_dir": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_dead1_real_proposals_20260915/review_panels",
+  "summary_plot_dir": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_dead1_real_proposals_20260915/summary_plots"
+}

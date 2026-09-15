@@ -347,6 +347,7 @@ def run_daywise_graph_matching(
     qc_output_path = Path(qc_output_dir).resolve() if qc_output_dir is not None else output_dir / "qc"
     run_log_payload.update(
         {
+            "git_commit": _git_commit(),
             "graph_matcher_algorithm_version": GRAPH_MATCHER_ALGORITHM_VERSION,
             "graph_runner_version": GRAPH_RUNNER_ALGORITHM_VERSION,
             "graph_params": asdict(graph_params),

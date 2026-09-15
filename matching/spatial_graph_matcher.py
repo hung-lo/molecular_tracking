@@ -167,12 +167,15 @@ def _local_support_stats(
     *,
     label_a: int,
     label_b: int,
-    anchor_table: pd.DataFrame,
+    anchor_coords_a: np.ndarray,
+    anchor_coords_b: np.ndarray,
+    neighborhood_a: tuple[np.ndarray, np.ndarray],
+    neighborhood_b: tuple[np.ndarray, np.ndarray],
     coords_a_by_label: dict[int, np.ndarray],
     coords_b_by_label: dict[int, np.ndarray],
     params: SpatialGraphParams,
 ) -> dict[str, object]:
-    if anchor_table.empty:
+    if len(anchor_coords_a) == 0:
         return {
             "graph_support_count": 0,
             "graph_support_fraction": 0.0,
@@ -184,17 +187,12 @@ def _local_support_stats(
             "graph_status": "insufficient_support",
         }
 
-    anchor_a = anchor_table["label_a"].astype(int).to_numpy()
-    anchor_b = anchor_table["label_b"].astype(int).to_numpy()
-    anchor_coords_a = np.vstack([coords_a_by_label[int(label)] for label in anchor_a])
-    anchor_coords_b = np.vstack([coords_b_by_label[int(label)] for label in anchor_b])
     cand_a = coords_a_by_label[int(label_a)]
     cand_b = coords_b_by_label[int(label_b)]
 
-    dist_a = np.linalg.norm(anchor_coords_a - cand_a, axis=1)
-    dist_b = np.linalg.norm(anchor_coords_b - cand_b, axis=1)
-    local_mask = (dist_a <= float(params.radius_um)) & (dist_b <= float(params.radius_um))
-    local_indices = np.flatnonzero(local_mask)
+    neighbor_indices_a, neighbor_distances_a = neighborhood_a
+    neighbor_indices_b, neighbor_distances_b = neighborhood_b
+    local_indices = np.intersect1d(neighbor_indices_a, neighbor_indices_b, assume_unique=True)
     if local_indices.size == 0:
         return {
             "graph_support_count": 0,
@@ -207,8 +205,10 @@ def _local_support_stats(
             "graph_status": "insufficient_support",
         }
 
-    local_a_order = local_indices[np.argsort(dist_a[local_indices])[: min(int(params.k_neighbors), len(local_indices))]]
-    local_b_order = local_indices[np.argsort(dist_b[local_indices])[: min(int(params.k_neighbors), len(local_indices))]]
+    local_distances_a = neighbor_distances_a[np.searchsorted(neighbor_indices_a, local_indices)]
+    local_distances_b = neighbor_distances_b[np.searchsorted(neighbor_indices_b, local_indices)]
+    local_a_order = local_indices[np.argsort(local_distances_a)[: min(int(params.k_neighbors), len(local_indices))]]
+    local_b_order = local_indices[np.argsort(local_distances_b)[: min(int(params.k_neighbors), len(local_indices))]]
     support_indices = np.intersect1d(local_a_order, local_b_order, assume_unique=False)
     support_count = int(len(support_indices))
     if support_count < int(params.min_anchor_support):
@@ -249,6 +249,28 @@ def _local_support_stats(
     }
 
 
+def _anchor_neighborhood_cache(
+    labels: np.ndarray,
+    coords_by_label: dict[int, np.ndarray],
+    anchor_coordinates: np.ndarray,
+    radius_um: float,
+) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    """Cache exact in-radius anchor indices and distances for candidate labels."""
+
+    tree = cKDTree(anchor_coordinates)
+    query_radius = np.nextafter(float(radius_um), np.inf)
+    cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for raw_label in np.unique(np.asarray(labels, dtype=int)):
+        label = int(raw_label)
+        coordinate = coords_by_label[label]
+        indices = np.asarray(tree.query_ball_point(coordinate, query_radius, eps=0.0), dtype=int)
+        indices.sort()
+        distances = np.linalg.norm(anchor_coordinates[indices] - coordinate, axis=1)
+        exact_mask = distances <= float(radius_um)
+        cache[label] = (indices[exact_mask], distances[exact_mask])
+    return cache
+
+
 def add_graph_consistency_scores(
     candidates: pd.DataFrame,
     anchors: pd.DataFrame,
@@ -279,6 +301,26 @@ def add_graph_consistency_scores(
         return table
 
     anchor_pairs = {(int(row.label_a), int(row.label_b)) for row in anchors.itertuples(index=False)}
+    anchor_a = anchors["label_a"].astype(int).to_numpy()
+    anchor_b = anchors["label_b"].astype(int).to_numpy()
+    anchor_coords_a = np.vstack([coords_a_by_label[int(label)] for label in anchor_a])
+    anchor_coords_b = np.vstack([coords_b_by_label[int(label)] for label in anchor_b])
+    scored_candidates = table.loc[
+        table["graph_rule"]
+        & ~pd.MultiIndex.from_frame(table[["label_a", "label_b"]]).isin(anchor_pairs)
+    ]
+    neighborhoods_a = _anchor_neighborhood_cache(
+        scored_candidates["label_a"].to_numpy(dtype=int),
+        coords_a_by_label,
+        anchor_coords_a,
+        float(params.radius_um),
+    )
+    neighborhoods_b = _anchor_neighborhood_cache(
+        scored_candidates["label_b"].to_numpy(dtype=int),
+        coords_b_by_label,
+        anchor_coords_b,
+        float(params.radius_um),
+    )
     for index, row in table.loc[table["graph_rule"]].iterrows():
         label_a = int(row["label_a"])
         label_b = int(row["label_b"])
@@ -291,7 +333,10 @@ def add_graph_consistency_scores(
         stats = _local_support_stats(
             label_a=label_a,
             label_b=label_b,
-            anchor_table=anchors,
+            anchor_coords_a=anchor_coords_a,
+            anchor_coords_b=anchor_coords_b,
+            neighborhood_a=neighborhoods_a[label_a],
+            neighborhood_b=neighborhoods_b[label_b],
             coords_a_by_label=coords_a_by_label,
             coords_b_by_label=coords_b_by_label,
             params=params,

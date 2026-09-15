@@ -49,6 +49,7 @@ NONSCIENTIFIC_JSON_KEYS = {
     "pair_workers",
     "qc_artifacts",
     "qc_output_dir",
+    "resolved_manifest_path",
     "run_finished_utc",
     "run_started_utc",
     "runtime_profile",

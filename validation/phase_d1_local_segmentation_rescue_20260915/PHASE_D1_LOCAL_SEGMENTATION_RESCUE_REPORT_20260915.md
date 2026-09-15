@@ -35,6 +35,9 @@
 ## MEASUREMENT BIAS
 - Green/Red/ratio are evaluation-only; ECLIPSE fields remain unavailable unless supplied by an existing extraction table.
 - Measurement-bias table: `/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_local_segmentation_rescue_20260915/synthetic_hide_rescue_measurement_bias.csv`
+- Green (n=1000): median absolute difference `32.03`, median relative bias `+4.56%`, correlation `0.791`.
+- Red (n=1000): median absolute difference `234.52`, median relative bias `+14.90%`, correlation `0.850`.
+- Ratio (n=1000): median absolute difference `0.0357`, median relative bias `-9.15%`, correlation `0.804`.
 
 ## REVIEW ARTIFACTS
 - Panels: `/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_local_segmentation_rescue_20260915/review_panels`

@@ -1,0 +1,16 @@
+{
+  "validation_git_commit": "de3cdefbbcffb00ee71f544d56065202e3269424",
+  "selected_session_manifest": {
+    "sha256": "3360a8d46ba0798ee0e9d1e932f14ee18bae3f54c1c8526a241cec1051d0f239"
+  },
+  "canonical_matching_run_log": {
+    "sha256": "19deaeeaa4e061f03d2f968d35f7b83ff690c6466df0c80ecfac07b0c8ecba5e"
+  },
+  "canonical_matching_scientific_outputs": {
+    "pairwise_matches_graph.csv": "e3e38022c967bc3cdfe65f41452228ba431d8ff1c83772e7fcdc3e00090dec5e",
+    "track_edges_graph.csv": "c90c36fef4bc8482972219582246ad49a8aef7cd38430b9c4fd9b7d1ae9c01b2",
+    "tracks_graph.csv": "51e42bbbd399b5c6a9a7a799fab65b717b3056c9c5035a4b1a4051d24f9f4d00"
+  },
+  "mask_hashes": "See input_hashes in the copied canonical matching run_log.json and validation extraction run_log.json."
+}
+

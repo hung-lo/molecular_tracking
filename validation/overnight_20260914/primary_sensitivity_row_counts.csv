@@ -1,0 +1,8 @@
+artifact,row_count,interpretation
+primary_final_graph,3216,graph policy primary output retained after segmentation-QC bypass
+primary_high_complete_matching,0,high policy not requested by exact original configuration
+primary_high_complete_full_qc,0,high policy not requested by exact original configuration
+sensitivity_balanced_complete,0,balanced policy not requested by exact original configuration
+sensitivity_high_one_internal_gap,0,high policy not requested by exact original configuration
+sensitivity_balanced_one_internal_gap,0,balanced policy not requested by exact original configuration
+

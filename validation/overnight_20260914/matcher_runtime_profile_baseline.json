@@ -1,0 +1,41 @@
+{
+  "commit": "c91846a",
+  "dataset": "Fucci-Tri_1/1050_20260511_to_20260617_20s_first20_graph_affine_balanced",
+  "pair_workers": 1,
+  "sessions": 20,
+  "pairs": 37,
+  "candidate_rows": 308742,
+  "accepted_matches": {"high": 197716, "balanced": 215664, "graph": 215689},
+  "resource_usage": {
+    "wall_seconds": 468.48,
+    "user_seconds": 433.23,
+    "system_seconds": 15.67,
+    "cpu_percent": 95,
+    "maximum_resident_set_kib": 1320852,
+    "memory_note": "GNU time maximum RSS is not aggregate simultaneous memory across workers."
+  },
+  "stages_seconds": {
+    "input_discovery_and_hashing": 11.08873075700103,
+    "feature_loading_and_serialization": 20.577253300994926,
+    "pairwise_candidate_transform_assignment": 119.18415357299818,
+    "pairwise_output_serialization": 14.889839728995867,
+    "track_graph_construction_and_serialization": 33.35353034999571,
+    "graph_input_and_transform_loading": 3.556684133996896,
+    "graph_support_anchor_and_pairwise_assignment": 211.0504025110058,
+    "graph_track_construction": 10.245059175002098,
+    "graph_pairwise_and_track_output_serialization": 13.389283813005022
+  },
+  "detailed_pair_subtotals_seconds": {
+    "global_shift": 6.409213711034681,
+    "overlap_and_transform": 69.70940044397867,
+    "candidate_generation": 6.538478942034999,
+    "affine_pairwise_assignment": 1.2767387540006894,
+    "graph_support": 208.14608356902318,
+    "graph_pairwise_assignment": 2.4277315590079525
+  },
+  "gap_summary": {
+    "1": {"pairs": 19, "candidate_rows": 156269, "high_matches": 107393, "balanced_matches": 114285, "pair_wall_sum_seconds": 62.993436},
+    "2": {"pairs": 18, "candidate_rows": 152473, "high_matches": 90323, "balanced_matches": 101379, "pair_wall_sum_seconds": 56.164631}
+  }
+}
+

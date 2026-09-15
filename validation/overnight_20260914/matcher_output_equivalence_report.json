@@ -1,0 +1,18 @@
+{
+  "scientific_output_equivalence": "PASS",
+  "comparisons": {
+    "repeated_1_worker": "PASS",
+    "repeated_2_workers": "PASS",
+    "repeated_4_workers": "PASS",
+    "1_vs_2_workers": "PASS",
+    "1_vs_4_workers": "PASS",
+    "pre_vs_post_kdtree_optimization": "PASS",
+    "optimized_1_vs_4_workers": "PASS"
+  },
+  "canonical_csv_artifacts_compared": 24,
+  "expected_exclusions": {
+    "csv_columns": ["elapsed_sec"],
+    "json_keys": ["git_commit", "graph_output_paths", "output_dir", "output_paths", "pair_workers", "qc_artifacts", "qc_output_dir", "resolved_manifest_path", "run_finished_utc", "run_started_utc", "runtime_profile"]
+  }
+}
+

@@ -84,6 +84,27 @@ def _git_commit() -> str | None:
     return result.stdout.strip() or None
 
 
+def _affine_git_commit_from_log(payload: dict[str, object]) -> str | None:
+    """Resolve affine-stage provenance without relabeling a legacy graph log."""
+
+    if "affine_matcher_git_commit" in payload:
+        value = payload.get("affine_matcher_git_commit")
+        return str(value) if value else None
+
+    graph_stage_markers = (
+        "graph_matcher_algorithm_version",
+        "graph_runner_version",
+        "graph_params",
+        "graph_row_counts",
+        "graph_output_paths",
+    )
+    if any(marker in payload for marker in graph_stage_markers):
+        return None
+
+    value = payload.get("git_commit")
+    return str(value) if value else None
+
+
 def _load_csv(path: Path) -> pd.DataFrame:
     if not path.exists() or path.stat().st_size == 0:
         return pd.DataFrame()
@@ -224,10 +245,7 @@ def run_daywise_graph_matching(
         require_qc_success=require_qc_success,
     )
     affine_run_log_payload = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
-    affine_matcher_git_commit = affine_run_log_payload.get(
-        "affine_matcher_git_commit",
-        affine_run_log_payload.get("git_commit"),
-    )
+    affine_matcher_git_commit = _affine_git_commit_from_log(affine_run_log_payload)
     if stage_callback is not None:
         stage_callback("daywise_affine_roi_matching", time.perf_counter() - affine_stage_start)
 

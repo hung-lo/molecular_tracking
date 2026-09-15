@@ -11,7 +11,7 @@ import tifffile
 
 import run_daywise_graph_matching as graph_runner
 import run_daywise_roi_matching as affine_runner
-from run_daywise_graph_matching import run_daywise_graph_matching
+from run_daywise_graph_matching import _affine_git_commit_from_log, run_daywise_graph_matching
 from tools.compare_matcher_outputs import compare_matcher_outputs
 
 
@@ -157,3 +157,45 @@ def test_resumed_legacy_affine_log_without_commit_uses_null(tmp_path: Path, monk
     assert run_log["affine_matcher_git_commit"] is None
     assert run_log["graph_runner_git_commit"] == "current_graph_commit"
     assert run_log["git_commit"] == "current_graph_commit"
+
+
+def test_resumed_legacy_graph_log_does_not_invent_affine_commit(tmp_path: Path, monkeypatch) -> None:
+    manifest_path = _build_dataset(tmp_path)
+    output_dir = tmp_path / "legacy_graph_with_old_top_level_commit"
+    monkeypatch.setattr(affine_runner, "_git_commit", lambda: "old_affine_commit")
+    monkeypatch.setattr(graph_runner, "_git_commit", lambda: "old_graph_commit")
+    run_daywise_graph_matching(
+        manifest_path=manifest_path,
+        output_dir=output_dir,
+        overwrite=True,
+        skip_qc=True,
+    )
+
+    run_log_path = output_dir / "run_log.json"
+    legacy_graph_log = json.loads(run_log_path.read_text(encoding="utf-8"))
+    legacy_graph_log["git_commit"] = "old_graph_commit"
+    for field in ("git_commit_role", "affine_matcher_git_commit", "graph_runner_git_commit"):
+        legacy_graph_log.pop(field, None)
+    # Keep graph-stage markers from the pre-2d750c1 graph runner.
+    run_log_path.write_text(json.dumps(legacy_graph_log, indent=2, sort_keys=True), encoding="utf-8")
+
+    monkeypatch.setattr(graph_runner, "_git_commit", lambda: "current_graph_commit")
+    run_daywise_graph_matching(
+        manifest_path=manifest_path,
+        output_dir=output_dir,
+        resume=True,
+        skip_qc=True,
+    )
+
+    run_log = json.loads(run_log_path.read_text(encoding="utf-8"))
+    assert run_log["affine_matcher_git_commit"] is None
+    assert run_log["graph_runner_git_commit"] == "current_graph_commit"
+    assert run_log["git_commit"] == "current_graph_commit"
+    assert run_log["git_commit_role"] == "graph_runner"
+
+
+def test_affine_provenance_helper_distinguishes_log_shapes() -> None:
+    assert _affine_git_commit_from_log({"git_commit": "pure_affine"}) == "pure_affine"
+    assert _affine_git_commit_from_log({"git_commit": "old_graph", "graph_runner_version": "v1"}) is None
+    assert _affine_git_commit_from_log({"affine_matcher_git_commit": "modern_affine", "git_commit": "graph"}) == "modern_affine"
+    assert _affine_git_commit_from_log({"graph_params": {}}) is None

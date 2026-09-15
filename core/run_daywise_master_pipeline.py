@@ -94,6 +94,7 @@ class MasterPipelineConfig:
     xy_um_per_px: float = 710.0 / 1024.0
     z_um_per_plane: float = 5.0
     max_pair_gap: int = 2
+    pair_workers: int = 1
     green_dark: float = 319.0
     red_dark: float = 534.0
     epsilon: float = 1.0
@@ -1201,6 +1202,7 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         spacing=spacing,
         params=AffineOverlapParams(),
         max_pair_gap=int(config.max_pair_gap),
+        pair_workers=int(config.pair_workers),
         overwrite=bool(config.overwrite),
         resume=bool(config.resume),
         skip_qc=bool(config.skip_matching_qc),
@@ -1452,6 +1454,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--xy-um-per-px", type=float, default=None)
     parser.add_argument("--z-um-per-plane", type=float, default=None)
     parser.add_argument("--max-pair-gap", type=int, default=2)
+    parser.add_argument("--pair-workers", type=int, default=1)
     parser.add_argument("--green-dark", type=float, default=319.0)
     parser.add_argument("--red-dark", type=float, default=534.0)
     parser.add_argument("--epsilon", type=float, default=1.0)
@@ -1544,6 +1547,7 @@ def main(argv: list[str] | None = None) -> Path:
         xy_um_per_px=args.xy_um_per_px,
         z_um_per_plane=args.z_um_per_plane,
         max_pair_gap=args.max_pair_gap,
+        pair_workers=args.pair_workers,
         green_dark=args.green_dark,
         red_dark=args.red_dark,
         epsilon=args.epsilon,

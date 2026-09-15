@@ -21,7 +21,7 @@ def _build_dataset(tmp_path: Path) -> Path:
     mask[0, 0, 0] = 1
     mask[0, 1, 1] = 2
     mask[1, 2, 2] = 3
-    for day in ["20260511", "20260512"]:
+    for day in ["20260511", "20260512", "20260513"]:
         _write_stack(tmp_path / f"{day}_mask.tif", mask)
 
     manifest = pd.DataFrame(
@@ -31,6 +31,15 @@ def _build_dataset(tmp_path: Path) -> Path:
                 "session_id": "20260511",
                 "acquisition_date": "2026-05-11",
                 "mask_path": str(tmp_path / "20260511_mask.tif"),
+                "red_image_path": "",
+                "green_image_path": "",
+                "required": True,
+            },
+            {
+                "session_index": 2,
+                "session_id": "20260513",
+                "acquisition_date": "2026-05-13",
+                "mask_path": str(tmp_path / "20260513_mask.tif"),
                 "red_image_path": "",
                 "green_image_path": "",
                 "required": True,
@@ -95,3 +104,35 @@ def test_run_daywise_roi_matching_rejects_invalid_pair_gap_values(tmp_path: Path
             overwrite=True,
         )
 
+
+def test_pair_workers_preserve_exact_scientific_outputs(tmp_path: Path) -> None:
+    manifest_path = _build_dataset(tmp_path)
+    outputs = []
+    for workers in (1, 2):
+        outputs.append(run_daywise_roi_matching(
+            manifest_path=manifest_path,
+            output_dir=tmp_path / f"match_workers_{workers}",
+            spacing=VoxelSpacing(),
+            params=AffineOverlapParams(),
+            pair_workers=workers,
+            save_candidates=True,
+            overwrite=True,
+            skip_qc=True,
+        ))
+
+    scientific_csvs = [
+        "roi_features.csv", "pairwise_transforms.csv", "pairwise_matches_high.csv",
+        "pairwise_matches_balanced.csv", "pairwise_candidates.csv", "tracks_high.csv",
+        "tracks_balanced.csv", "cycle_consistency_high.csv", "cycle_consistency_balanced.csv",
+        "cycle_edge_checks_high.csv", "cycle_edge_checks_balanced.csv", "track_edges_high.csv",
+        "track_edges_balanced.csv", "track_length_summary.csv", "session_manifest_resolved.csv",
+    ]
+    for filename in scientific_csvs:
+        pd.testing.assert_frame_equal(pd.read_csv(outputs[0] / filename), pd.read_csv(outputs[1] / filename))
+    left_summary = pd.read_csv(outputs[0] / "pairwise_summary.csv").drop(columns="elapsed_sec")
+    right_summary = pd.read_csv(outputs[1] / "pairwise_summary.csv").drop(columns="elapsed_sec")
+    pd.testing.assert_frame_equal(left_summary, right_summary)
+
+    run_log = json.loads((outputs[1] / "run_log.json").read_text(encoding="utf-8"))
+    assert run_log["pair_workers"] == 2
+    assert len(run_log["runtime_profile"]["pair_timings_seconds"]) == 3

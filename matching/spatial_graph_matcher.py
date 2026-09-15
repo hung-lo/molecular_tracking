@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 import math
 from collections.abc import Mapping
 from typing import Any
@@ -91,6 +92,7 @@ class GraphPairMatchResult:
     graph_matches: pd.DataFrame
     changes: pd.DataFrame
     summary: dict[str, object]
+    timings_seconds: dict[str, float] | None = None
 
 
 def _as_int(value: Any) -> int:
@@ -472,9 +474,19 @@ def refine_pair_with_spatial_graph(
     high_matches = baseline_result.high_matches.copy()
     balanced_matches = baseline_result.balanced_matches.copy()
 
+    stage_start = time.perf_counter()
     coords_a_by_label, coords_b_by_label = aligned_physical_coordinates(features_a, features_b, transform, spacing)
+    coordinate_setup_seconds = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     anchors = select_graph_anchors(high_matches, params)
+    anchor_selection_seconds = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     graph_candidates = add_graph_consistency_scores(candidates, anchors, coords_a_by_label, coords_b_by_label, params)
+    graph_support_seconds = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     if anchors.empty:
         graph_matches = balanced_matches.copy()
         if graph_matches.empty:
@@ -498,7 +510,9 @@ def refine_pair_with_spatial_graph(
             graph_matches["is_graph_anchor"] = False
     else:
         graph_matches = graph_one_to_one_assignment(graph_candidates, anchors, params)
+    assignment_seconds = time.perf_counter() - stage_start
 
+    stage_start = time.perf_counter()
     changes = compare_balanced_and_graph_matches(balanced_matches, graph_matches)
     summary = summarize_graph_pair(
         session_a=session_a,
@@ -509,10 +523,18 @@ def refine_pair_with_spatial_graph(
         graph_matches=graph_matches,
         changes=changes,
     )
+    comparison_and_summary_seconds = time.perf_counter() - stage_start
     return GraphPairMatchResult(
         candidates=graph_candidates,
         anchors=anchors,
         graph_matches=graph_matches,
         changes=changes,
         summary=summary,
+        timings_seconds={
+            "coordinate_setup": float(coordinate_setup_seconds),
+            "anchor_selection": float(anchor_selection_seconds),
+            "graph_support": float(graph_support_seconds),
+            "pairwise_assignment": float(assignment_seconds),
+            "comparison_and_summary": float(comparison_and_summary_seconds),
+        },
     )

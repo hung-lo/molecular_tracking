@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import math
 from collections.abc import Mapping
 from pathlib import Path
+import time
 from typing import Any
 
 import numpy as np
@@ -214,6 +215,7 @@ class PairMatchResult:
     balanced_matches: pd.DataFrame
     summary: dict[str, object]
     transform: RestrictedTransform
+    timings_seconds: dict[str, float] | None = None
 
 
 def extract_roi_features(
@@ -872,14 +874,20 @@ def match_pair(
     if features_b is None:
         features_b = extract_roi_features(mask_b, session_id=session_b, spacing=spacing)
 
+    stage_start = time.perf_counter()
     shift_zyx, shift_summary = estimate_global_shift(mask_a, mask_b, params=params)
+    global_shift_seconds = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     area_a = features_a["area_voxels"]
     area_b = features_b["area_voxels"]
     overlap_table = build_sparse_overlap_table(mask_a, mask_b, shift_zyx, area_a, area_b)
     mutual_overlap = select_mutual_overlap_pairs(overlap_table)
     seeds = mutual_overlap.loc[mutual_overlap["dice"] >= float(params.seed_min_dice)].copy()
     transform = fit_restricted_transform(features_a, features_b, seeds, shift_zyx, spacing, params)
+    overlap_and_transform_seconds = time.perf_counter() - stage_start
 
+    stage_start = time.perf_counter()
     candidates = generate_candidate_pairs(
         features_a=features_a,
         features_b=features_b,
@@ -889,8 +897,12 @@ def match_pair(
         params=params,
         spacing=spacing,
     )
+    candidate_generation_seconds = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
     high_matches = greedy_one_to_one(candidates, "high_rule")
     balanced_matches = greedy_one_to_one(candidates, "balanced_rule")
+    pairwise_assignment_seconds = time.perf_counter() - stage_start
 
     summary = {
         "day_a": session_a,
@@ -925,6 +937,12 @@ def match_pair(
         balanced_matches=balanced_matches,
         summary=summary,
         transform=transform,
+        timings_seconds={
+            "global_shift": float(global_shift_seconds),
+            "overlap_and_transform": float(overlap_and_transform_seconds),
+            "candidate_generation": float(candidate_generation_seconds),
+            "pairwise_assignment": float(pairwise_assignment_seconds),
+        },
     )
 
 
@@ -942,4 +960,3 @@ def accepted_edge_keys(edge_table: pd.DataFrame) -> set[tuple[int, int]]:
     if edge_table is None or edge_table.empty:
         return set()
     return {(int(row.label_a), int(row.label_b)) for row in edge_table.itertuples(index=False)}
-

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
@@ -191,6 +192,33 @@ def _load_mask_stack(mask_path: Path) -> np.ndarray:
         return tifffile.imread(mask_path)
 
 
+def _match_pair_task(
+    task: tuple[str, str, int, str, str, AffineOverlapParams, VoxelSpacing, pd.DataFrame, pd.DataFrame],
+) -> tuple[str, str, PairMatchResult, float]:
+    """Run one independent pair calculation; return identifiers in task order."""
+
+    session_a, session_b, pair_gap, mask_path_a, mask_path_b, params, spacing, features_a, features_b = task
+    pair_start_seconds = time.perf_counter()
+    mask_a = _load_mask_stack(Path(mask_path_a))
+    mask_b = _load_mask_stack(Path(mask_path_b))
+    try:
+        result = match_pair(
+            session_a=session_a,
+            session_b=session_b,
+            mask_a=mask_a,
+            mask_b=mask_b,
+            params=params,
+            spacing=spacing,
+            features_a=features_a,
+            features_b=features_b,
+            pair_gap=pair_gap,
+        )
+    finally:
+        del mask_a
+        del mask_b
+    return session_a, session_b, result, float(time.perf_counter() - pair_start_seconds)
+
+
 def _resolved_manifest_dataframe(records: list[SessionRecord]) -> pd.DataFrame:
     """Convert manifest records into a resolved CSV-ready table."""
 
@@ -308,6 +336,7 @@ def run_daywise_roi_matching(
     spacing: VoxelSpacing | None = None,
     params: AffineOverlapParams | None = None,
     max_pair_gap: int = 2,
+    pair_workers: int = 1,
     save_candidates: bool = False,
     overwrite: bool = False,
     resume: bool = False,
@@ -322,6 +351,7 @@ def run_daywise_roi_matching(
 ) -> Path:
     """Run daywise ROI matching and export all canonical outputs."""
 
+    workflow_start_seconds = time.perf_counter()
     manifest_path = Path(manifest_path).resolve()
     output_dir = Path(output_dir).resolve()
     try:
@@ -333,9 +363,13 @@ def run_daywise_roi_matching(
     max_pair_gap = int(max_pair_gap_value)
     if max_pair_gap not in {1, 2}:
         raise ValueError("--max-pair-gap must be either 1 or 2.")
+    if int(pair_workers) < 1:
+        raise ValueError("--pair-workers must be at least 1.")
+    pair_workers = int(pair_workers)
     spacing = spacing or VoxelSpacing()
     params = params or AffineOverlapParams()
 
+    stage_start_seconds = time.perf_counter()
     records = load_session_manifest(manifest_path)
     validate_manifest_for_matching(records)
     manifest_hash = _sha256_file(manifest_path)
@@ -348,6 +382,7 @@ def run_daywise_roi_matching(
         spacing=spacing,
         max_pair_gap=max_pair_gap,
     )
+    input_discovery_seconds = time.perf_counter() - stage_start_seconds
 
     if output_dir.exists():
         if resume and _existing_output_matches(output_dir, fingerprint):
@@ -371,6 +406,7 @@ def run_daywise_roi_matching(
     resolved_manifest = _resolved_manifest_dataframe(records)
     resolved_manifest.to_csv(output_dir / "session_manifest_resolved.csv", index=False)
 
+    stage_start_seconds = time.perf_counter()
     feature_rows: list[pd.DataFrame] = []
     features_by_session: dict[str, pd.DataFrame] = {}
     input_hashes: list[dict[str, object]] = []
@@ -397,6 +433,7 @@ def run_daywise_roi_matching(
 
     roi_features = pd.concat(feature_rows, ignore_index=True) if feature_rows else pd.DataFrame()
     roi_features.to_csv(output_dir / "roi_features.csv", index=False)
+    feature_loading_seconds = time.perf_counter() - stage_start_seconds
 
     pair_results: dict[tuple[str, str], PairMatchResult] = {}
     pair_summaries: list[dict[str, object]] = []
@@ -405,30 +442,36 @@ def run_daywise_roi_matching(
     session_by_id = {record.session_id: record for record in records}
     ordered_sessions = [record.session_id for record in records]
 
+    pair_tasks = []
     for index_a, session_a in enumerate(ordered_sessions):
         for index_b in range(index_a + 1, min(len(ordered_sessions), index_a + max_pair_gap + 1)):
             session_b = ordered_sessions[index_b]
             pair_gap = index_b - index_a
             if pair_gap < 1 or pair_gap > max_pair_gap:
                 continue
-            pair_start_seconds = time.perf_counter()
-            mask_a = _load_mask_stack(session_by_id[session_a].mask_path)
-            mask_b = _load_mask_stack(session_by_id[session_b].mask_path)
-            result = match_pair(
-                session_a=session_a,
-                session_b=session_b,
-                mask_a=mask_a,
-                mask_b=mask_b,
-                params=params,
-                spacing=spacing,
-                features_a=features_by_session[session_a],
-                features_b=features_by_session[session_b],
-                pair_gap=pair_gap,
-            )
-            del mask_a
-            del mask_b
+            pair_tasks.append((
+                session_a,
+                session_b,
+                pair_gap,
+                str(session_by_id[session_a].mask_path),
+                str(session_by_id[session_b].mask_path),
+                params,
+                spacing,
+                features_by_session[session_a],
+                features_by_session[session_b],
+            ))
+
+    stage_start_seconds = time.perf_counter()
+    if pair_workers == 1:
+        completed_pairs = map(_match_pair_task, pair_tasks)
+        executor = None
+    else:
+        executor = ProcessPoolExecutor(max_workers=pair_workers)
+        completed_pairs = executor.map(_match_pair_task, pair_tasks)
+    try:
+        for session_a, session_b, result, pair_elapsed_seconds in completed_pairs:
+            pair_gap = int(session_by_id[session_b].session_index - session_by_id[session_a].session_index)
             pair_results[(session_a, session_b)] = result
-            pair_elapsed_seconds = time.perf_counter() - pair_start_seconds
             pair_summaries.append(result.summary | {"elapsed_sec": float(pair_elapsed_seconds)})
             transform = result.transform
             pair_transforms.append(
@@ -458,7 +501,12 @@ def run_daywise_roi_matching(
                 candidate_df.insert(1, "day_b", session_b)
                 candidate_df.insert(2, "pair_gap", int(pair_gap))
                 candidate_rows.append(candidate_df)
+    finally:
+        if executor is not None:
+            executor.shutdown()
+    pairwise_processing_seconds = time.perf_counter() - stage_start_seconds
 
+    stage_start_seconds = time.perf_counter()
     pairwise_summary = pd.DataFrame(pair_summaries, columns=PAIRWISE_SUMMARY_COLUMNS)
     if not pairwise_summary.empty:
         pairwise_summary = pairwise_summary.sort_values(["day_a", "day_b"]).reset_index(drop=True)
@@ -512,7 +560,9 @@ def run_daywise_roi_matching(
     if save_candidates:
         candidate_table = pd.concat(candidate_rows, ignore_index=True) if candidate_rows else pd.DataFrame(columns=PAIRWISE_CANDIDATE_COLUMNS)
         candidate_table.to_csv(output_dir / "pairwise_candidates.csv", index=False)
+    pairwise_serialization_seconds = time.perf_counter() - stage_start_seconds
 
+    stage_start_seconds = time.perf_counter()
     tracks_high, edges_high = build_tracks_from_pair_tables(
         day_names=ordered_sessions,
         features_by_session=features_by_session,
@@ -554,6 +604,7 @@ def run_daywise_roi_matching(
         pd.concat([tracks_high, tracks_balanced], ignore_index=True) if not tracks_high.empty or not tracks_balanced.empty else pd.DataFrame()
     )
     track_length_summary.to_csv(output_dir / "track_length_summary.csv", index=False)
+    track_graph_seconds = time.perf_counter() - stage_start_seconds
 
     input_hash_records = []
     for record in records:
@@ -573,6 +624,23 @@ def run_daywise_roi_matching(
     warnings: list[str] = []
     qc_output_path = Path(qc_output_dir).resolve() if qc_output_dir is not None else qc_dir
     qc_status = "not_requested" if skip_qc else "pending"
+    pair_timings = [
+        {
+            "day_a": session_a,
+            "day_b": session_b,
+            "pair_gap": int(session_by_id[session_b].session_index - session_by_id[session_a].session_index),
+            "elapsed_sec": float(result.summary.get("elapsed_sec", 0.0)),
+            **(result.timings_seconds or {}),
+        }
+        for (session_a, session_b), result in pair_results.items()
+    ]
+    pair_elapsed_lookup = {
+        (str(row["day_a"]), str(row["day_b"])): float(row["elapsed_sec"])
+        for row in pair_summaries
+    }
+    for row in pair_timings:
+        row["elapsed_sec"] = pair_elapsed_lookup[(str(row["day_a"]), str(row["day_b"]))]
+
     run_log_payload = {
         "algorithm_version": MATCHER_ALGORITHM_VERSION,
         "run_started_utc": datetime.now(timezone.utc).isoformat(),
@@ -585,6 +653,7 @@ def run_daywise_roi_matching(
         "spacing": asdict(spacing),
         "params": asdict(params),
         "max_pair_gap": int(max_pair_gap),
+        "pair_workers": pair_workers,
         "python_version": sys.version,
         "platform": platform.platform(),
         "package_versions": _package_versions(),
@@ -630,6 +699,16 @@ def run_daywise_roi_matching(
             "qc_dir": str(qc_output_path),
         },
         "warnings": warnings,
+        "runtime_profile": {
+            "stage_durations_seconds": {
+                "input_discovery_and_hashing": float(input_discovery_seconds),
+                "feature_loading_and_serialization": float(feature_loading_seconds),
+                "pairwise_candidate_transform_assignment": float(pairwise_processing_seconds),
+                "pairwise_output_serialization": float(pairwise_serialization_seconds),
+                "track_graph_construction_and_serialization": float(track_graph_seconds),
+            },
+            "pair_timings_seconds": pair_timings,
+        },
     }
     _export_json(output_dir / "run_log.json", run_log_payload)
 
@@ -665,6 +744,7 @@ def run_daywise_roi_matching(
             if qc_output_path != Path(qc_artifacts["output_dir"]):
                 run_log_payload["qc_output_dir"] = str(qc_artifacts["output_dir"])
     run_log_payload["run_finished_utc"] = datetime.now(timezone.utc).isoformat()
+    run_log_payload["runtime_profile"]["total_wall_seconds"] = float(time.perf_counter() - workflow_start_seconds)
     run_log_payload["warnings"] = warnings
     _export_json(output_dir / "run_log.json", run_log_payload)
 
@@ -676,6 +756,7 @@ def run_daywise_roi_matching(
         f"- Output directory: `{output_dir}`",
         f"- Sessions: `{len(records)}`",
         f"- Pair gap limit: `{max_pair_gap}`",
+        f"- Pair workers: `{pair_workers}`",
         "",
         "Output counts:",
         f"- High pairwise matches: `{len(pairwise_matches_high)}`",
@@ -699,6 +780,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--xy-um-per-px", type=float, default=710.0 / 1024.0, help="XY pixel spacing in micrometers.")
     parser.add_argument("--z-um-per-plane", type=float, default=5.0, help="Z spacing in micrometers.")
     parser.add_argument("--max-pair-gap", type=int, default=2, help="Maximum allowed session gap for pairwise matching.")
+    parser.add_argument("--pair-workers", type=int, default=1, help="Independent session-pair worker processes (default: 1).")
     parser.add_argument("--save-candidates", action="store_true", help="Write the full candidate table.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing output directory.")
     parser.add_argument("--resume", action="store_true", help="Reuse a prior exact-matching output directory when possible.")
@@ -724,6 +806,7 @@ def main(argv: list[str] | None = None) -> Path:
         spacing=spacing,
         params=AffineOverlapParams(),
         max_pair_gap=args.max_pair_gap,
+        pair_workers=args.pair_workers,
         save_candidates=bool(args.save_candidates),
         overwrite=bool(args.overwrite),
         resume=bool(args.resume),
@@ -742,4 +825,3 @@ def main(argv: list[str] | None = None) -> Path:
 
 if __name__ == "__main__":
     main()
-

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import datetime, timezone
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import json
 import platform
 import subprocess
@@ -147,6 +148,26 @@ def _pair_table_group(table: pd.DataFrame, day_a: str, day_b: str) -> pd.DataFra
     return table.loc[mask].copy().reset_index(drop=True)
 
 
+def _graph_pair_task(
+    task: tuple[str, str, PairMatchResult, pd.DataFrame, pd.DataFrame, VoxelSpacing, SpatialGraphParams, int],
+) -> tuple[GraphPairMatchResult, float]:
+    """Refine one independent session pair and retain deterministic task order."""
+
+    day_a, day_b, baseline_result, features_a, features_b, spacing, graph_params, pair_gap = task
+    pair_start_seconds = time.perf_counter()
+    result = refine_pair_with_spatial_graph(
+        session_a=day_a,
+        session_b=day_b,
+        baseline_result=baseline_result,
+        features_a=features_a,
+        features_b=features_b,
+        spacing=spacing,
+        params=graph_params,
+        pair_gap=pair_gap,
+    )
+    return result, float(time.perf_counter() - pair_start_seconds)
+
+
 def _export_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -159,6 +180,7 @@ def run_daywise_graph_matching(
     params: AffineOverlapParams | None = None,
     graph_params: SpatialGraphParams | None = None,
     max_pair_gap: int = 2,
+    pair_workers: int = 1,
     overwrite: bool = False,
     resume: bool = False,
     skip_qc: bool = False,
@@ -171,11 +193,15 @@ def run_daywise_graph_matching(
     require_qc_success: bool = False,
     stage_callback: Callable[[str, float], None] | None = None,
 ) -> Path:
+    workflow_start_seconds = time.perf_counter()
     manifest_path = Path(manifest_path).resolve()
     output_dir = Path(output_dir).resolve()
     spacing = spacing or VoxelSpacing()
     params = params or AffineOverlapParams()
     graph_params = graph_params or SpatialGraphParams()
+    if int(pair_workers) < 1:
+        raise ValueError("--pair-workers must be at least 1.")
+    pair_workers = int(pair_workers)
 
     affine_stage_start = time.perf_counter()
     baseline_output_dir = run_daywise_roi_matching(
@@ -184,6 +210,7 @@ def run_daywise_graph_matching(
         spacing=spacing,
         params=params,
         max_pair_gap=max_pair_gap,
+        pair_workers=pair_workers,
         save_candidates=True,
         overwrite=overwrite,
         resume=resume,
@@ -200,6 +227,7 @@ def run_daywise_graph_matching(
         stage_callback("daywise_affine_roi_matching", time.perf_counter() - affine_stage_start)
 
     run_start_seconds = time.perf_counter()
+    stage_start_seconds = time.perf_counter()
     manifest_records = load_session_manifest(manifest_path)
     manifest_records = [record for record in manifest_records if record.required or True]
     ordered_sessions = [record.session_id for record in manifest_records]
@@ -220,8 +248,9 @@ def run_daywise_graph_matching(
     if "session_id" in roi_features.columns:
         roi_features["session_id"] = roi_features["session_id"].astype(str)
     features_by_session = _build_features_by_session(roi_features)
+    graph_input_loading_seconds = time.perf_counter() - stage_start_seconds
 
-    graph_results: list[GraphPairMatchResult] = []
+    graph_tasks = []
     for row in pairwise_transforms.itertuples(index=False):
         day_a = str(row.day_a)
         day_b = str(row.day_b)
@@ -240,18 +269,42 @@ def run_daywise_graph_matching(
             pair_summary=pair_summary_row.iloc[0],
             pair_transform=pd.Series(row._asdict()),
         )
-        graph_result = refine_pair_with_spatial_graph(
-            session_a=day_a,
-            session_b=day_b,
-            baseline_result=baseline_result,
-            features_a=features_by_session[day_a],
-            features_b=features_by_session[day_b],
-            spacing=spacing,
-            params=graph_params,
-            pair_gap=int(pair_summary_row.iloc[0].get("pair_gap", 0)) if "pair_gap" in pair_summary_row.columns else None,
-        )
-        graph_results.append(graph_result)
+        graph_tasks.append((
+            day_a,
+            day_b,
+            baseline_result,
+            features_by_session[day_a],
+            features_by_session[day_b],
+            spacing,
+            graph_params,
+            int(pair_summary_row.iloc[0].get("pair_gap", 0)) if "pair_gap" in pair_summary_row.columns else 0,
+        ))
 
+    stage_start_seconds = time.perf_counter()
+    if pair_workers == 1:
+        completed_graph_pairs = map(_graph_pair_task, graph_tasks)
+        executor = None
+    else:
+        executor = ProcessPoolExecutor(max_workers=pair_workers)
+        completed_graph_pairs = executor.map(_graph_pair_task, graph_tasks)
+    graph_results: list[GraphPairMatchResult] = []
+    graph_pair_timings = []
+    try:
+        for graph_result, pair_elapsed_seconds in completed_graph_pairs:
+            graph_results.append(graph_result)
+            graph_pair_timings.append({
+                "day_a": str(graph_result.summary["day_a"]),
+                "day_b": str(graph_result.summary["day_b"]),
+                "pair_gap": int(graph_result.summary.get("pair_gap", 0)),
+                "elapsed_sec": float(pair_elapsed_seconds),
+                **(graph_result.timings_seconds or {}),
+            })
+    finally:
+        if executor is not None:
+            executor.shutdown()
+    graph_pair_processing_seconds = time.perf_counter() - stage_start_seconds
+
+    stage_start_seconds = time.perf_counter()
     graph_pair_tables = {
         (result.summary["day_a"], result.summary["day_b"]): result.graph_matches
         for result in graph_results
@@ -270,7 +323,9 @@ def run_daywise_graph_matching(
     )
     graph_tracks = summarize_track_cycle_metadata(graph_tracks, graph_cycle_edge_checks)
     graph_length_summary = build_track_length_summary_table(graph_tracks)
+    graph_track_construction_seconds = time.perf_counter() - stage_start_seconds
 
+    stage_start_seconds = time.perf_counter()
     graph_pairwise_matches = pd.concat([result.graph_matches for result in graph_results], ignore_index=True) if graph_results else pd.DataFrame(columns=GRAPH_PAIRWISE_MATCH_COLUMNS)
     graph_pairwise_summary = pd.DataFrame([result.summary for result in graph_results], columns=GRAPH_PAIRWISE_SUMMARY_COLUMNS)
     if not graph_pairwise_summary.empty:
@@ -285,6 +340,7 @@ def run_daywise_graph_matching(
     graph_edges.to_csv(output_dir / "track_edges_graph.csv", index=False)
     graph_length_summary.to_csv(output_dir / "track_length_summary_graph.csv", index=False)
     graph_changes.to_csv(output_dir / "graph_match_changes.csv", index=False)
+    graph_serialization_seconds = time.perf_counter() - stage_start_seconds
 
     run_log_payload = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
     warnings: list[str] = []
@@ -294,6 +350,7 @@ def run_daywise_graph_matching(
             "graph_matcher_algorithm_version": GRAPH_MATCHER_ALGORITHM_VERSION,
             "graph_runner_version": GRAPH_RUNNER_ALGORITHM_VERSION,
             "graph_params": asdict(graph_params),
+            "pair_workers": pair_workers,
             "policies": ["high", "balanced", "graph"],
             "supported_match_policies": list(SUPPORTED_MATCH_POLICIES),
             "default_analysis_policies": list(DEFAULT_ANALYSIS_POLICIES),
@@ -325,6 +382,16 @@ def run_daywise_graph_matching(
     run_log_payload["qc_error"] = None
     run_log_payload["run_finished_utc"] = datetime.now(timezone.utc).isoformat()
     run_log_payload["warnings"] = warnings
+    runtime_profile = run_log_payload.setdefault("runtime_profile", {})
+    runtime_profile["graph_stage_durations_seconds"] = {
+        "input_and_transform_loading": float(graph_input_loading_seconds),
+        "graph_support_anchor_and_pairwise_assignment": float(graph_pair_processing_seconds),
+        "track_graph_construction": float(graph_track_construction_seconds),
+        "pairwise_and_track_output_serialization": float(graph_serialization_seconds),
+    }
+    runtime_profile["graph_pair_timings_seconds"] = graph_pair_timings
+    runtime_profile["graph_total_wall_seconds"] = float(time.perf_counter() - run_start_seconds)
+    runtime_profile["matcher_total_wall_seconds"] = float(time.perf_counter() - workflow_start_seconds)
     _export_json(output_dir / "run_log.json", run_log_payload)
 
     if not skip_qc:
@@ -372,6 +439,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--xy-um-per-px", type=float, default=710.0 / 1024.0, help="XY pixel spacing in micrometers.")
     parser.add_argument("--z-um-per-plane", type=float, default=5.0, help="Z spacing in micrometers.")
     parser.add_argument("--max-pair-gap", type=int, default=2, help="Maximum allowed session gap for pairwise matching.")
+    parser.add_argument("--pair-workers", type=int, default=1, help="Independent session-pair worker processes (default: 1).")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing output directory.")
     parser.add_argument("--resume", action="store_true", help="Reuse a prior exact-matching output directory when possible.")
     parser.add_argument("--skip-qc", action="store_true", help="Skip automatic QC generation after graph matching.")
@@ -395,6 +463,7 @@ def main(argv: list[str] | None = None) -> Path:
         params=AffineOverlapParams(),
         graph_params=SpatialGraphParams(),
         max_pair_gap=args.max_pair_gap,
+        pair_workers=args.pair_workers,
         overwrite=bool(args.overwrite),
         resume=bool(args.resume),
         skip_qc=bool(args.skip_qc),

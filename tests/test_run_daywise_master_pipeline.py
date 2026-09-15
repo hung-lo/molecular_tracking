@@ -42,6 +42,7 @@ def test_run_daywise_master_pipeline_parse_args_and_defaults() -> None:
     assert args.overwrite is False
     assert args.resume is False
     assert args.sessions is None
+    assert args.pair_workers == 1
     assert args.skip_ranked_roi_views is False
     assert args.ranked_roi_z_radius == 3
     assert args.render_z_radius == 0
@@ -74,6 +75,7 @@ def test_run_daywise_master_pipeline_config_defaults() -> None:
     assert config.skip_ranked_roi_views is False
     assert config.ranked_roi_z_radius == 3
     assert config.render_z_radius == 0
+    assert config.pair_workers == 1
 
 
 def _build_records(tmp_path: Path, count: int = 6) -> list[SessionRecord]:

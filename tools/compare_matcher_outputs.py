@@ -42,7 +42,10 @@ NONSCIENTIFIC_CSV_COLUMNS = {
     "pairwise_summary_graph.csv": ("elapsed_sec",),
 }
 NONSCIENTIFIC_JSON_KEYS = {
+    "affine_matcher_git_commit",
     "git_commit",
+    "git_commit_role",
+    "graph_runner_git_commit",
     "graph_output_paths",
     "output_dir",
     "output_paths",

@@ -3,12 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 import csv
 import json
+import shutil
 
 import numpy as np
 import pandas as pd
 import tifffile
 
+import run_daywise_graph_matching as graph_runner
+import run_daywise_roi_matching as affine_runner
 from run_daywise_graph_matching import run_daywise_graph_matching
+from tools.compare_matcher_outputs import compare_matcher_outputs
 
 
 def _build_dataset(tmp_path: Path) -> Path:
@@ -30,7 +34,9 @@ def _build_dataset(tmp_path: Path) -> Path:
     return manifest_path
 
 
-def test_run_daywise_graph_matching_exports_graph_tables(tmp_path: Path) -> None:
+def test_run_daywise_graph_matching_exports_graph_tables(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(affine_runner, "_git_commit", lambda: "same-stage-commit")
+    monkeypatch.setattr(graph_runner, "_git_commit", lambda: "same-stage-commit")
     manifest_path = _build_dataset(tmp_path)
     stages: list[tuple[str, float]] = []
     output_dir = run_daywise_graph_matching(
@@ -49,6 +55,10 @@ def test_run_daywise_graph_matching_exports_graph_tables(tmp_path: Path) -> None
     assert run_log["graph_matcher_algorithm_version"] == "local_spatial_graph_v1"
     assert run_log["graph_row_counts"]["tracks_graph"] > 0
     assert run_log["graph_output_paths"]["tracks_graph"].endswith("tracks_graph.csv")
+    assert run_log["affine_matcher_git_commit"] == "same-stage-commit"
+    assert run_log["graph_runner_git_commit"] == "same-stage-commit"
+    assert run_log["git_commit"] == run_log["graph_runner_git_commit"]
+    assert run_log["git_commit_role"] == "graph_runner"
     assert [key for key, _duration in stages] == [
         "daywise_affine_roi_matching",
         "graph_roi_matching",
@@ -82,3 +92,68 @@ def test_graph_pair_workers_preserve_exact_scientific_outputs(tmp_path: Path) ->
     run_log = json.loads((outputs[1] / "run_log.json").read_text(encoding="utf-8"))
     assert run_log["pair_workers"] == 2
     assert len(run_log["runtime_profile"]["graph_pair_timings_seconds"]) == 3
+
+
+def test_resumed_graph_run_preserves_affine_commit(tmp_path: Path, monkeypatch) -> None:
+    manifest_path = _build_dataset(tmp_path)
+    output_dir = tmp_path / "resumed_graph"
+    monkeypatch.setattr(affine_runner, "_git_commit", lambda: "old_affine_commit")
+    monkeypatch.setattr(graph_runner, "_git_commit", lambda: "old_affine_commit")
+    run_daywise_graph_matching(
+        manifest_path=manifest_path,
+        output_dir=output_dir,
+        overwrite=True,
+        skip_qc=True,
+    )
+    scientific_before = {
+        path.name: path.read_bytes()
+        for path in output_dir.glob("*.csv")
+    }
+    reference_dir = tmp_path / "pre_resume_reference"
+    shutil.copytree(output_dir, reference_dir)
+
+    monkeypatch.setattr(graph_runner, "_git_commit", lambda: "current_graph_commit")
+    run_daywise_graph_matching(
+        manifest_path=manifest_path,
+        output_dir=output_dir,
+        resume=True,
+        skip_qc=True,
+    )
+
+    run_log = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
+    assert run_log["affine_matcher_git_commit"] == "old_affine_commit"
+    assert run_log["graph_runner_git_commit"] == "current_graph_commit"
+    assert run_log["git_commit"] == "current_graph_commit"
+    assert scientific_before == {path.name: path.read_bytes() for path in output_dir.glob("*.csv")}
+    assert compare_matcher_outputs(reference_dir, output_dir)["scientific_output_equivalence"] == "PASS"
+
+
+def test_resumed_legacy_affine_log_without_commit_uses_null(tmp_path: Path, monkeypatch) -> None:
+    manifest_path = _build_dataset(tmp_path)
+    output_dir = tmp_path / "legacy_graph"
+    monkeypatch.setattr(affine_runner, "_git_commit", lambda: "initial_commit")
+    monkeypatch.setattr(graph_runner, "_git_commit", lambda: "initial_commit")
+    run_daywise_graph_matching(
+        manifest_path=manifest_path,
+        output_dir=output_dir,
+        overwrite=True,
+        skip_qc=True,
+    )
+    run_log_path = output_dir / "run_log.json"
+    legacy_log = json.loads(run_log_path.read_text(encoding="utf-8"))
+    for field in ("git_commit", "git_commit_role", "affine_matcher_git_commit", "graph_runner_git_commit"):
+        legacy_log.pop(field, None)
+    run_log_path.write_text(json.dumps(legacy_log, indent=2, sort_keys=True), encoding="utf-8")
+
+    monkeypatch.setattr(graph_runner, "_git_commit", lambda: "current_graph_commit")
+    run_daywise_graph_matching(
+        manifest_path=manifest_path,
+        output_dir=output_dir,
+        resume=True,
+        skip_qc=True,
+    )
+
+    run_log = json.loads(run_log_path.read_text(encoding="utf-8"))
+    assert run_log["affine_matcher_git_commit"] is None
+    assert run_log["graph_runner_git_commit"] == "current_graph_commit"
+    assert run_log["git_commit"] == "current_graph_commit"

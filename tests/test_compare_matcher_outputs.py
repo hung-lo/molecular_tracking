@@ -16,6 +16,8 @@ def _write_output(directory: Path, *, workers: int, scientific_value: int = 1) -
             table["elapsed_sec"] = float(workers)
         table.to_csv(directory / filename, index=False)
     (directory / "run_log.json").write_text(json.dumps({
+        "affine_matcher_git_commit": f"affine-{workers}",
+        "graph_runner_git_commit": f"graph-{workers}",
         "pair_workers": workers,
         "run_started_utc": f"time-{workers}",
         "runtime_profile": {"total": workers},

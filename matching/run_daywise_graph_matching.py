@@ -223,6 +223,11 @@ def run_daywise_graph_matching(
         qc_random_seed=qc_random_seed,
         require_qc_success=require_qc_success,
     )
+    affine_run_log_payload = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
+    affine_matcher_git_commit = affine_run_log_payload.get(
+        "affine_matcher_git_commit",
+        affine_run_log_payload.get("git_commit"),
+    )
     if stage_callback is not None:
         stage_callback("daywise_affine_roi_matching", time.perf_counter() - affine_stage_start)
 
@@ -342,12 +347,17 @@ def run_daywise_graph_matching(
     graph_changes.to_csv(output_dir / "graph_match_changes.csv", index=False)
     graph_serialization_seconds = time.perf_counter() - stage_start_seconds
 
-    run_log_payload = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
+    run_log_payload = affine_run_log_payload
     warnings: list[str] = []
     qc_output_path = Path(qc_output_dir).resolve() if qc_output_dir is not None else output_dir / "qc"
+    graph_runner_git_commit = _git_commit()
     run_log_payload.update(
         {
-            "git_commit": _git_commit(),
+            # Backward-compatible top-level provenance identifies the final graph stage.
+            "git_commit": graph_runner_git_commit,
+            "git_commit_role": "graph_runner",
+            "affine_matcher_git_commit": affine_matcher_git_commit,
+            "graph_runner_git_commit": graph_runner_git_commit,
             "graph_matcher_algorithm_version": GRAPH_MATCHER_ALGORITHM_VERSION,
             "graph_runner_version": GRAPH_RUNNER_ALGORITHM_VERSION,
             "graph_params": asdict(graph_params),

@@ -3,9 +3,9 @@
 ## STARTING/ENDING COMMIT
 - Plan baseline: `804bed014569c87603ab3f6018f5e710ae398005`
 - Workspace start: `90b3a74978623fc18888232861183eabb752ebf5`
-- Ending commit: `a6dbc5e` (`Record Phase D1 rescue validation results`)
+- Ending commit: `0617f85` (`Store Phase D1 benchmark tables`)
 - Canonical run provenance commit: `04d522fe8ad7365b04eb6cf94217ebad8e2c19f6`
-- Commits created: `1384d2c` implementation/tests; `a6dbc5e` validation summaries/review artifacts.
+- Commits created: `1384d2c` implementation/tests; `a6dbc5e` summaries/review artifacts; `0617f85` proposal tables.
 - Mode: `real_proposals`
 
 ## IMPLEMENTATION

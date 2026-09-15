@@ -3,9 +3,9 @@
 ## STARTING/ENDING COMMIT
 - Plan baseline: `804bed014569c87603ab3f6018f5e710ae398005`
 - Workspace start: `90b3a74978623fc18888232861183eabb752ebf5`
-- Ending commit: `1384d2c` (`Add Phase D1 local rescue evaluator`)
+- Ending commit: `0617f85` (`Store Phase D1 benchmark tables`)
 - Canonical run provenance commit: `fede6d127e5458a01e9b8428b594c5eb3d2fe296`
-- Commits created: one focused implementation/test commit; validation tables remain persistent local artifacts.
+- Commits created: `1384d2c` implementation/tests; `a6dbc5e` summaries/review artifacts; `0617f85` benchmark tables.
 - Mode: `synthetic_benchmark` plus optional Dead-1 `real_proposals`
 
 ## IMPLEMENTATION

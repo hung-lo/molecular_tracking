@@ -833,7 +833,16 @@ def _eligible_synthetic_cases_with_audit(
                 continue
             target_session, target_label = observations[target_index]
             truth = lookup.get((target_session, target_label))
-            if truth is None or bool(truth.get("touches_z_edge", False)) or bool(truth.get("touches_xy_edge", False)):
+            if truth is None:
+                continue
+            edge_z = _flag(truth.get("touches_z_edge")) if "touches_z_edge" in truth.index else None
+            edge_xy = _flag(truth.get("touches_xy_edge")) if "touches_xy_edge" in truth.index else None
+            if edge_z is None or edge_xy is None:
+                excluded += 1
+                if audit is not None:
+                    audit["missing_evidence"] = audit.get("missing_evidence", 0) + 1
+                continue
+            if edge_z or edge_xy:
                 continue
             if trust_status != "trusted":
                 excluded += 1

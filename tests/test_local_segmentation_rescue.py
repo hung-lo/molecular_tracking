@@ -131,6 +131,15 @@ def test_synthetic_trust_missing_evidence_fails_closed():
     assert audit["missing_evidence"] == 1
 
 
+def test_synthetic_trust_missing_target_edge_evidence_fails_closed():
+    context = _synthetic_context(pd.DataFrame([{"track_uid": "t1", "s0_roi": 1, "s1_roi": 1, "s2_roi": 1}]))
+    features = context.features.drop(columns=["touches_z_edge", "touches_xy_edge"])
+    context = RunContext(context.run_dir, context.matching_dir, features, context.tracks, context.sessions, context.transforms, context.spacing_zyx, context.spacing_source, context.run_log, context.matching_sha256, context.manifest_sha256, context.git_commit, context.image_hashes)
+    audit: dict[str, int] = {}
+    cases, excluded = _eligible_synthetic_cases_with_audit(context, audit)
+    assert cases == [] and excluded == 1 and audit["missing_evidence"] == 1
+
+
 def test_synthetic_trust_records_verified_evidence_without_hard_coded_claims():
     context = _synthetic_context(pd.DataFrame([{
         "track_uid": "t1", "s0_roi": 1, "s1_roi": 1, "s2_roi": 1,

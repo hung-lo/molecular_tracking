@@ -1,26 +1,141 @@
 # molecular_tracking
 
-## Multi-mouse project workflow (primary)
+Longitudinal two-photon ROI identity tracking and molecular-state analysis.
 
-Raw ThorImage folders are read-only inputs. Copy `config/project.example.toml` to the ignored
-`config/project.local.toml`, then edit the raw and derivatives roots. The raw root may be either
-the historical grouped tree (`raw_data/<mouse>/<session>`) or the flat acquisition staging tree
-(`incoming_data/WT_<mouse>_<YYYYMMDD>`); both are discovered without copying acquisitions.
+`molecular_tracking` provides a reproducible project workflow for tracking the same segmented ROIs across longitudinal two-photon imaging sessions, extracting per-session fluorescence measurements, and carrying those identities into downstream Fucci/ECLIPSE analyses.
+
+The **daywise workflow is the primary workflow**. The older weekly/explicit-path matcher is retained in the repository only for historical reproducibility and is no longer the recommended analysis path.
+
+A central design rule is:
+
+> Prefer a missing observation to an incorrect biological identity.
+
+## Pipeline at a glance
+
+```text
+Raw ThorImage acquisitions + Experiment.xml
+                │
+                ▼
+      Project catalog + pre-QC
+      - acquisition discovery
+      - PMT / laser-power checks
+      - analysis_eligible gate
+                │
+                ▼
+       Validated session manifest
+       - 1050 nm primary
+       - 920 nm optional
+       - _vol10 excluded from quantitative analysis
+                │
+                ▼
+       Daily registered images + masks
+                │
+                ▼
+       Daywise matcher
+       1. affine-overlap candidates
+       2. high / balanced assignments
+       3. spatial-graph refinement
+       4. graph tracks used as final assignment
+                │
+                ▼
+       Post-matching QC
+       - registration / transform QC
+       - cycle / gap checks
+       - graph-vs-balanced agreement
+       - segmentation / extraction eligibility
+                │
+                ▼
+       Matched ROI extraction
+       + quick plots / raw-space review
+                │
+                ├──────────────► Matcher evaluator
+                │                - read-only endpoint diagnosis
+                │                - pseudo-gap benchmark
+                │
+                └──────────────► Optional endpoint stitcher
+                                 - conservative, state-blind
+                                 - benchmark-gated
+                                 - separate stitched identity view
+```
+
+## Quick start
+
+### 1. Configure the project
+
+Raw ThorImage data are treated as read-only inputs. Copy the example project config and edit the raw-data and derivatives roots:
 
 ```bash
-python tools/build_data_catalog.py --project-config config/project.local.toml --dry-run
-python tools/build_data_catalog.py --project-config config/project.local.toml --strict
-python tools/build_session_manifest.py --project-config config/project.local.toml --mouse-id Fucci-Tri_1 --laser-nm 1050
-.venv/bin/python core/run_daywise_master_pipeline.py --project-config config/project.local.toml --mouse-id Fucci-Tri_1 --laser-nm 1050
+cp config/project.example.toml config/project.local.toml
+```
 
-# quick test on earliest 5 sessions
+The raw root may use either the historical grouped layout or the flat acquisition-staging layout supported by the catalog builder.
+
+### 2. Install
+
+Python 3.11 or newer is required.
+
+```bash
+python -m pip install -e .
+```
+
+For development and tests:
+
+```bash
+python -m pip install -e ".[test]"
+pytest tests/
+```
+
+Core Python dependencies are declared in `pyproject.toml`. Registration/segmentation environments used to create upstream daily images and masks may require additional image-analysis packages.
+
+### 3. Build and validate the data catalog
+
+Always inspect the catalog before launching a longitudinal analysis:
+
+```bash
+python tools/build_data_catalog.py \
+  --project-config config/project.local.toml \
+  --dry-run
+
+python tools/build_data_catalog.py \
+  --project-config config/project.local.toml \
+  --strict
+```
+
+The catalog step discovers acquisitions, parses ThorImage metadata, runs acquisition-settings QC, and writes deterministic catalog/QC artifacts under the derivatives root.
+
+### 4. Build the session manifest
+
+Example for the primary 1050-nm Fucci analysis:
+
+```bash
+python tools/build_session_manifest.py \
+  --project-config config/project.local.toml \
+  --mouse-id Fucci-Tri_1 \
+  --laser-nm 1050
+```
+
+If the required registered images and masks are not available yet, the builder writes a planning manifest rather than pretending the dataset is analysis-ready.
+
+### 5. Run the primary daywise pipeline
+
+```bash
+.venv/bin/python core/run_daywise_master_pipeline.py \
+  --project-config config/project.local.toml \
+  --mouse-id Fucci-Tri_1 \
+  --laser-nm 1050
+```
+
+For a small contiguous test run:
+
+```bash
+# earliest five sessions
 .venv/bin/python core/run_daywise_master_pipeline.py \
   --project-config config/project.local.toml \
   --mouse-id Fucci-Tri_1 \
   --laser-nm 1050 \
   --sessions first:5
 
-# quick test on most recent 5 sessions
+# most recent five sessions
 .venv/bin/python core/run_daywise_master_pipeline.py \
   --project-config config/project.local.toml \
   --mouse-id Fucci-Tri_1 \
@@ -28,400 +143,424 @@ python tools/build_session_manifest.py --project-config config/project.local.tom
   --sessions last:5
 ```
 
-`--sessions first:N` or `--sessions last:N` creates a run-local subset manifest; it never modifies
-the validated project manifest. Omit the option to run all sessions.
+`--sessions first:N` and `--sessions last:N` create a run-local subset and never modify the validated project manifest.
 
-1050 nm is required and primary; 920 nm is optional. Acquisitions containing `_vol10` are
-alignment-only and never enter quantitative manifests. Generated files go under the separate
-derivatives root. Until preprocessing and segmentation products exist, the manifest builder
-writes `session_manifest_plan.csv`, not an analysis-ready manifest. See
-`docs/multi_mouse_workflow.md`.
+---
 
-## Legacy explicit-path workflows
+# Current tracking architecture
 
-Commands later in this README are retained as legacy examples. They require explicit dataset,
-manifest, match, and output paths and never select a mouse implicitly.
+## 1. Pre-analysis data QC
 
-Small repository for ROI and molecular-tracking analysis code with a clean split between reusable logic, plotting scripts, matching utilities, tests, and intentionally kept notebooks.
+Acquisition QC happens before sessions are allowed into the quantitative longitudinal manifest.
 
-## Packages
-- antspy
-- cellpose
+`tools/build_data_catalog.py` parses each acquisition's ThorImage `Experiment.xml` and records:
 
+- PMT A and PMT B gain;
+- 920-nm and 1050-nm Pockels start/stop values;
+- acquisition geometry and z-stack metadata;
+- averaging and software metadata;
+- per-acquisition `settings_qc_pass`;
+- a human-readable `settings_qc_reason`;
+- a machine-readable `settings_qc_status` (`pass`, `fail`, `not_configured`, or `not_applicable`);
+- final `analysis_eligible` status.
 
-## Repository layout
+### Fucci acquisition settings
+
+The currently configured Fucci acquisition expectations are:
+
+| Mouse | PMT A | PMT B | 920-nm power | 1050-nm power |
+|---|---:|---:|---:|---:|
+| `Fucci-Tri_1` | 10 | 10 | 50 | 50 |
+| `Fucci-Tri_3` | 10 | 10 | 60 | 60 |
+| `Fucci-Dead_1` | 10 | 10 | 70 | 70 |
+| `Fucci-Dead_2` | 10 | 10 | 70 | 70 |
+
+For an active laser, both Pockels start and stop values must match the configured expected power. The selected laser is always treated as active, so an accidentally zero or incorrect selected-laser power fails QC.
+
+A Fucci acquisition that fails this check is marked `analysis_eligible = False` and is excluded from manifest generation.
+
+The Fucci workflow also **fails closed on old catalogs** that do not contain the acquisition-QC fields. Rebuild them with `tools/build_data_catalog.py` rather than silently analyzing data with unknown acquisition settings.
+
+The catalog writes QC artifacts including:
+
+```text
+_catalog/
+├── acquisitions.generated.csv
+├── sessions.generated.csv
+├── acquisition_settings_qc.csv
+├── acquisition_settings_qc.png
+├── acquisition_settings_qc.json
+├── mice.validated.csv
+└── validation_report.json
+```
+
+The JSON summary records pass/fail counts, excluded `_vol10` controls, unconfigured mice, and failed-session reasons for automated review.
+
+The master run also checks selected-session consistency. PMT gains, selected-laser Pockels values, and averaging are compared across the selected sessions; setting changes can be promoted from warnings to a hard stop with the acquisition-consistency requirement.
+
+### Project-level acquisition rules
+
+For the current Fucci project:
+
+- **1050 nm is the primary longitudinal analysis channel.**
+- **920 nm is optional** and is used as a validation/cross-laser layer rather than as a requirement for the main 1050 trajectory analysis.
+- Acquisitions containing `_vol10` are alignment-only and are excluded from quantitative manifests.
+- Raw acquisition folders are never modified by the pipeline.
+- Generated products belong under the configured derivatives root.
+
+---
+
+## 2. Daywise matcher
+
+The current matcher operates directly on daily segmented masks.
+
+The master pipeline runs two linked stages:
+
+1. **Affine-overlap matching**
+2. **Spatial-graph refinement**
+
+### Affine-overlap stage
+
+The affine-overlap matcher:
+
+- estimates coarse session-to-session displacement from binary occupancy;
+- fits a restricted transform between sessions;
+- transforms ROI geometry into a common physical space;
+- constructs a shared candidate table;
+- solves separate one-to-one `high` and `balanced` assignments.
+
+`high` is the strict branch. `balanced` provides the broader baseline candidate assignment used by the graph refinement and for agreement auditing.
+
+### Spatial-graph refinement
+
+The spatial-graph matcher is a conservative refinement of the affine result.
+
+It:
+
+- reuses the baseline pairwise candidates;
+- uses strict `high` matches as anchors;
+- limits refinement to candidate relationships admitted by the baseline balanced branch;
+- evaluates local geometric consistency after transforming centroids into common physical space;
+- produces a deterministic graph assignment.
+
+The graph score is geometric; it is not a learned classifier.
+
+### Final assignment used by the master pipeline
+
+In the current master workflow, the **graph result is the final longitudinal assignment**.
+
+The affine `balanced` result remains valuable as an independent provenance/comparison branch. Final graph tracks are annotated as:
+
+- `consensus`: every accepted graph edge is also present in the balanced assignment;
+- `graph_only`: at least one accepted graph edge differs from balanced;
+- `unmatched`: singleton ROI with no accepted longitudinal edge.
+
+This agreement information is propagated into compatible extraction tables so downstream analyses can distinguish conservative graph/affine consensus tracks from identities that depend on graph-only decisions.
+
+Important matching outputs include:
+
+```text
+session_manifest_resolved.csv
+roi_features.csv
+
+pairwise_transforms.csv
+pairwise_summary.csv
+
+pairwise_matches_high.csv
+pairwise_matches_balanced.csv
+pairwise_matches_graph.csv
+
+tracks_high.csv
+tracks_balanced.csv
+tracks_graph.csv
+
+track_edges_*.csv
+cycle_consistency_*.csv
+cycle_edge_checks_*.csv
+
+graph_match_changes.csv
+pairwise_matches_graph_agreement.csv
+accepted_graph_edges_with_agreement.csv
+graph_affine_agreement_track_summary.csv
+graph_affine_agreement_summary.json
+```
+
+See:
+
+- `docs/daywise_roi_matching_algorithm.md`
+- `docs/daywise_spatial_graph_matching.md`
+- `docs/output_schema.md`
+
+---
+
+## 3. Post-matching QC
+
+Matching QC is generated automatically after matching unless explicitly skipped.
+
+It is a **review and failure-detection layer**, not a second source of biological identity.
+
+The QC bundle is designed to surface:
+
+- pairwise examples with poor geometric alignment;
+- weak or fallback transforms;
+- cycle inconsistencies;
+- one-gap bridges and other unusual track connections;
+- graph decisions that differ from the balanced affine branch;
+- suspicious segmentation geometry;
+- extraction/trajectory eligibility issues.
+
+By default, QC findings can be inspected without deleting the matching output. Runs that must fail when the QC stage fails can enable the corresponding strict QC requirement.
+
+The master pipeline also exposes segmentation/trajectory gates, including configurable volume limits, z-depth limits, edge exclusion, track-relative volume checks, minimum usable-session requirements, and internal-gap/coverage rules.
+
+For interpretation of the matching QC bundle, see:
+
+- `docs/qc_interpretation.md`
+- `docs/daywise_pipeline.md`
+
+---
+
+## 4. Matched ROI extraction
+
+After graph-track construction and QC, the master pipeline performs matched ROI intensity extraction.
+
+The extraction layer:
+
+- keeps structural missingness distinct from failed intensity extraction;
+- writes all eligible ROI-session observations as well as complete-track subsets;
+- applies session-level normalization using signal-valid native ROIs from that session;
+- keeps trajectory eligibility separate from the normalization fit;
+- propagates graph-vs-affine agreement provenance;
+- generates quick plots and native raw-space review panels.
+
+The primary identity source remains `tracks_graph.csv` from the canonical matching directory.
+
+Downstream Fucci/ECLIPSE state calculations are postprocessing steps and do not feed back into identity matching.
+
+---
+
+# Matcher evaluator
+
+`matching/evaluate_daywise_tracking.py` is a **read-only diagnostic layer** for an existing matching run.
+
+Its purpose is to understand why canonical tracks end and whether a plausible later ROI exists.
+
+Typical run:
+
+```bash
+python matching/evaluate_daywise_tracking.py \
+  --match-dir /path/to/matching \
+  --output-dir /path/to/matching/evaluation \
+  --policy graph \
+  --lookahead 3 \
+  --search-radius-um 15 \
+  --crop-radius-um 45 \
+  --z-radius 1 \
+  --max-review-panels 100
+```
+
+Optional extraction and state tables can be supplied for review/enrichment, but they do not alter canonical matching.
+
+The evaluator asks questions such as:
+
+- Did the same canonical track already recover after a one-session gap?
+- Is there a nearby later track start?
+- Is the nearby object only a singleton?
+- Is there no segmented ROI near the predicted position?
+- Is the endpoint close to an unreliable image/FOV boundary?
+- Is registration/transform support unreliable?
+- Are multiple later candidates geometrically plausible?
+
+It also generates raw-space review panels and a synthetic pseudo-gap benchmark using trusted continuous tracks.
+
+The evaluator **does not**:
+
+- rerun the matcher;
+- change affine, graph, or gap thresholds;
+- edit canonical track IDs;
+- create canonical `t -> t+3` links;
+- interpolate missing masks;
+- use molecular state to decide identity.
+
+Automatic triage is intentionally conservative. Biological interpretations such as `segmentation_dropout`, `matcher_fragment`, or `true_disappearance` remain review labels rather than automatic declarations.
+
+See `docs/daywise_matcher_evaluator.md`.
+
+---
+
+# Conservative endpoint stitcher
+
+`matching/run_endpoint_stitching.py` is an **optional post-hoc identity-recovery stage** built on top of the canonical matcher and evaluator.
+
+It is designed for the specific case where a canonical track ends and a plausible continuation begins later as a different canonical track.
+
+Typical proposal/benchmark run:
+
+```bash
+python matching/run_endpoint_stitching.py \
+  --match-dir /path/to/matching \
+  --evaluation-dir /path/to/matching/evaluation \
+  --output-dir /path/to/endpoint_stitching \
+  --policy graph \
+  --max-gap-sessions 3 \
+  --search-radius-um 15 \
+  --profile conservative_v1 \
+  --benchmark-replicates 20 \
+  --benchmark-cases-per-gap 50 \
+  --random-seed 0 \
+  --max-review-panels 100 \
+  --overwrite
+```
+
+The stitcher is deliberately separate from canonical matching.
+
+### Safety properties
+
+The stitcher:
+
+- only considers true canonical endpoints and later starts of different tracks;
+- supports gaps of 1–3 sessions;
+- uses reciprocal spatial ranking, transform reliability, local anchor residuals, source-history consistency, future-target consistency, and canonical track QC;
+- uses a global one-to-one assignment so a source or target cannot be reused;
+- does not interpolate masks or observations;
+- preserves the original canonical track UIDs in provenance tables;
+- refuses same-session collisions and checks observation conservation;
+- never writes back into the canonical matching directory.
+
+### State-blind identity assignment
+
+Molecular state is intentionally excluded from identity decisions.
+
+ECLIPSE values, red/green intensity, and `color_z` may be carried as review provenance, but they are not used for candidate tiering or assignment cost. This prevents the identity algorithm from preferentially linking cells because their molecular trajectories happen to look similar.
+
+### Benchmark gate
+
+Before derived stitched tracks are written, the stitcher runs a pseudo-fragment benchmark that splits trusted continuous canonical tracks and asks whether the same algorithm can recover their known identities while rejecting negative/collision controls.
+
+The benchmark has strict precision and false-positive guardrails. If the guardrail is not met, stitched track files are blocked unless the user explicitly overrides that write guard.
+
+To request the derived stitched identity view after the benchmark:
+
+```bash
+python matching/run_endpoint_stitching.py \
+  ... \
+  --write-stitched-tracks
+```
+
+This may produce:
+
+```text
+tracks_graph_stitched.csv
+track_uid_stitch_map.csv
+```
+
+alongside proposals, assignments, benchmark tables, review manifests, PNG panels, summaries, and provenance logs.
+
+**Canonical graph tracks remain unchanged.** Stitched tracks are a separate derived view and should not become the primary scientific identity source until the frozen stitch profile has been validated on an independent/hold-out dataset.
+
+See `docs/daywise_endpoint_stitching.md`.
+
+---
+
+# Identity layers and what is canonical
+
+The repository intentionally keeps identity layers separate:
+
+| Layer | Purpose | Changes canonical tracks? |
+|---|---|---|
+| Affine `high` / `balanced` | baseline pairwise matching and comparison | No |
+| Graph matcher | primary final assignment in the master workflow | Produces canonical graph tracks |
+| Matching QC | detect/review suspicious geometry and track structure | No |
+| Evaluator | diagnose track endings and benchmark recoverability | No |
+| Endpoint stitcher | optional recovery of fragmented identities | No; writes a separate derived identity view |
+| Fucci/ECLIPSE postprocessing | molecular-state analysis | No |
+
+This separation makes it possible to audit exactly which conclusions depend on canonical graph matching, graph-only decisions, or optional post-hoc stitching.
+
+---
+
+# Repository layout
 
 ```text
 molecular_tracking/
-├── core/
-│   ├── analysis_paths.py
-│   ├── run_daywise_matched_roi_pipeline.py
-│   ├── roi_log_ratio_analysis.py
-│   ├── run_920_two_day_cp3nuclei_analysis.py
-│   └── run_registered_roi_pipeline.py
-├── matching/
-│   ├── affine_overlap_matcher.py
-│   ├── daywise_roi_matcher_qc_plots.py
-│   ├── roi_matcher.py
-│   └── roi_matcher_qc_plots.py
-├── notebooks/
-│   ├── demo_registered_roi_pipeline_1050.ipynb
-│   ├── roi_intensity_manual_plotting_20260526.ipynb
-│   ├── roi_raw_space_triplet_panels_1050.ipynb
-│   └── roi_shared_raw_space_group_panel_1050.ipynb
-├── plotting/
-│   ├── raw_space_triplet_panels.py
-│   ├── run_daywise_green_red_fit_residuals.py
-│   ├── run_daywise_green_red_fit_residuals_increasing.py
-│   ├── run_daywise_green_red_linear_fit_summary.py
-│   ├── run_raw_space_inverse_mask_validation.py
-│   └── shared_raw_space_group_panel.py
-├── tests/
-│   ├── test_affine_overlap_matcher.py
-│   ├── test_daywise_matched_roi_pipeline.py
-│   ├── test_daywise_roi_matcher_qc_plots.py
-│   ├── test_roi_log_ratio_analysis.py
-│   ├── test_roi_matcher.py
-│   ├── test_roi_matcher_qc_plot_contours.py
-│   ├── test_roi_matcher_qc_plot_single_plane.py
-│   ├── test_roi_matcher_qc_plot_style.py
-│   └── test_roi_matcher_qc_plots.py
-├── .gitignore
-└── README.md
+├── config/          project configuration templates
+├── core/            catalog, metadata/QC, extraction, and master pipeline
+├── matching/        affine/graph matching, matching QC, evaluator, stitcher
+├── plotting/        quick plots and raw-space validation figures
+├── postprocessing/  Fucci/ECLIPSE and downstream trajectory analyses
+├── metadata/        project metadata
+├── validation/      validation utilities/workflows
+├── tools/           project/catalog/manifest helper CLIs
+├── tests/           regression and behavior tests
+├── docs/            algorithm and output documentation
+├── examples/        example manifests/configuration inputs
+└── notebooks/       intentionally retained demos/reference notebooks
 ```
 
-## What goes where
+## Main entry points
 
-- `core/`: reusable analysis code and main pipeline entry points.
-- `plotting/`: figure generation, summaries, and raw-space validation panels.
-- `matching/`: ROI matching logic plus QC plotting helpers tied to matching.
-- `tests/`: tests for reusable analysis and matching behavior.
-- `notebooks/`: only intentionally kept demo or reference notebooks.
+| Task | Entry point |
+|---|---|
+| Build acquisition catalog + pre-QC | `tools/build_data_catalog.py` |
+| Build project session manifest | `tools/build_session_manifest.py` |
+| Run primary daywise workflow | `core/run_daywise_master_pipeline.py` |
+| Run graph matching directly | `matching/run_daywise_graph_matching.py` |
+| Evaluate canonical endpoints | `matching/evaluate_daywise_tracking.py` |
+| Run conservative endpoint stitching | `matching/run_endpoint_stitching.py` |
+| Fucci/ECLIPSE postprocessing | `postprocessing/` |
 
-## Docs and examples
+---
 
-- `docs/daywise_roi_matching_algorithm.md`: baseline matcher overview.
-- `docs/daywise_spatial_graph_matching.md`: experimental graph refinement overview.
-- `docs/daywise_pipeline.md`: daywise extraction and completeness rules.
-- `docs/output_schema.md`: public CSV schema reference.
-- `docs/fucci_color_state_postprocessing.md`: Dead-referenced Fucci color-state, trajectory, PCA, and event analysis.
-- `docs/qc_interpretation.md`: how to read matching QC.
-- `docs/troubleshooting.md`: common failure modes and checks.
-- `examples/daywise_session_manifest.csv`: starter manifest template.
+# Documentation
 
-## Data and outputs
+Start with:
 
-This repo is meant to stay code-first and reproducible.
+- `docs/multi_mouse_workflow.md` — project/catalog/manifest workflow
+- `docs/daywise_roi_matching_algorithm.md` — affine-overlap baseline
+- `docs/daywise_spatial_graph_matching.md` — spatial-graph refinement
+- `docs/qc_interpretation.md` — matching QC interpretation
+- `docs/daywise_pipeline.md` — extraction, completeness, and trajectory rules
+- `docs/daywise_matcher_evaluator.md` — endpoint evaluator
+- `docs/daywise_endpoint_stitching.md` — conservative stitcher and benchmark guardrail
+- `docs/output_schema.md` — CSV/output schemas
+- `docs/fucci_color_state_postprocessing.md` — Fucci/ECLIPSE postprocessing
+- `docs/troubleshooting.md` — common failure modes
 
-- Keep `1050_data/` and `920_data/` as external or local-only data folders.
-- Do not commit regenerated analysis outputs, figures, CSV exports, caches, or checkpoints.
-- Track source code, tests, and curated notebooks; regenerate outputs locally as needed.
+---
 
-## Working style
+# Data and reproducibility
 
-- Put reusable logic in `core/` or `matching/`, not in notebooks.
-- Keep one-off plotting or figure scripts in `plotting/`.
-- Add tests in `tests/` when reusable behavior changes.
-- Keep notebooks slim and move stabilized logic back into Python modules.
+This repository is intended to remain code-first.
 
-## Running from the repo root
+- Keep raw imaging data outside the repository.
+- Treat raw ThorImage acquisitions as read-only.
+- Keep generated derivatives, figures, CSV exports, caches, and checkpoints out of source control unless they are intentionally curated examples.
+- Record run configuration and provenance with each analysis.
+- Prefer deterministic, auditable outputs over hidden notebook state.
+- Add or update tests whenever reusable matching/QC behavior changes.
 
-Examples:
+---
 
-```bash
-python core/run_registered_roi_pipeline.py
-python core/run_daywise_matched_roi_pipeline.py
-python core/run_920_two_day_cp3nuclei_analysis.py
-python matching/run_daywise_roi_matching.py
-python plotting/run_daywise_green_red_linear_fit_summary.py
-pytest tests/
+# Legacy workflow
+
+The historical weekly/explicit-path matcher and associated scripts remain in the repository for reproducibility of older analyses.
+
+They are **not the recommended workflow for new longitudinal datasets** and are intentionally not documented as a parallel first-class pipeline here.
+
+For current work, use:
+
+```text
+project catalog / pre-QC
+        →
+daywise graph-aware master pipeline
+        →
+matching QC
+        →
+read-only evaluator
+        →
+optional benchmark-gated endpoint stitching
+        →
+downstream molecular-state analysis
 ```
 
-## Choosing a workflow
-
-- Use the legacy weekly workflow when you have weekly average masks plus the daywise registered `*_SyN.tif` images that came out of the `weeklyRegister` notebook.
-- Use the new daywise workflow when you segment each day separately, for example with Cellpose or SAM, and want matching to run directly on those daily masks.
-- The new daywise workflow does not replace the weekly workflow. It runs alongside it and reuses the same downstream dark-correction and green/red metric helpers.
-- Fucci color-state analysis is an additive postprocessing layer. It consumes an explicit master-run directory and never runs automatically from the matching/extraction pipeline.
-
-## Weekly workflow example (`crop_512`)
-
-Example data folder:
-- Windows path: `D:\_data\_newAAV_2026\weekly_registration_test\crop_512`
-- WSL path used in commands below: `/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512`
-
-Use WSL-style paths when running from the bash terminal in this repo. In other words, use `/mnt/d/...` instead of `D:\...`.
-
-Overall order:
-1. Run the `weeklyRegister` notebook first.
-2. Run `matching/roi_matcher.py` on the weekly registered average masks.
-3. Run `matching/roi_matcher_qc_plots.py` to sanity-check the matches.
-4. Run `core/run_weekly_matched_roi_pipeline.py` to extract daywise green/red ROI values from the matched ROIs.
-5. Run `plotting/run_weekly_matched_output_quick_plots.py` on the step-4 output directory.
-
-What step 1 should leave in the dataset folder:
-- Registered daywise images such as `20260511_R_crop_512_SyN.tif` and `20260511_G_crop_512_SyN.tif`.
-- Weekly registered masks for the matcher such as `week1_average_cp_masks_SyN.tif` through `week9_average_cp_masks_SyN.tif`.
-- Weekly non-SyN Cellpose masks for the weekly matched ROI pipeline such as `week1_average_cp_masks.tif` or `week1_average_cp_mask.tif`.
-
-### Step 2: ROI matcher
-
-```bash
-uv run python matching/roi_matcher.py \
-  --masks \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week1_average_cp_masks_SyN.tif" \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week2_average_cp_masks_SyN.tif" \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week3_average_cp_masks_SyN.tif" \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week4_average_cp_masks_SyN.tif" \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week5_average_cp_masks_SyN.tif" \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week6_average_cp_masks_SyN.tif" \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week7_average_cp_masks_SyN.tif" \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week8_average_cp_masks_SyN.tif" \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week9_average_cp_masks_SyN.tif" \
-  --days week1 week2 week3 week4 week5 week6 week7 week8 week9 \
-  --output-prefix /mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/roi_match_runs/20260710_9wks
-```
-
-This writes the matcher CSVs into `roi_match_runs/`, including:
-- `/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/roi_match_runs/20260710_9wks.csv`
-- `/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/roi_match_runs/20260710_9wks_qc.csv`
-- `/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/roi_match_runs/20260710_9wks_run_log.json`
-
-### Step 3: ROI matcher QC plots
-
-```bash
-uv run python matching/roi_matcher_qc_plots.py \
-  --masks \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week1_average_cp_masks_SyN.tif" \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week2_average_cp_masks_SyN.tif" \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week3_average_cp_masks_SyN.tif" \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week4_average_cp_masks_SyN.tif" \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week5_average_cp_masks_SyN.tif" \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week6_average_cp_masks_SyN.tif" \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week7_average_cp_masks_SyN.tif" \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week8_average_cp_masks_SyN.tif" \
-    "/mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/week9_average_cp_masks_SyN.tif" \
-  --days week1 week2 week3 week4 week5 week6 week7 week8 week9 \
-  --output-dir /mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/roi_match_runs/20260710_9wks_qc \
-  --examples-per-group 4
-```
-
-This step is optional but strongly recommended before you trust the matched ROI table.
-
-### Step 4: Weekly matched ROI pipeline
-
-```bash
-uv run python core/run_weekly_matched_roi_pipeline.py \
-  --dataset /mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512 \
-  --match-csv /mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/roi_match_runs/20260710_9wks.csv \
-  --start-date 20260511
-```
-
-Notes:
-- `--dataset` should point to the folder that contains the weekly masks plus the daywise `*_SyN.tif` images.
-- `--start-date` can be omitted if the earliest non-SyN raw TIFF in that folder is your true day 0, but keeping it explicit is safer.
-- The weekly mask name usually does not need to be passed because the script already tries both `{week_name}_average_cp_masks.tif` and `{week_name}_average_cp_mask.tif`.
-- This script uses the matched ROI CSV from step 2, the non-SyN weekly average masks, and the daywise registered `*_SyN.tif` images.
-- At the end it prints `output_dir=...`. Copy that path for step 5.
-
-### Step 5: Quick plots from the matched output
-
-Replace `PASTE_OUTPUT_DIR_FROM_STEP_4` with the exact `output_dir=...` path printed by step 4.
-
-```bash
-uv run python plotting/run_weekly_matched_output_quick_plots.py \
-  --analysis-dir PASTE_OUTPUT_DIR_FROM_STEP_4 \
-  --output-dir /path/to/quick_plots \
-  --start-date 20260511 \
-  --top-n 30 \
-  --policy high
-```
-
-If you only want to re-run from an existing matcher CSV later, skip steps 1 to 3 and start directly from step 4.
-
-This quick-plot script accepts either the weekly `weekly_matched_*` exports or the daywise `matched_*` exports, so it works for both workflows. When a `match_policy` column is present, `high` is the default visualization policy; use `--policy balanced` or `--policy all` if you want the sensitivity branch or the combined comparison. The plots are written to `<output-dir-or-analysis-dir>/quick_plots/<policy>/`, so `high` and `balanced` stay in separate folders.
-
-
-Reusable re-run template:
-
-```bash
-uv run python core/run_weekly_matched_roi_pipeline.py \
-  --dataset /mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512 \
-  --match-csv /mnt/d/_data/_newAAV_2026/weekly_registration_test/crop_512/roi_match_runs/YOUR_MATCH_FILE.csv \
-  --start-date 20260511
-```
-
-If dataset paths need to change, update `core/analysis_paths.py` or pass dataset-specific paths through script arguments where supported.
-
-## Daywise workflow example (`cellpose_or_sam_daily_masks`)
-
-Use this path when every day has its own segmentation mask and the mask, red image, and green image all share the same voxel space.
-
-Required manifest columns:
-
-- `session_index`
-- `session_id`
-- `acquisition_date`
-- `mask_path`
-- `red_image_path`
-- `green_image_path`
-- `required`
-
-Example manifest row:
-
-```csv
-session_index,session_id,acquisition_date,mask_path,red_image_path,green_image_path,required
-0,20260511,2026-05-11,masks/20260511_R_cp_masks.tif,images/20260511_R.tif,images/20260511_G.tif,true
-```
-
-### Step 1: run the daywise matcher
-
-```bash
-uv run python matching/run_daywise_roi_matching.py \
-  --manifest /path/to/daywise_session_manifest.csv \
-  --output-dir /path/to/roi_match_runs/20260713_affine_overlap_v1 \
-  --xy-um-per-px 0.693359375 \
-  --z-um-per-plane 5.0 \
-  --max-pair-gap 2
-```
-
-Common optional flags:
-
-- `--save-candidates` writes the full candidate table for audit/debugging.
-- `--overwrite` replaces an existing output directory.
-- `--resume` reuses an existing output directory only when the manifest, inputs, parameters, and algorithm version match exactly.
-- `--skip-qc` skips the automatic QC stage if you only want the matcher tables.
-- `--qc-output-dir /path/to/qc` sends automatic QC to a custom folder instead of `<match-dir>/qc`.
-
-The matcher writes the core tables and, by default, an automatic QC bundle under `<match-dir>/qc/`.
-
-Core outputs include:
-
-- `session_manifest_resolved.csv`
-- `roi_features.csv`
-- `pairwise_summary.csv`
-- `pairwise_transforms.csv`
-- `pairwise_matches_high.csv`
-- `pairwise_matches_balanced.csv`
-- `cycle_consistency_high.csv`
-- `cycle_consistency_balanced.csv`
-- `tracks_high.csv`
-- `tracks_balanced.csv`
-- `track_length_summary.csv`
-- `run_log.json`
-
-### Step 2: review the QC bundle
-
-The matcher now generates QC automatically into `<match-dir>/qc/`. You can rerun or redirect it with the standalone QC script if you want a fresh bundle or a different output folder:
-
-```bash
-uv run python matching/daywise_roi_matcher_qc_plots.py \
-  --match-dir /path/to/roi_match_runs/20260713_affine_overlap_v1 \
-  --output-dir /path/to/roi_match_runs/20260713_affine_overlap_v1/qc_plots
-```
-
-This recreates the review-sample CSVs and pair/track QC figures.
-
-### Step 3: run the daywise matched ROI pipeline
-
-```bash
-uv run python core/run_daywise_matched_roi_pipeline.py \
-  --dataset /path/to/dataset_root \
-  --manifest /path/to/daywise_session_manifest.csv \
-  --match-dir /path/to/roi_match_runs/20260713_affine_overlap_v1 \
-  --policies high balanced \
-  --green-dark 319 \
-  --red-dark 534
-```
-
-This step:
-
-- validates that the manifest matches the matcher output;
-- extracts ROI intensities from the original daily images using the matched daily masks;
-- applies the existing dark-correction and green/red metric helpers;
-- writes the daywise analysis tables and QC summaries.
-
-The daywise analysis output directory contains tables such as:
-
-- `matched_roi_intensity_results_raw.csv`
-- `matched_roi_intensity_results_dark_corrected.csv`
-- `matched_session_population_roi_metrics.csv`
-- `matched_roi_day_table_all.csv`
-- `matched_roi_day_table_complete.csv`
-- `matched_track_qc_summary.csv`
-- `matched_daywise_green_red_linear_fit_summary.csv`
-- `matched_roi_trajectory_eligibility.csv`
-- `matched_roi_trajectory_signed_distance_matrix.csv`
-- `matched_roi_pca_complete_case_centered.csv`
-- `primary_high_complete_matching.csv`
-- `sensitivity_balanced_complete.csv`
-- `review_flagged_tracks.csv`
-
-You can also run the quick-plot step on this directory directly:
-
-```bash
-uv run python plotting/run_weekly_matched_output_quick_plots.py \
-  --analysis-dir /path/to/daywise_matched_roi_pipeline_output \
-  --output-dir /path/to/quick_plots \
-  --start-date 20260511 \
-  --top-n 30 \
-  --policy high
-```
-
-The script looks for the daywise `matched_*` tables as well as the older `weekly_matched_*` names. It also honors `match_policy` when that column exists, so `high` is the default for daywise outputs and weekly tables remain unchanged. The output root is split by policy, so repeated `high` and `balanced` runs do not overwrite each other.
-
-### Experimental graph matcher
-
-If you want to try the local spatial-graph refinement, run the separate graph command after the baseline daywise matcher:
-
-```bash
-uv run python matching/run_daywise_graph_matching.py   --manifest /path/to/daywise_session_manifest.csv   --output-dir /path/to/roi_match_runs/20260716_graph_v1   --xy-um-per-px 0.693359375   --z-um-per-plane 5.0   --max-pair-gap 2
-```
-
-This writes the baseline `high` and `balanced` tables plus the experimental `graph` outputs alongside them:
-
-- `pairwise_matches_graph.csv`
-- `tracks_graph.csv`
-- `cycle_consistency_graph.csv`
-- `cycle_edge_checks_graph.csv`
-- `track_edges_graph.csv`
-- `track_length_summary_graph.csv`
-
-The graph run also reuses the same automatic QC bundle under `<match-dir>/qc/`, so you can compare the three policy branches in one place.
-
-### Daywise master pipeline
-
-If you want one wrapper that runs graph matching, compares graph vs balanced affine, extracts the graph-policy intensities, propagates the agreement labels, and renders the standard quick plots, use the master runner:
-
-```bash
-uv run python core/run_daywise_master_pipeline.py \
-  --dataset /path/to/dataset_root \
-  --manifest /path/to/daywise_session_manifest.csv \
-  --output-root /path/to/daywise_master_runs \
-  --run-name 20260716_master_v1 \
-  --xy-um-per-px 0.693359375 \
-  --z-um-per-plane 5.0 \
-  --max-pair-gap 2
-```
-
-The most important flags are:
-
-- `--dataset`: the dataset root that contains the daily images and masks.
-- `--manifest`: the daywise session manifest CSV.
-- `--output-root`: where the master run folder should be created.
-- `--run-name`: optional stable folder name for the run.
-- `--sessions`: optional contiguous subset selector in the form `first:N` or `last:N`; omit it to run all sessions.
-- `--xy-um-per-px`, `--z-um-per-plane`, and `--max-pair-gap`: the matching geometry settings.
-
-The master pipeline creates one run directory containing the matching output, the matched ROI extraction tables, the agreement annotations, the quick plots, the wrapped red-vs-green summary figure, and two run-level summaries:
-
-- `run_manifest.json`
-- `SUMMARY.md`
-
-This is an additive entry point. It does not change the existing daywise matcher or the weekly workflow; it just packages the same downstream pieces into a single run directory with agreement labels and a wrapped red-vs-green summary plot.
-### How it fits the current workflow
-
-- The weekly workflow stays exactly as it is today.
-- The daywise workflow is a parallel path for datasets where daily segmentation is the right starting point.
-- Both workflows share the same downstream intensity-analysis helpers, so the daywise tables should feel familiar if you already use the registered ROI pipeline.
-- If you are unsure which path to use, start with the weekly workflow for older datasets and use the daywise workflow when you already trust the daily masks.
+If an older dataset must be reproduced exactly, use the historical scripts and the documentation or commit corresponding to that analysis rather than mixing weekly and current daywise identity products.

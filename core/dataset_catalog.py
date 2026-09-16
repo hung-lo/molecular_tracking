@@ -206,6 +206,8 @@ def _sha(path:Path)->str:return hashlib.sha256(path.read_bytes()).hexdigest()
 def build_manifest_plan(config,rows,mouse_id:str,laser_nm:int|None=None,*,source_catalog:Path|None=None,validation_report:dict|None=None)->tuple[Path,bool]:
     laser=int(laser_nm if laser_nm is not None else config.rig.primary_laser_nm); mice={m.mouse_id:m for m in load_mice(config.paths.mice_csv)}
     if mouse_id not in mice: raise ValueError(f"Unknown mouse_id {mouse_id!r}")
+    if mouse_id.startswith("Fucci-") and rows and not {"settings_qc_pass", "settings_qc_reason", "analysis_eligible"}.issubset(rows[0]):
+        raise ValueError("Acquisition rows lack settings QC fields; rebuild the catalog with tools/build_data_catalog.py")
     selected=[r for r in rows if r["mouse_id"]==mouse_id and bool(r["analysis_included"]) and bool(r.get("analysis_eligible", True)) and r.get("laser_nm") not in (None, "", "nan") and int(r["laser_nm"])==laser]
     grouped={}
     for row in selected: grouped.setdefault((row["session_id"],row["acquisition_date"],laser),[]).append(row)

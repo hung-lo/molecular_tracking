@@ -10,10 +10,12 @@ control; it is never selected implicitly when Cellpose is unavailable.
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 from datetime import date
 import argparse
 import hashlib
+from importlib import metadata as importlib_metadata
 import json
 from pathlib import Path
 import subprocess
@@ -81,6 +83,8 @@ class RunContext:
     manifest_sha256: str
     git_commit: str
     image_hashes: dict[str, dict[str, str]]
+    track_edges: pd.DataFrame | None = None
+    cycle_edge_checks: pd.DataFrame | None = None
 
 
 def _finite(value: Any, default: float = np.nan) -> float:
@@ -92,7 +96,39 @@ def _finite(value: Any, default: float = np.nan) -> float:
 
 
 def _present(value: Any) -> bool:
-    return value is not None and not pd.isna(value)
+    if value is None:
+        return False
+    try:
+        return not bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return True
+
+
+def _first_finite(row: Mapping[str, Any] | pd.Series, *keys: str, default: float = np.nan) -> float:
+    """Return the first finite value across optional schema aliases."""
+
+    for key in keys:
+        if key not in row:
+            continue
+        value = _finite(row.get(key))
+        if np.isfinite(value):
+            return value
+    return default
+
+
+def _flag(value: Any) -> bool | None:
+    """Parse a boolean-like value without treating the string ``False`` as true."""
+
+    if not _present(value):
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "yes", "y"}:
+            return True
+        if normalized in {"false", "0", "no", "n"}:
+            return False
+        return None
+    return bool(value)
 
 
 def _sha256(path: Path) -> str:
@@ -404,7 +440,26 @@ def _candidates_from_labels(
     return candidates, compact
 
 
-_CELLPOSE_MODEL: Any = None
+_CELLPOSE_MODELS: dict[tuple[str, str], Any] = {}
+
+
+def _cellpose_version(module: Any) -> str:
+    version = getattr(module, "__version__", None)
+    if version and str(version).casefold() != "unknown":
+        return str(version)
+    try:
+        return importlib_metadata.version("cellpose")
+    except importlib_metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _cached_cellpose_model(models: Any, *, pretrained_model: str, resolved_device: str) -> Any:
+    key = (str(pretrained_model), str(resolved_device))
+    if key not in _CELLPOSE_MODELS:
+        _CELLPOSE_MODELS[key] = models.CellposeModel(
+            gpu=resolved_device == "cuda", pretrained_model=pretrained_model
+        )
+    return _CELLPOSE_MODELS[key]
 
 
 def _preflight_backend(backend: str, *, device: str = "cuda", min_size: int = 100, do_3d: bool = True, z_axis: int = 0, channel_axis: int = 3) -> dict[str, Any]:
@@ -412,7 +467,6 @@ def _preflight_backend(backend: str, *, device: str = "cuda", min_size: int = 10
 
     if backend == THRESHOLD_BACKEND:
         return {"resolved_device": "cpu", "cellpose_version": None, "torch_version": None, "cuda_available": False}
-    global _CELLPOSE_MODEL
     try:
         import cellpose
         import torch
@@ -424,11 +478,10 @@ def _preflight_backend(backend: str, *, device: str = "cuda", min_size: int = 10
         raise BackendUnavailable("Cellpose-SAM scientific backend requires CUDA; GPU is unavailable")
     resolved_device = "cuda" if device != "cpu" else "cpu"
     try:
-        if _CELLPOSE_MODEL is None:
-            _CELLPOSE_MODEL = models.CellposeModel(gpu=resolved_device == "cuda", pretrained_model="cpsam_v2")
+        _cached_cellpose_model(models, pretrained_model="cpsam_v2", resolved_device=resolved_device)
     except Exception as exc:  # pragma: no cover - optional environment/model download
         raise BackendUnavailable(f"Cellpose-SAM model preflight failed: {exc}") from exc
-    return {"cellpose_version": str(getattr(cellpose, "__version__", "unknown")), "torch_version": str(getattr(torch, "__version__", "unknown")), "cuda_available": cuda_available, "resolved_device": resolved_device, "pretrained_model": "cpsam_v2", "do_3D": bool(do_3d), "z_axis": int(z_axis), "channel_axis": int(channel_axis), "min_size": int(min_size)}
+    return {"cellpose_version": _cellpose_version(cellpose), "torch_version": str(getattr(torch, "__version__", "unknown")), "cuda_available": cuda_available, "resolved_device": resolved_device, "pretrained_model": "cpsam_v2", "model_cache_key": ["cpsam_v2", resolved_device], "do_3D": bool(do_3d), "z_axis": int(z_axis), "channel_axis": int(channel_axis), "min_size": int(min_size)}
 
 
 def segment_local_cellpose(
@@ -444,7 +497,6 @@ def segment_local_cellpose(
 ) -> tuple[list[dict[str, Any]], np.ndarray, float]:
     """Run the established production Cellpose-SAM configuration on one crop."""
 
-    global _CELLPOSE_MODEL
     try:
         import torch
         from cellpose import models
@@ -452,13 +504,13 @@ def segment_local_cellpose(
         raise BackendUnavailable(f"Cellpose-SAM unavailable: {exc}") from exc
     if device != "cpu" and not bool(torch.cuda.is_available()):
         raise BackendUnavailable("Cellpose-SAM scientific backend requires CUDA; GPU is unavailable")
-    if _CELLPOSE_MODEL is None:
-        _CELLPOSE_MODEL = models.CellposeModel(gpu=device != "cpu", pretrained_model="cpsam_v2")
+    resolved_device = "cuda" if device != "cpu" else "cpu"
+    model = _cached_cellpose_model(models, pretrained_model="cpsam_v2", resolved_device=resolved_device)
     image = np.asarray(image_crop_zyx)
     if image.ndim != 3:
         raise ValueError("image_crop_zyx must be 3D ZYX")
     loaded = image[..., None]
-    masks, _flows, _styles = _CELLPOSE_MODEL.eval(
+    masks, _flows, _styles = model.eval(
         loaded,
         do_3D=bool(do_3d),
         z_axis=int(z_axis),
@@ -531,6 +583,10 @@ def _load_run_context(run_dir: str | Path) -> RunContext:
     features["label"] = pd.to_numeric(features["label"], errors="raise").astype(int)
     tracks = pd.read_csv(tracks_path, low_memory=False)
     transforms = pd.read_csv(transforms_path, low_memory=False)
+    track_edges_path = matching / "track_edges_graph.csv"
+    cycle_checks_path = matching / "cycle_edge_checks_graph.csv"
+    track_edges = pd.read_csv(track_edges_path, low_memory=False) if track_edges_path.is_file() else None
+    cycle_edge_checks = pd.read_csv(cycle_checks_path, low_memory=False) if cycle_checks_path.is_file() else None
     run_log_path = matching / "run_log.json"
     run_log = json.loads(run_log_path.read_text(encoding="utf-8")) if run_log_path.is_file() else {}
     spacing_payload = run_log.get("spacing", {}) if isinstance(run_log, dict) else {}
@@ -553,6 +609,7 @@ def _load_run_context(run_dir: str | Path) -> RunContext:
     return RunContext(
         root, matching, features, tracks, sessions, transforms, spacing, spacing_source, run_log,
         matching_hash.hexdigest(), _sha256(manifest_path), str(run_log.get("git_commit", _git_commit())), image_hashes,
+        track_edges, cycle_edge_checks,
     )
 
 
@@ -621,7 +678,147 @@ def _predict_target(
     return {"predicted_xyz": [np.nan, np.nan, np.nan], "transform_method": "unavailable", "transform_paths": [], "transform_fallback_reason": "no_neighbor_observation"}
 
 
-def _eligible_synthetic_cases_with_audit(context: RunContext) -> tuple[list[dict[str, Any]], int]:
+def _track_edge_rows(context: RunContext, track: pd.Series) -> list[dict[str, Any]]:
+    """Load per-track edge evidence from the serialized track or edge table."""
+
+    raw = track.get("_edges")
+    if _present(raw):
+        if isinstance(raw, str):
+            try:
+                raw = ast.literal_eval(raw)
+            except (SyntaxError, ValueError):
+                raw = None
+        if isinstance(raw, (list, tuple)):
+            return [dict(item) for item in raw if isinstance(item, Mapping)]
+    edges = context.track_edges
+    if edges is None or edges.empty or "track_uid" not in edges.columns:
+        return []
+    subset = edges.loc[edges["track_uid"].astype(str).eq(str(track.get("track_uid", "")))]
+    return subset.to_dict("records")
+
+
+def _synthetic_trust(
+    context: RunContext,
+    track: pd.Series,
+) -> tuple[str, list[str], str, list[str]]:
+    """Verify trust claims from explicit summaries or canonical edge evidence."""
+
+    edges = _track_edge_rows(context, track)
+    reasons: list[str] = []
+    verified: list[str] = []
+    sources: set[str] = set()
+
+    source_value = track.get("track_match_source") if "track_match_source" in track.index else None
+    source = str(source_value).strip().casefold() if _present(source_value) else ""
+    if source:
+        verified.append("track_match_source")
+        sources.add("track_summary")
+    elif edges and all(str(edge.get("candidate_source", "")).strip().casefold() in {"both", "consensus"} for edge in edges):
+        source = "consensus"
+        verified.append("candidate_source")
+        sources.add("track_edges")
+    else:
+        reasons.append("missing_evidence:track_match_source")
+    if source and source != "consensus":
+        reasons.append("not_consensus")
+
+    has_conflict = _flag(track.get("has_cycle_conflict")) if "has_cycle_conflict" in track.index else None
+    cycle_unchecked = _flag(track.get("cycle_unchecked")) if "cycle_unchecked" in track.index else None
+    if has_conflict is not None and cycle_unchecked is not None:
+        verified.extend(("has_cycle_conflict", "cycle_unchecked"))
+        sources.add("track_summary")
+    elif "n_cycle_comparable" in track.index and "n_cycle_agree" in track.index:
+        comparable = _first_finite(track, "n_cycle_comparable", default=np.nan)
+        agree = _first_finite(track, "n_cycle_agree", default=np.nan)
+        if np.isfinite(comparable) and np.isfinite(agree):
+            has_conflict = comparable > 0 and agree < comparable
+            cycle_unchecked = comparable == 0
+            verified.extend(("n_cycle_comparable", "n_cycle_agree"))
+            sources.add("track_summary")
+    elif context.cycle_edge_checks is not None:
+        checks = context.cycle_edge_checks
+        if "track_uid" in checks.columns:
+            subset = checks.loc[checks["track_uid"].astype(str).eq(str(track.get("track_uid", "")))]
+            agrees = [_flag(value) for value in subset.get("cycle_agrees", pd.Series(dtype=object)).tolist()]
+            agrees = [value for value in agrees if value is not None]
+            if agrees:
+                has_conflict = not all(agrees)
+                cycle_unchecked = False
+            else:
+                has_conflict = False
+                cycle_unchecked = True
+            verified.append("cycle_edge_checks")
+            sources.add("cycle_edge_checks")
+    if has_conflict is None or cycle_unchecked is None:
+        reasons.append("missing_evidence:cycle_status")
+    else:
+        if has_conflict:
+            reasons.append("cycle_conflict")
+        if cycle_unchecked:
+            reasons.append("cycle_unchecked")
+
+    fallback = _flag(track.get("contains_transform_fallback_edge")) if "contains_transform_fallback_edge" in track.index else None
+    if fallback is not None:
+        verified.append("contains_transform_fallback_edge")
+        sources.add("track_summary")
+    elif edges and all("transform_fallback_reason" in edge for edge in edges):
+        fallback = any(_present(edge.get("transform_fallback_reason")) and str(edge.get("transform_fallback_reason")).strip() for edge in edges)
+        verified.append("transform_fallback_reason")
+        sources.add("track_edges")
+    else:
+        reasons.append("missing_evidence:transform_reliability")
+    if fallback:
+        reasons.append("transform_fallback")
+
+    adjacent = _first_finite(track, "n_adjacent_edges", default=np.nan)
+    if np.isfinite(adjacent):
+        verified.append("n_adjacent_edges")
+        sources.add("track_summary")
+    elif edges and all("pair_gap" in edge for edge in edges):
+        adjacent = sum(_first_finite(edge, "pair_gap", default=np.nan) == 1 for edge in edges)
+        verified.append("pair_gap")
+        sources.add("track_edges")
+    else:
+        reasons.append("missing_evidence:n_adjacent_edges")
+    if np.isfinite(adjacent) and adjacent < 2:
+        reasons.append("unstable_track_context")
+
+    max_distance = _first_finite(track, "max_distance_um", default=np.nan)
+    if np.isfinite(max_distance):
+        verified.append("max_distance_um")
+        sources.add("track_summary")
+    elif edges and all(np.isfinite(_finite(edge.get("distance_um"))) for edge in edges):
+        max_distance = max(_finite(edge.get("distance_um")) for edge in edges)
+        verified.append("distance_um")
+        sources.add("track_edges")
+    else:
+        reasons.append("missing_evidence:max_distance_um")
+    if np.isfinite(max_distance) and max_distance > 50:
+        reasons.append("large_match_distance")
+
+    max_ambiguity = _first_finite(track, "max_ambiguity", default=np.nan)
+    if np.isfinite(max_ambiguity):
+        verified.append("max_ambiguity")
+        sources.add("track_summary")
+    elif edges and all(np.isfinite(_finite(edge.get("ambiguity"))) for edge in edges):
+        max_ambiguity = max(_finite(edge.get("ambiguity")) for edge in edges)
+        verified.append("ambiguity")
+        sources.add("track_edges")
+    else:
+        reasons.append("missing_evidence:max_ambiguity")
+    if np.isfinite(max_ambiguity) and max_ambiguity > 0.5:
+        reasons.append("ambiguous_match")
+
+    if not reasons:
+        positive = ["consensus", "no_cycle_conflict", "reliable_transform", "stable_context", "bounded_distance", "bounded_ambiguity"]
+        return "trusted", positive, "+".join(sorted(sources)), sorted(set(verified))
+    return "untrusted", reasons, "+".join(sorted(sources)), sorted(set(verified))
+
+
+def _eligible_synthetic_cases_with_audit(
+    context: RunContext,
+    audit: dict[str, int] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
     lookup = _feature_lookup(context)
     cases: list[dict[str, Any]] = []
     excluded = 0
@@ -630,23 +827,7 @@ def _eligible_synthetic_cases_with_audit(context: RunContext) -> tuple[list[dict
         if len(observations) < 3:
             continue
         track_uid = str(track.get("track_uid", track.get("cluster_id", "")))
-        trust_reasons: list[str] = []
-        if "track_match_source" in track and str(track.get("track_match_source", "")) != "consensus":
-            trust_reasons.append("not_consensus")
-        if bool(track.get("has_cycle_conflict", False)):
-            trust_reasons.append("cycle_conflict")
-        if bool(track.get("cycle_unchecked", False)):
-            trust_reasons.append("cycle_unchecked")
-        if bool(track.get("contains_transform_fallback_edge", False)):
-            trust_reasons.append("transform_fallback")
-        max_distance = _finite(track.get("max_distance_um"))
-        if np.isfinite(max_distance) and max_distance > 50:
-            trust_reasons.append("large_match_distance")
-        max_ambiguity = _finite(track.get("max_ambiguity"))
-        if np.isfinite(max_ambiguity) and max_ambiguity > 0.5:
-            trust_reasons.append("ambiguous_match")
-        if int(_finite(track.get("n_adjacent_edges"), 0)) < 2:
-            trust_reasons.append("unstable_track_context")
+        trust_status, trust_reasons, trust_source, trust_fields = _synthetic_trust(context, track)
         for target_index in range(1, len(context.sessions) - 1):
             if target_index not in observations or target_index - 1 not in observations or target_index + 1 not in observations:
                 continue
@@ -654,8 +835,10 @@ def _eligible_synthetic_cases_with_audit(context: RunContext) -> tuple[list[dict
             truth = lookup.get((target_session, target_label))
             if truth is None or bool(truth.get("touches_z_edge", False)) or bool(truth.get("touches_xy_edge", False)):
                 continue
-            if trust_reasons:
+            if trust_status != "trusted":
                 excluded += 1
+                if audit is not None and any(reason.startswith("missing_evidence:") for reason in trust_reasons):
+                    audit["missing_evidence"] = audit.get("missing_evidence", 0) + 1
                 continue
             source_session, source_label = observations[target_index - 1]
             cases.append({
@@ -675,8 +858,10 @@ def _eligible_synthetic_cases_with_audit(context: RunContext) -> tuple[list[dict
                 # from the hidden target and never drives ranking.
                 "expected_volume_um3": np.nan,
                 "benchmark_context": "endpoint_one_sided",
-                "synthetic_trust_status": "trusted",
-                "synthetic_trust_reasons": "consensus;no_cycle_conflict;reliable_transform;stable_context",
+                "synthetic_trust_status": trust_status,
+                "synthetic_trust_reasons": ";".join(trust_reasons),
+                "synthetic_trust_evidence_source": trust_source,
+                "synthetic_trust_fields_verified": ";".join(trust_fields),
             })
     return cases, excluded
 
@@ -727,7 +912,7 @@ def _find_real_cases(
     candidates: list[dict[str, Any]] = []
     selected = table.loc[table[classification_column].astype(str).str.strip().str.casefold().eq("no_mask_near_prediction")]
     for _, row in selected.iterrows():
-        source_index = int(_finite(row.get("end_session_index", row.get("source_session_index", np.nan)), -1))
+        source_index = int(_first_finite(row, "end_session_index", "source_session_index", default=-1))
         if source_index < 0:
             continue
         derived_target_index = source_index + 1
@@ -748,7 +933,7 @@ def _find_real_cases(
         if source_session not in {manifest_source, "", "nan", "None"} or target_session not in {manifest_target, "", "nan", "None"}:
             continue
         source_session, target_session = manifest_source, manifest_target
-        source_label = row.get("source_label", row.get("roi_id", row.get("end_label", np.nan)))
+        source_label = _first_finite(row, "source_label", "roi_id", "end_label", default=np.nan)
         if not source_session or not target_session or not np.isfinite(_finite(source_label)):
             continue
         endpoint_id = str(row.get("endpoint_id", row.get("id", "")))
@@ -1203,9 +1388,11 @@ def evaluate(
         except Exception:
             evaluator_row_count = 0
     if mode == "synthetic_benchmark":
-        cases, synthetic_excluded = _eligible_synthetic_cases_with_audit(context)
+        synthetic_audit: dict[str, int] = {}
+        cases, synthetic_excluded = _eligible_synthetic_cases_with_audit(context, synthetic_audit)
         endpoint_all_cases: list[dict[str, Any]] = []
     else:
+        synthetic_audit = {}
         synthetic_excluded = 0
         endpoint_all_cases = _find_real_cases(context, None, seed, endpoint_path)
         cases = _sample_cases(endpoint_all_cases, sample_size, seed)
@@ -1213,7 +1400,9 @@ def evaluate(
     eligible_case_count = len(cases)
     records: list[dict[str, Any]] = []
     candidate_records: list[dict[str, Any]] = []
-    artifacts: list[dict[str, Any]] = []
+    artifact_buckets: dict[str, list[tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]]] = {}
+    artifact_counts: dict[str, int] = {}
+    review_rng = np.random.default_rng(int(seed))
     image_cache: dict[str, np.ndarray] = {}
     mask_cache: dict[str, np.ndarray] = {}
     for case in ([] if preflight_error else cases):
@@ -1221,9 +1410,20 @@ def evaluate(
         record, candidates, selected, arrays = _run_case(context, case, synthetic=mode == "synthetic_benchmark", crop_shape_zyx=crop_shape, threshold_percentile=threshold_percentile, min_voxels=min_voxels, backend=backend, cellpose_min_size=cellpose_min_size, cellpose_device=cellpose_device, cellpose_do_3d=cellpose_do_3d, cellpose_z_axis=cellpose_z_axis, cellpose_channel_axis=cellpose_channel_axis, backend_runtime=backend_runtime, lookup=lookup, graph=graph, image_cache=image_cache, mask_cache=mask_cache)
         records.append(record)
         candidate_records.extend(candidates)
-        # Keep a bounded pool in memory; final panels are category-aware.
-        if arrays and len(artifacts) < 64:
-            artifacts.append((record, selected, arrays))
+        # Keep bounded per-category reservoirs so late benchmark categories are visible.
+        if arrays:
+            category = str(record.get("identity_category") or record.get("status") or "uncategorized")
+            bucket = artifact_buckets.setdefault(category, [])
+            count = artifact_counts.get(category, 0) + 1
+            artifact_counts[category] = count
+            item = (record, selected, arrays)
+            if len(bucket) < 12:
+                bucket.append(item)
+            else:
+                replacement = int(review_rng.integers(count))
+                if replacement < len(bucket):
+                    bucket[replacement] = item
+    artifacts = [item for category in sorted(artifact_buckets) for item in artifact_buckets[category]]
     cases_path = root / ("synthetic_hide_rescue_cases.csv" if mode == "synthetic_benchmark" else "local_rescue_real_cases.csv")
     candidates_path = root / ("synthetic_hide_rescue_candidates.csv" if mode == "synthetic_benchmark" else "local_rescue_real_candidates.csv")
     metrics_path = root / "synthetic_hide_rescue_metrics.csv"
@@ -1235,7 +1435,7 @@ def evaluate(
         bias_columns = [column for column in pd.DataFrame(records).columns if any(token in column for token in ("green_", "red_", "ratio_", "eclipse_"))]
         pd.DataFrame(records, columns=["track_uid", "target_session", *bias_columns]).to_csv(root / "synthetic_hide_rescue_measurement_bias.csv", index=False)
     summary = _summary(records, candidate_records, mode, context, seed)
-    summary.update({"output_dir": str(root), "output_paths": {"cases": str(cases_path), "candidates": str(candidates_path), "metrics": str(metrics_path) if mode == "synthetic_benchmark" else None, "measurement_bias": str(root / "synthetic_hide_rescue_measurement_bias.csv") if mode == "synthetic_benchmark" else None, "summary": str(summary_path)}, "crop_shape_zyx": list(crop_shape), "threshold_percentile": threshold_percentile, "min_voxels": min_voxels, "backend": backend, "cellpose_model": "cpsam_v2" if backend == CELLPOSE_BACKEND else None, "cellpose_device": cellpose_device if backend == CELLPOSE_BACKEND else None, "backend_runtime": backend_runtime, "backend_preflight_error": preflight_error, "endpoint_classification": str(endpoint_path) if endpoint_path else None, "classification_source_path": str(endpoint_path) if endpoint_path else None, "classification_source_sha256": _sha256(endpoint_path) if endpoint_path and endpoint_path.is_file() else None, "evaluator_artifact_available": endpoint_artifact_available if mode == "real_proposals" else None, "evaluator_no_mask_near_prediction_rows": evaluator_row_count if mode == "real_proposals" else None, "rows_parsed_successfully": len(endpoint_all_cases) if mode == "real_proposals" else None, "target_derived_from_end_session_index_plus_one": True if mode == "real_proposals" and endpoint_all_cases else None, "real_case_source": "endpoint_evaluator" if mode == "real_proposals" and cases else "unavailable" if mode == "real_proposals" else None, "generic_gap_fallback_used": False, "synthetic_trusted_eligible": len(cases) if mode == "synthetic_benchmark" else None, "synthetic_trusted_excluded": synthetic_excluded if mode == "synthetic_benchmark" else None})
+    summary.update({"output_dir": str(root), "output_paths": {"cases": str(cases_path), "candidates": str(candidates_path), "metrics": str(metrics_path) if mode == "synthetic_benchmark" else None, "measurement_bias": str(root / "synthetic_hide_rescue_measurement_bias.csv") if mode == "synthetic_benchmark" else None, "summary": str(summary_path)}, "crop_shape_zyx": list(crop_shape), "threshold_percentile": threshold_percentile, "min_voxels": min_voxels, "backend": backend, "cellpose_model": "cpsam_v2" if backend == CELLPOSE_BACKEND else None, "cellpose_device": cellpose_device if backend == CELLPOSE_BACKEND else None, "backend_runtime": backend_runtime, "backend_preflight_error": preflight_error, "endpoint_classification": str(endpoint_path) if endpoint_path else None, "classification_source_path": str(endpoint_path) if endpoint_path else None, "classification_source_sha256": _sha256(endpoint_path) if endpoint_path and endpoint_path.is_file() else None, "evaluator_artifact_available": endpoint_artifact_available if mode == "real_proposals" else None, "evaluator_no_mask_near_prediction_rows": evaluator_row_count if mode == "real_proposals" else None, "rows_parsed_successfully": len(endpoint_all_cases) if mode == "real_proposals" else None, "target_derived_from_end_session_index_plus_one": True if mode == "real_proposals" and endpoint_all_cases else None, "real_case_source": "endpoint_evaluator" if mode == "real_proposals" and cases else "unavailable" if mode == "real_proposals" else None, "generic_gap_fallback_used": False, "synthetic_trusted_eligible": len(cases) if mode == "synthetic_benchmark" else None, "synthetic_trusted_excluded": synthetic_excluded if mode == "synthetic_benchmark" else None, "synthetic_trust_missing_evidence": synthetic_audit.get("missing_evidence", 0) if mode == "synthetic_benchmark" else None, "review_selection_population": len(records), "review_selection_full_population": True, "review_selection_category_counts": {category: artifact_counts[category] for category in sorted(artifact_counts)}})
     if preflight_error:
         summary["n_eligible"] = eligible_case_count
         summary["n_attempted"] = 0

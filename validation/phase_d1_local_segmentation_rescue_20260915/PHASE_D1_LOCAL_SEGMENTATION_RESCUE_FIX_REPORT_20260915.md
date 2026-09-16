@@ -1,6 +1,7 @@
 # Phase D1 Local Segmentation Rescue Fix Report (2026-09-15)
 
 - baseline: `fe80523`
+- ending commit: `b8b0f10`
 - validity-fix follow-up: `abc4ddd`
 
 ## Truth leakage
@@ -38,7 +39,7 @@
 
 - focused Phase D1 tests: **8 passed**
 - acquisition/catalog/master focused tests: **40 passed**
-- full repository suite: **316 passed, 2 skipped**
+- full repository suite: **318 passed, 2 skipped**
 - Cellpose-SAM pilot: **not run** (this environment lacks the Cellpose package/GPU runtime)
 
 ## Status

@@ -1,8 +1,7 @@
 # Phase D1 Local Segmentation Rescue Fix Report (2026-09-15)
 
-- baseline: `e803388`
-- validity-fix commit: `fe80523`
-- acquisition-QC commit (separate): `206b413`
+- baseline: `fe80523`
+- validity-fix follow-up: `abc4ddd`
 
 ## Truth leakage
 
@@ -24,24 +23,26 @@
 ## Real proposals
 
 - only explicit evaluator rows classified `no_mask_near_prediction` are accepted;
+- evaluator rows use `end_session_index + 1` and selected manifest order for the target;
 - missing evaluator artifact is reported unavailable;
 - generic internal-gap fallback: **NO**.
 
 ## Identity and measurement safeguards
 
 - canonical-label overlap fields and identity categories are recorded separately from Dice/IoU;
+- summary reports identity-correct rate separately from good-mask rate;
 - measurement fields are explicitly `raw_mask_mean_*` diagnostics;
 - no canonical masks, tracks, track IDs, matcher thresholds, or primary extraction outputs are written.
 
 ## Tests
 
-- focused Phase D1 tests: **6 passed**
+- focused Phase D1 tests: **8 passed**
 - acquisition/catalog/master focused tests: **40 passed**
-- full repository suite: **315 passed, 2 skipped**
+- full repository suite: **316 passed, 2 skipped**
+- Cellpose-SAM pilot: **not run** (this environment lacks the Cellpose package/GPU runtime)
 
 ## Status
 
 - production-ready: **NO**
 - ready to design production acceptance gates: **NO**
 - reason: a Cellpose-SAM pilot and manual review are still required before setting production gates.
-

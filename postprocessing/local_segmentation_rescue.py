@@ -407,6 +407,30 @@ def _candidates_from_labels(
 _CELLPOSE_MODEL: Any = None
 
 
+def _preflight_backend(backend: str, *, device: str = "cuda", min_size: int = 100, do_3d: bool = True, z_axis: int = 0, channel_axis: int = 3) -> dict[str, Any]:
+    """Load/validate a backend once before a large benchmark loop."""
+
+    if backend == THRESHOLD_BACKEND:
+        return {"resolved_device": "cpu", "cellpose_version": None, "torch_version": None, "cuda_available": False}
+    global _CELLPOSE_MODEL
+    try:
+        import cellpose
+        import torch
+        from cellpose import models
+    except Exception as exc:  # pragma: no cover - optional environment
+        raise BackendUnavailable(f"Cellpose-SAM unavailable: {exc}") from exc
+    cuda_available = bool(torch.cuda.is_available())
+    if device != "cpu" and not cuda_available:
+        raise BackendUnavailable("Cellpose-SAM scientific backend requires CUDA; GPU is unavailable")
+    resolved_device = "cuda" if device != "cpu" else "cpu"
+    try:
+        if _CELLPOSE_MODEL is None:
+            _CELLPOSE_MODEL = models.CellposeModel(gpu=resolved_device == "cuda", pretrained_model="cpsam_v2")
+    except Exception as exc:  # pragma: no cover - optional environment/model download
+        raise BackendUnavailable(f"Cellpose-SAM model preflight failed: {exc}") from exc
+    return {"cellpose_version": str(getattr(cellpose, "__version__", "unknown")), "torch_version": str(getattr(torch, "__version__", "unknown")), "cuda_available": cuda_available, "resolved_device": resolved_device, "pretrained_model": "cpsam_v2", "do_3D": bool(do_3d), "z_axis": int(z_axis), "channel_axis": int(channel_axis), "min_size": int(min_size)}
+
+
 def segment_local_cellpose(
     image_crop_zyx: np.ndarray,
     spacing_zyx: Iterable[float] = DEFAULT_SPACING_ZYX,
@@ -597,20 +621,41 @@ def _predict_target(
     return {"predicted_xyz": [np.nan, np.nan, np.nan], "transform_method": "unavailable", "transform_paths": [], "transform_fallback_reason": "no_neighbor_observation"}
 
 
-def _eligible_synthetic_cases(context: RunContext) -> list[dict[str, Any]]:
+def _eligible_synthetic_cases_with_audit(context: RunContext) -> tuple[list[dict[str, Any]], int]:
     lookup = _feature_lookup(context)
     cases: list[dict[str, Any]] = []
+    excluded = 0
     for _, track in context.tracks.iterrows():
         observations = _track_observations(context, track)
         if len(observations) < 3:
             continue
         track_uid = str(track.get("track_uid", track.get("cluster_id", "")))
+        trust_reasons: list[str] = []
+        if "track_match_source" in track and str(track.get("track_match_source", "")) != "consensus":
+            trust_reasons.append("not_consensus")
+        if bool(track.get("has_cycle_conflict", False)):
+            trust_reasons.append("cycle_conflict")
+        if bool(track.get("cycle_unchecked", False)):
+            trust_reasons.append("cycle_unchecked")
+        if bool(track.get("contains_transform_fallback_edge", False)):
+            trust_reasons.append("transform_fallback")
+        max_distance = _finite(track.get("max_distance_um"))
+        if np.isfinite(max_distance) and max_distance > 50:
+            trust_reasons.append("large_match_distance")
+        max_ambiguity = _finite(track.get("max_ambiguity"))
+        if np.isfinite(max_ambiguity) and max_ambiguity > 0.5:
+            trust_reasons.append("ambiguous_match")
+        if int(_finite(track.get("n_adjacent_edges"), 0)) < 2:
+            trust_reasons.append("unstable_track_context")
         for target_index in range(1, len(context.sessions) - 1):
             if target_index not in observations or target_index - 1 not in observations or target_index + 1 not in observations:
                 continue
             target_session, target_label = observations[target_index]
             truth = lookup.get((target_session, target_label))
             if truth is None or bool(truth.get("touches_z_edge", False)) or bool(truth.get("touches_xy_edge", False)):
+                continue
+            if trust_reasons:
+                excluded += 1
                 continue
             source_session, source_label = observations[target_index - 1]
             cases.append({
@@ -630,8 +675,16 @@ def _eligible_synthetic_cases(context: RunContext) -> list[dict[str, Any]]:
                 # from the hidden target and never drives ranking.
                 "expected_volume_um3": np.nan,
                 "benchmark_context": "endpoint_one_sided",
+                "synthetic_trust_status": "trusted",
+                "synthetic_trust_reasons": "consensus;no_cycle_conflict;reliable_transform;stable_context",
             })
-    return cases
+    return cases, excluded
+
+
+def _eligible_synthetic_cases(context: RunContext) -> list[dict[str, Any]]:
+    """Return the conservative trusted synthetic set (legacy API wrapper)."""
+
+    return _eligible_synthetic_cases_with_audit(context)[0]
 
 
 def _sample_cases(cases: list[dict[str, Any]], sample_size: int | None, seed: int) -> list[dict[str, Any]]:
@@ -672,11 +725,17 @@ def _find_real_cases(
         return []
     source_hash = _sha256(path)
     candidates: list[dict[str, Any]] = []
-    selected = table.loc[table[classification_column].astype(str).eq("no_mask_near_prediction")]
+    selected = table.loc[table[classification_column].astype(str).str.strip().str.casefold().eq("no_mask_near_prediction")]
     for _, row in selected.iterrows():
-        target_index = int(_finite(row.get("target_session_index", row.get("session_index", np.nan)), -1))
-        source_index = int(_finite(row.get("source_session_index", row.get("end_session_index", target_index - 1)), -1))
-        if target_index < 0 or source_index < 0:
+        source_index = int(_finite(row.get("end_session_index", row.get("source_session_index", np.nan)), -1))
+        if source_index < 0:
+            continue
+        derived_target_index = source_index + 1
+        explicit_target = row.get("target_session_index", row.get("target_index", np.nan))
+        if _present(explicit_target) and int(_finite(explicit_target, -1)) != derived_target_index:
+            continue
+        target_index = derived_target_index
+        if target_index >= len(context.sessions):
             continue
         source_session = str(row.get("source_session", row.get("session_id", row.get("end_session_id", ""))))
         target_session = str(row.get("target_session", row.get("target_session_id", "")))
@@ -684,6 +743,11 @@ def _find_real_cases(
             source_session = str(context.sessions.iloc[source_index].session_id)
         if target_session in {"", "nan", "None"} and 0 <= target_index < len(context.sessions):
             target_session = str(context.sessions.iloc[target_index].session_id)
+        manifest_source = str(context.sessions.iloc[source_index].session_id)
+        manifest_target = str(context.sessions.iloc[target_index].session_id)
+        if source_session not in {manifest_source, "", "nan", "None"} or target_session not in {manifest_target, "", "nan", "None"}:
+            continue
+        source_session, target_session = manifest_source, manifest_target
         source_label = row.get("source_label", row.get("roi_id", row.get("end_label", np.nan)))
         if not source_session or not target_session or not np.isfinite(_finite(source_label)):
             continue
@@ -724,8 +788,10 @@ def _case_provenance(
     *,
     backend: str,
     segmentation_parameters: Mapping[str, Any],
+    backend_runtime: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     hashes = context.image_hashes.get(str(target_session), {})
+    runtime = dict(backend_runtime or {})
     return {
         "git_commit": context.git_commit,
         "canonical_run_path": str(context.run_dir),
@@ -736,6 +802,11 @@ def _case_provenance(
         "segmentation_backend": backend,
         "segmentation_model": "cpsam_v2" if backend == CELLPOSE_BACKEND else SEGMENTER_NAME,
         "segmentation_parameters": dict(segmentation_parameters),
+        "backend_runtime": runtime,
+        "cellpose_version": runtime.get("cellpose_version"),
+        "torch_version": runtime.get("torch_version"),
+        "cuda_available": runtime.get("cuda_available"),
+        "resolved_device": runtime.get("resolved_device"),
         "voxel_spacing_zyx_um": list(context.spacing_zyx),
         "proposal_only": True,
     }
@@ -772,6 +843,7 @@ def _run_case(
     cellpose_do_3d: bool,
     cellpose_z_axis: int,
     cellpose_channel_axis: int,
+    backend_runtime: Mapping[str, Any] | None,
     lookup: dict[tuple[str, int], pd.Series],
     graph: TransformGraph,
     image_cache: dict[str, np.ndarray],
@@ -803,11 +875,11 @@ def _run_case(
     status = "candidate_generated"
     if image_path is None:
         status = "missing_segmentation_channel"
-        base = {**case, **prediction, "benchmark_context": benchmark_context, "status": status, "failure_reason": status, "n_candidates": 0, **_case_provenance(context, target_session, backend=backend, segmentation_parameters=segmentation_parameters)}
+        base = {**case, **prediction, "benchmark_context": benchmark_context, "status": status, "failure_reason": status, "n_candidates": 0, **_case_provenance(context, target_session, backend=backend, segmentation_parameters=segmentation_parameters, backend_runtime=backend_runtime)}
         return base, [], None, {}
     if not np.all(np.isfinite(prediction["predicted_xyz"])):
         status = "transform_unavailable"
-        base = {**case, **prediction, "benchmark_context": benchmark_context, "status": status, "failure_reason": status, "n_candidates": 0, "input_image_path": "", **_case_provenance(context, target_session, backend=backend, segmentation_parameters=segmentation_parameters)}
+        base = {**case, **prediction, "benchmark_context": benchmark_context, "status": status, "failure_reason": status, "n_candidates": 0, "input_image_path": "", **_case_provenance(context, target_session, backend=backend, segmentation_parameters=segmentation_parameters, backend_runtime=backend_runtime)}
         return base, [], None, {}
     image = image_cache.setdefault(str(image_path), _load_tif(image_path))
     bounds = compute_crop_bounds(prediction["predicted_xyz"], image.shape, crop_shape_zyx)
@@ -822,7 +894,7 @@ def _run_case(
         )
     except BackendUnavailable as exc:
         status = "backend_unavailable"
-        base = {**case, **prediction, "benchmark_context": benchmark_context, "status": status, "failure_reason": str(exc), "n_candidates": 0, "input_image_path": str(image_path), **_case_provenance(context, target_session, backend=backend, segmentation_parameters=segmentation_parameters)}
+        base = {**case, **prediction, "benchmark_context": benchmark_context, "status": status, "failure_reason": str(exc), "n_candidates": 0, "input_image_path": str(image_path), **_case_provenance(context, target_session, backend=backend, segmentation_parameters=segmentation_parameters, backend_runtime=backend_runtime)}
         return base, [], None, {"crop": crop, "bounds": bounds, "image_path": image_path}
     expected = _estimate_expected_volume(observations, target_index, lookup)
     ranked = rank_candidates(candidates, prediction["predicted_xyz"], context.spacing_zyx, expected if np.isfinite(expected) else None)
@@ -832,7 +904,7 @@ def _run_case(
         status = "multiple_candidates"
     selected = ranked[0] if ranked else None
     for candidate in ranked:
-        candidate.update({"mouse": case.get("mouse", "unknown"), "run": context.run_dir.name, "track_id": case["track_id"], "track_uid": case["track_uid"], "source_session": source_session, "target_session": target_session, "source_roi_id": source_label, "target_truth_roi_id": case.get("target_truth_roi_id", ""), "predicted_x": prediction["predicted_xyz"][0], "predicted_y": prediction["predicted_xyz"][1], "predicted_z": prediction["predicted_xyz"][2], "transform_method": prediction["transform_method"], "transform_paths": json.dumps(prediction["transform_paths"]), "transform_fallback_reason": prediction["transform_fallback_reason"], "crop_start_zyx": list(bounds.start_zyx), "crop_stop_zyx": list(bounds.stop_zyx), "threshold": threshold, **_case_provenance(context, target_session, backend=backend, segmentation_parameters=segmentation_parameters)})
+        candidate.update({"mouse": case.get("mouse", "unknown"), "run": context.run_dir.name, "track_id": case["track_id"], "track_uid": case["track_uid"], "source_session": source_session, "target_session": target_session, "source_roi_id": source_label, "target_truth_roi_id": case.get("target_truth_roi_id", ""), "predicted_x": prediction["predicted_xyz"][0], "predicted_y": prediction["predicted_xyz"][1], "predicted_z": prediction["predicted_xyz"][2], "transform_method": prediction["transform_method"], "transform_paths": json.dumps(prediction["transform_paths"]), "transform_fallback_reason": prediction["transform_fallback_reason"], "crop_start_zyx": list(bounds.start_zyx), "crop_stop_zyx": list(bounds.stop_zyx), "threshold": threshold, **_case_provenance(context, target_session, backend=backend, segmentation_parameters=segmentation_parameters, backend_runtime=backend_runtime)})
     truth_metrics: dict[str, Any] = {}
     bias: dict[str, Any] = {}
     truth_mask = None
@@ -919,7 +991,7 @@ def _run_case(
                 truth_ratio = truth_green / truth_red if np.isfinite(truth_green) and np.isfinite(truth_red) and truth_red else np.nan
                 rescue_ratio = rescue_green / rescue_red if np.isfinite(rescue_green) and np.isfinite(rescue_red) and rescue_red else np.nan
                 bias = {"raw_mask_mean_green_original": truth_green, "raw_mask_mean_green_rescued": rescue_green, "raw_mask_mean_green_absolute_difference": abs(rescue_green - truth_green), "raw_mask_mean_green_relative_difference": (rescue_green - truth_green) / truth_green if truth_green else np.nan, "raw_mask_mean_red_original": truth_red, "raw_mask_mean_red_rescued": rescue_red, "raw_mask_mean_red_absolute_difference": abs(rescue_red - truth_red), "raw_mask_mean_red_relative_difference": (rescue_red - truth_red) / truth_red if truth_red else np.nan, "raw_mask_ratio_original": truth_ratio, "raw_mask_ratio_rescued": rescue_ratio, "raw_mask_ratio_absolute_difference": abs(rescue_ratio - truth_ratio), "raw_mask_ratio_relative_difference": (rescue_ratio - truth_ratio) / truth_ratio if truth_ratio else np.nan, "eclipse_original": np.nan, "eclipse_rescued": np.nan}
-    base = {**case, **prediction, "benchmark_context": benchmark_context, "status": status, "failure_reason": "" if status in {"candidate_generated", "multiple_candidates"} else status, "n_candidates": len(ranked), "selected_candidate_id": selected["candidate_id"] if selected else np.nan, "crop_center_xyz": prediction["predicted_xyz"], "crop_start_zyx": list(bounds.start_zyx), "crop_stop_zyx": list(bounds.stop_zyx), "crop_shape_zyx": list(bounds.shape_zyx), "crop_physical_size_um": (np.asarray(bounds.shape_zyx) * context.spacing_zyx).tolist(), "edge_clipping": bounds.edge_clipped, "input_image_path": str(image_path), "input_image_hash": context.image_hashes.get(target_session, {}).get("red_sha256", ""), "threshold": threshold, "voxel_spacing_zyx_um": list(context.spacing_zyx), **truth_metrics, **bias, **_case_provenance(context, target_session, backend=backend, segmentation_parameters=segmentation_parameters)}
+    base = {**case, **prediction, "benchmark_context": benchmark_context, "status": status, "failure_reason": "" if status in {"candidate_generated", "multiple_candidates"} else status, "n_candidates": len(ranked), "selected_candidate_id": selected["candidate_id"] if selected else np.nan, "crop_center_xyz": prediction["predicted_xyz"], "crop_start_zyx": list(bounds.start_zyx), "crop_stop_zyx": list(bounds.stop_zyx), "crop_shape_zyx": list(bounds.shape_zyx), "crop_physical_size_um": (np.asarray(bounds.shape_zyx) * context.spacing_zyx).tolist(), "edge_clipping": bounds.edge_clipped, "input_image_path": str(image_path), "input_image_hash": context.image_hashes.get(target_session, {}).get("red_sha256", ""), "threshold": threshold, "voxel_spacing_zyx_um": list(context.spacing_zyx), **truth_metrics, **bias, **_case_provenance(context, target_session, backend=backend, segmentation_parameters=segmentation_parameters, backend_runtime=backend_runtime)}
     return base, ranked, selected, {"truth_mask": truth_mask, "candidate_labels": labels, "crop": crop, "bounds": bounds, "image_path": image_path}
 
 
@@ -934,7 +1006,8 @@ def _write_pngs(output_dir: Path, records: list[dict[str, Any]], artifacts: list
     plot_dir = output_dir / "summary_plots"
     panel_dir.mkdir(parents=True, exist_ok=True)
     plot_dir.mkdir(parents=True, exist_ok=True)
-    for index, item in enumerate(artifacts[:12]):
+    review_items = _select_review_artifacts(artifacts, synthetic=synthetic)
+    for index, item in enumerate(review_items):
         record, selected, arrays = item
         if not arrays:
             continue
@@ -991,6 +1064,36 @@ def _write_pngs(output_dir: Path, records: list[dict[str, Any]], artifacts: list
     return panel_dir, plot_dir
 
 
+def _select_review_artifacts(artifacts: list[dict[str, Any]], *, synthetic: bool) -> list[dict[str, Any]]:
+    """Choose a deterministic, category-aware bounded review set."""
+
+    if not artifacts:
+        return []
+    chosen: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    categories = ["correct_identity_good_mask", "correct_identity_poor_mask", "wrong_neighbor_identity", "merged_multiple_cells", "ambiguous_identity", "no_canonical_overlap", "no_candidate"]
+    for category in categories:
+        for index, item in enumerate(artifacts):
+            if index not in seen and (not synthetic or item[0].get("identity_category") == category):
+                chosen.append(item); seen.add(index); break
+    finite = [(index, float(item[0].get("dice_3d", np.nan))) for index, item in enumerate(artifacts) if index not in seen and np.isfinite(_finite(item[0].get("dice_3d")))]
+    if finite:
+        for index in {min(finite, key=lambda value: value[1])[0], max(finite, key=lambda value: value[1])[0], finite[len(finite) // 2][0]}:
+            if index not in seen:
+                chosen.append(artifacts[index]); seen.add(index)
+    errors = [(index, _finite(item[0].get("centroid_error_um"))) for index, item in enumerate(artifacts) if index not in seen and np.isfinite(_finite(item[0].get("centroid_error_um")))]
+    if errors:
+        index = max(errors, key=lambda value: value[1])[0]
+        if index not in seen:
+            chosen.append(artifacts[index]); seen.add(index)
+    for index, item in enumerate(artifacts):
+        if len(chosen) >= 12:
+            break
+        if index not in seen:
+            chosen.append(item); seen.add(index)
+    return chosen[:12]
+
+
 def _summary(records: list[dict[str, Any]], candidates: list[dict[str, Any]], mode: str, context: RunContext, seed: int) -> dict[str, Any]:
     table = pd.DataFrame(records)
     summary: dict[str, Any] = {"mode": mode, "mouse": context.run_dir.parts[-5] if len(context.run_dir.parts) >= 5 else "unknown", "run": context.run_dir.name, "n_eligible": len(records), "n_attempted": len(records), "n_with_candidate": int(table.get("n_candidates", pd.Series(dtype=float)).gt(0).sum()) if not table.empty else 0, "n_multiple_candidates": int(table.get("status", pd.Series(dtype=str)).eq("multiple_candidates").sum()) if not table.empty else 0, "n_no_candidate": int(table.get("status", pd.Series(dtype=str)).eq("no_segmentation_object").sum()) if not table.empty else 0, "status_counts": table.get("status", pd.Series(dtype=str)).value_counts().to_dict() if not table.empty else {}, "random_seed": seed, "proposal_only": True, "segmentation_model": "backend-selected", "canonical_outputs_modified": False, "state_variables_used_for_identity": False}
@@ -1005,29 +1108,35 @@ def _summary(records: list[dict[str, Any]], candidates: list[dict[str, Any]], mo
             elif column == "volume_ratio_rescue_to_truth": summary["median_volume_ratio"] = float(numeric.median()) if numeric.notna().any() else np.nan
             elif column == "wrong_neighbor": summary["wrong_neighbor_rate"] = float(values.fillna(False).mean()) if len(values) else np.nan
         if "identity_category" in table:
-            summary["identity_categories"] = table["identity_category"].value_counts(dropna=False).to_dict()
-            summary["correct_identity_good_mask_rate"] = float(table["identity_category"].eq("correct_identity_good_mask").mean()) if len(table) else np.nan
-            summary["correct_identity_poor_mask_rate"] = float(table["identity_category"].eq("correct_identity_poor_mask").mean()) if len(table) else np.nan
-            summary["wrong_neighbor_identity_rate"] = float(table["identity_category"].eq("wrong_neighbor_identity").mean()) if len(table) else np.nan
+            categories = table["identity_category"]
+            summary["identity_categories"] = categories.value_counts(dropna=False).to_dict()
+            summary["correct_identity_good_mask_rate"] = float(categories.eq("correct_identity_good_mask").mean()) if len(table) else np.nan
+            summary["correct_identity_poor_mask_rate"] = float(categories.eq("correct_identity_poor_mask").mean()) if len(table) else np.nan
+            summary["identity_correct_rate"] = float(categories.isin(["correct_identity_good_mask", "correct_identity_poor_mask"]).mean()) if len(table) else np.nan
+            summary["good_mask_rate"] = summary["correct_identity_good_mask_rate"]
+            summary["wrong_neighbor_identity_rate"] = float(categories.eq("wrong_neighbor_identity").mean()) if len(table) else np.nan
+            summary["merged_multiple_cells_rate"] = float(categories.eq("merged_multiple_cells").mean()) if len(table) else np.nan
+            summary["ambiguous_identity_rate"] = float(categories.eq("ambiguous_identity").mean()) if len(table) else np.nan
+            summary["no_canonical_overlap_rate"] = float(categories.eq("no_canonical_overlap").mean()) if len(table) else np.nan
     return summary
 
 
 def _write_report(output_dir: Path, context: RunContext, mode: str, summary: dict[str, Any], focused_note: str = "") -> Path:
     report = output_dir / OUTPUT_REPORT
-    lines = [f"# Phase D1 Local Segmentation Rescue Report (2026-09-15)", "", "## STARTING/ENDING COMMIT", f"- Canonical run provenance commit: `{context.git_commit}`", f"- Evaluator repository commit: `{_git_commit()}`", f"- Mode: `{mode}`", "", "## IMPLEMENTATION", f"- Module: `postprocessing/local_segmentation_rescue.py`", f"- Segmenter: `{SEGMENTER_NAME}`", f"- Spacing (ZYX um): `{context.spacing_zyx}` ({context.spacing_source})", f"- Crop: `{DEFAULT_CROP_SHAPE_ZYX}` voxels, configurable via CLI", "- Transform evidence: direct, composed, fallback, or unavailable; prediction and ranking are state-free.", "- Truth leakage: target label/mask is loaded only after candidate segmentation for synthetic evaluation.", "", "## BENCHMARK/PROPOSALS", f"- Eligible/attempted: `{summary.get('n_eligible', 0)}` / `{summary.get('n_attempted', 0)}`", f"- Candidate generated: `{summary.get('n_with_candidate', 0)}`; multiple: `{summary.get('n_multiple_candidates', 0)}`; no candidate: `{summary.get('n_no_candidate', 0)}`", f"- Status counts: `{summary.get('status_counts', {})}`"]
+    lines = [f"# Phase D1 Local Segmentation Rescue Report (2026-09-15)", "", "## STARTING/ENDING COMMIT", f"- Canonical run provenance commit: `{context.git_commit}`", f"- Evaluator repository commit: `{_git_commit()}`", f"- Mode: `{mode}`", "", "## IMPLEMENTATION", f"- Module: `postprocessing/local_segmentation_rescue.py`", f"- Segmenter backend: `{summary.get('backend', 'unknown')}`", f"- Spacing (ZYX um): `{context.spacing_zyx}` ({context.spacing_source})", f"- Crop: `{DEFAULT_CROP_SHAPE_ZYX}` voxels, configurable via CLI", "- Transform evidence: direct, composed, fallback, or unavailable; prediction and ranking are state-free.", "- Truth leakage: target label/mask is loaded only after candidate segmentation for synthetic evaluation.", "", "## BENCHMARK/PROPOSALS", f"- Eligible/attempted: `{summary.get('n_eligible', 0)}` / `{summary.get('n_attempted', 0)}`", f"- Candidate generated: `{summary.get('n_with_candidate', 0)}`; multiple: `{summary.get('n_multiple_candidates', 0)}`; no candidate: `{summary.get('n_no_candidate', 0)}`", f"- Status counts: `{summary.get('status_counts', {})}`"]
     if mode == "synthetic_benchmark":
-        lines += [f"- Correct-cell rate: `{summary.get('correct_cell_rate', np.nan)}`", f"- Median/P90 centroid error (um): `{summary.get('median_centroid_error_um', np.nan)}` / `{summary.get('p90_centroid_error_um', np.nan)}`", f"- Median Dice/IoU: `{summary.get('median_dice', np.nan)}` / `{summary.get('median_iou', np.nan)}`", f"- Median volume ratio: `{summary.get('median_volume_ratio', np.nan)}`"]
+        lines += [f"- Identity-correct rate: `{summary.get('identity_correct_rate', np.nan)}`", f"- Good-mask rate: `{summary.get('good_mask_rate', np.nan)}`", f"- Wrong-neighbor identity rate: `{summary.get('wrong_neighbor_identity_rate', np.nan)}`", f"- Merged/ambiguous rates: `{summary.get('merged_multiple_cells_rate', np.nan)}` / `{summary.get('ambiguous_identity_rate', np.nan)}`", f"- Median/P90 centroid error (um): `{summary.get('median_centroid_error_um', np.nan)}` / `{summary.get('p90_centroid_error_um', np.nan)}`", f"- Median Dice/IoU: `{summary.get('median_dice', np.nan)}` / `{summary.get('median_iou', np.nan)}`", f"- Median volume ratio: `{summary.get('median_volume_ratio', np.nan)}`"]
     lines += ["", "## MEASUREMENT BIAS", "- Green/Red/ratio are evaluation-only; ECLIPSE fields remain unavailable unless supplied by an existing extraction table.", f"- Measurement-bias table: `{summary.get('output_paths', {}).get('measurement_bias', '')}`", "", "## REVIEW ARTIFACTS", f"- Panels: `{summary.get('review_panel_dir', '')}`", f"- Summary plots: `{summary.get('summary_plot_dir', '')}`", "", "## HARD CONSTRAINTS", "- Canonical masks/tracks/track IDs changed: **NO**", "- Matching thresholds or ECLIPSE calculation changed: **NO**", "- ECLIPSE/Green/Red/state used for identity: **NO**", "- Rescued masks or measurements written to primary extraction: **NO**", "", "## CONCLUSION", "- Production acceptance threshold: **not defined in Phase D1**", "- Scientific promise: **UNCERTAIN pending benchmark distributions and review**", "- Next step: inspect review PNGs and benchmark distributions before any production gate.", "", focused_note]
     report.write_text("\n".join(lines) + "\n", encoding="utf-8")
     fix_lines = [
         "# Phase D1 Local Segmentation Rescue Fix Report (2026-09-15)", "",
-        "- baseline: `e803388`", f"- ending commit: `{_git_commit()}`", "- commits created: validity hardening", "",
+        "- baseline: `fe80523`", f"- ending commit: `{_git_commit()}`", "- commits created: post-fe80523 validity hardening", "",
         "## TRUTH LEAKAGE", "- target truth volume used before selection: **NO**", "- target truth mask used before selection: **NO**", "- synthetic and real ranking semantics aligned: **YES**", "",
-        "## BENCHMARK CONTEXT", f"- endpoint_one_sided n: `{summary.get('n_eligible', 0) if mode == 'synthetic_benchmark' else 0}`", "- internal_gap_two_sided n: `0`", "- metrics reported separately: **YES**", "",
-        "## SEGMENTER", f"- scientific backend: `{summary.get('backend', CELLPOSE_BACKEND)}`", f"- model/version: `{summary.get('cellpose_model') or 'threshold baseline'}`", f"- device: `{summary.get('cellpose_device') or 'cpu'}`", "- threshold backend retained only as baseline/test: **YES**", "",
-        "## IDENTITY METRICS", f"- correct identity rate: `{summary.get('correct_identity_good_mask_rate', np.nan)}`", f"- wrong neighbor identity rate: `{summary.get('wrong_neighbor_identity_rate', np.nan)}`", f"- ambiguous/merge rate: `{summary.get('identity_categories', {})}`", f"- correct identity but poor-mask rate: `{summary.get('correct_identity_poor_mask_rate', np.nan)}`", "",
+        "## BENCHMARK CONTEXT", f"- endpoint_one_sided n: `{summary.get('n_eligible', 0) if mode == 'synthetic_benchmark' else 0}`", "- internal_gap_two_sided n: `0`", "- metrics reported separately: **YES**", "- trust criteria: consensus track, no cycle conflict/unchecked edge, reliable transform, non-edge target, stable context, bounded distance/ambiguity", f"- trusted eligible/excluded: `{summary.get('synthetic_trusted_eligible', np.nan)}` / `{summary.get('synthetic_trusted_excluded', np.nan)}`", "",
+        "## SEGMENTER", f"- scientific backend: `{summary.get('backend', CELLPOSE_BACKEND)}`", f"- model/version: `{summary.get('cellpose_model') or 'threshold baseline'}` / `{summary.get('backend_runtime', {}).get('cellpose_version', 'n/a')}`", f"- device: `{summary.get('backend_runtime', {}).get('resolved_device', summary.get('cellpose_device') or 'cpu')}`", "- threshold backend retained only as baseline/test: **YES**", "",
+        "## IDENTITY METRICS", f"- identity correct rate: `{summary.get('identity_correct_rate', np.nan)}`", f"- wrong neighbor identity rate: `{summary.get('wrong_neighbor_identity_rate', np.nan)}`", f"- ambiguous/merge rates: `{summary.get('ambiguous_identity_rate', np.nan)}` / `{summary.get('merged_multiple_cells_rate', np.nan)}`", f"- correct identity but poor-mask rate: `{summary.get('correct_identity_poor_mask_rate', np.nan)}`", "",
         "## MASK METRICS", f"- median Dice: `{summary.get('median_dice', np.nan)}`", f"- median IoU: `{summary.get('median_iou', np.nan)}`", f"- median centroid error: `{summary.get('median_centroid_error_um', np.nan)}`", f"- median volume ratio: `{summary.get('median_volume_ratio', np.nan)}`", "",
-        "## REAL PROPOSALS", f"- source artifact: `{summary.get('endpoint_classification') or 'unavailable'}`", f"- evaluator no_mask_near_prediction count: `{summary.get('n_eligible', 0) if mode == 'real_proposals' else 0}`", f"- eligible: `{summary.get('n_eligible', 0) if mode == 'real_proposals' else 0}`", f"- attempted: `{summary.get('n_attempted', 0) if mode == 'real_proposals' else 0}`", "- generic-gap fallback used: **NO**", "",
+        "## REAL PROPOSALS", f"- evaluator artifact: `{summary.get('endpoint_classification') or 'unavailable'}`", f"- artifact SHA256: `{summary.get('classification_source_sha256') or 'n/a'}`", f"- evaluator no_mask_near_prediction rows: `{summary.get('evaluator_no_mask_near_prediction_rows', 0)}`", f"- rows parsed successfully: `{summary.get('rows_parsed_successfully', 0)}`", f"- eligible/attempted: `{summary.get('n_eligible', 0) if mode == 'real_proposals' else 0}` / `{summary.get('n_attempted', 0) if mode == 'real_proposals' else 0}`", f"- target derived from end_session_index + 1: **{'YES' if summary.get('target_derived_from_end_session_index_plus_one') else 'NO/UNAVAILABLE'}**", "- generic-gap fallback used: **NO**", "",
         "## MEASUREMENT BIAS", "- production extraction semantics reused: **NO; outputs are explicitly raw_mask_mean diagnostics**", "",
         "## TESTS", "- focused: run by validation command", "- full suite: run by validation command", "",
         "## HARD CONSTRAINTS", "- canonical masks changed: **NO**", "- canonical tracks changed: **NO**", "- track IDs changed: **NO**", "- matcher thresholds changed: **NO**", "- state/intensity used for identity: **NO**", "- primary extraction changed: **NO**", "- runner executable mode: **100755**", "",
@@ -1070,23 +1179,50 @@ def evaluate(
     crop_shape = tuple(int(v) for v in crop_shape_zyx)
     if len(crop_shape) != 3:
         raise ValueError("crop_shape_zyx must contain three values")
+    preflight_error = ""
+    try:
+        backend_runtime = _preflight_backend(
+            backend, device=cellpose_device, min_size=cellpose_min_size,
+            do_3d=cellpose_do_3d, z_axis=cellpose_z_axis,
+            channel_axis=cellpose_channel_axis,
+        )
+    except BackendUnavailable as exc:
+        backend_runtime = {"resolved_device": "unavailable", "error": str(exc)}
+        preflight_error = str(exc)
     lookup = _feature_lookup(context)
     graph = TransformGraph(context.transforms)
-    cases = _eligible_synthetic_cases(context) if mode == "synthetic_benchmark" else _find_real_cases(context, sample_size, seed, endpoint_classification)
+    endpoint_path = Path(endpoint_classification).expanduser().resolve() if endpoint_classification else next((candidate.resolve() for candidate in (context.run_dir / "endpoint_classification.csv", context.matching_dir / "endpoint_classification.csv") if candidate.is_file()), None)
+    endpoint_artifact_available = bool(endpoint_path and endpoint_path.is_file())
+    evaluator_row_count = 0
+    if endpoint_artifact_available:
+        try:
+            endpoint_frame = pd.read_csv(endpoint_path, low_memory=False)
+            endpoint_column = next((column for column in ("classification", "endpoint_class", "evaluator_class") if column in endpoint_frame.columns), None)
+            if endpoint_column is not None:
+                evaluator_row_count = int(endpoint_frame[endpoint_column].astype(str).str.strip().str.casefold().eq("no_mask_near_prediction").sum())
+        except Exception:
+            evaluator_row_count = 0
+    if mode == "synthetic_benchmark":
+        cases, synthetic_excluded = _eligible_synthetic_cases_with_audit(context)
+        endpoint_all_cases: list[dict[str, Any]] = []
+    else:
+        synthetic_excluded = 0
+        endpoint_all_cases = _find_real_cases(context, None, seed, endpoint_path)
+        cases = _sample_cases(endpoint_all_cases, sample_size, seed)
     cases = _sample_cases(cases, sample_size, seed) if mode == "synthetic_benchmark" else cases
+    eligible_case_count = len(cases)
     records: list[dict[str, Any]] = []
     candidate_records: list[dict[str, Any]] = []
     artifacts: list[dict[str, Any]] = []
     image_cache: dict[str, np.ndarray] = {}
     mask_cache: dict[str, np.ndarray] = {}
-    for case in cases:
+    for case in ([] if preflight_error else cases):
         case = {**case, "random_seed": int(seed)}
-        record, candidates, selected, arrays = _run_case(context, case, synthetic=mode == "synthetic_benchmark", crop_shape_zyx=crop_shape, threshold_percentile=threshold_percentile, min_voxels=min_voxels, backend=backend, cellpose_min_size=cellpose_min_size, cellpose_device=cellpose_device, cellpose_do_3d=cellpose_do_3d, cellpose_z_axis=cellpose_z_axis, cellpose_channel_axis=cellpose_channel_axis, lookup=lookup, graph=graph, image_cache=image_cache, mask_cache=mask_cache)
+        record, candidates, selected, arrays = _run_case(context, case, synthetic=mode == "synthetic_benchmark", crop_shape_zyx=crop_shape, threshold_percentile=threshold_percentile, min_voxels=min_voxels, backend=backend, cellpose_min_size=cellpose_min_size, cellpose_device=cellpose_device, cellpose_do_3d=cellpose_do_3d, cellpose_z_axis=cellpose_z_axis, cellpose_channel_axis=cellpose_channel_axis, backend_runtime=backend_runtime, lookup=lookup, graph=graph, image_cache=image_cache, mask_cache=mask_cache)
         records.append(record)
         candidate_records.extend(candidates)
-        # Keep only a small review sample in memory; the full benchmark stays
-        # in compact CSV rows rather than retaining every 3-D crop.
-        if arrays and len(artifacts) < 12:
+        # Keep a bounded pool in memory; final panels are category-aware.
+        if arrays and len(artifacts) < 64:
             artifacts.append((record, selected, arrays))
     cases_path = root / ("synthetic_hide_rescue_cases.csv" if mode == "synthetic_benchmark" else "local_rescue_real_cases.csv")
     candidates_path = root / ("synthetic_hide_rescue_candidates.csv" if mode == "synthetic_benchmark" else "local_rescue_real_candidates.csv")
@@ -1099,7 +1235,17 @@ def evaluate(
         bias_columns = [column for column in pd.DataFrame(records).columns if any(token in column for token in ("green_", "red_", "ratio_", "eclipse_"))]
         pd.DataFrame(records, columns=["track_uid", "target_session", *bias_columns]).to_csv(root / "synthetic_hide_rescue_measurement_bias.csv", index=False)
     summary = _summary(records, candidate_records, mode, context, seed)
-    summary.update({"output_dir": str(root), "output_paths": {"cases": str(cases_path), "candidates": str(candidates_path), "metrics": str(metrics_path) if mode == "synthetic_benchmark" else None, "measurement_bias": str(root / "synthetic_hide_rescue_measurement_bias.csv") if mode == "synthetic_benchmark" else None, "summary": str(summary_path)}, "crop_shape_zyx": list(crop_shape), "threshold_percentile": threshold_percentile, "min_voxels": min_voxels, "backend": backend, "cellpose_model": "cpsam_v2" if backend == CELLPOSE_BACKEND else None, "cellpose_device": cellpose_device if backend == CELLPOSE_BACKEND else None, "endpoint_classification": str(endpoint_classification) if endpoint_classification else None, "real_case_source": "endpoint_evaluator" if mode == "real_proposals" and cases else "unavailable" if mode == "real_proposals" else None, "generic_gap_fallback_used": False})
+    summary.update({"output_dir": str(root), "output_paths": {"cases": str(cases_path), "candidates": str(candidates_path), "metrics": str(metrics_path) if mode == "synthetic_benchmark" else None, "measurement_bias": str(root / "synthetic_hide_rescue_measurement_bias.csv") if mode == "synthetic_benchmark" else None, "summary": str(summary_path)}, "crop_shape_zyx": list(crop_shape), "threshold_percentile": threshold_percentile, "min_voxels": min_voxels, "backend": backend, "cellpose_model": "cpsam_v2" if backend == CELLPOSE_BACKEND else None, "cellpose_device": cellpose_device if backend == CELLPOSE_BACKEND else None, "backend_runtime": backend_runtime, "backend_preflight_error": preflight_error, "endpoint_classification": str(endpoint_path) if endpoint_path else None, "classification_source_path": str(endpoint_path) if endpoint_path else None, "classification_source_sha256": _sha256(endpoint_path) if endpoint_path and endpoint_path.is_file() else None, "evaluator_artifact_available": endpoint_artifact_available if mode == "real_proposals" else None, "evaluator_no_mask_near_prediction_rows": evaluator_row_count if mode == "real_proposals" else None, "rows_parsed_successfully": len(endpoint_all_cases) if mode == "real_proposals" else None, "target_derived_from_end_session_index_plus_one": True if mode == "real_proposals" and endpoint_all_cases else None, "real_case_source": "endpoint_evaluator" if mode == "real_proposals" and cases else "unavailable" if mode == "real_proposals" else None, "generic_gap_fallback_used": False, "synthetic_trusted_eligible": len(cases) if mode == "synthetic_benchmark" else None, "synthetic_trusted_excluded": synthetic_excluded if mode == "synthetic_benchmark" else None})
+    if preflight_error:
+        summary["n_eligible"] = eligible_case_count
+        summary["n_attempted"] = 0
+        summary["backend_failures"] = 1
+    if preflight_error:
+        summary["status"] = "backend_unavailable"
+    elif mode == "real_proposals" and not endpoint_artifact_available:
+        summary["status"] = "evaluator_artifact_unavailable"
+    elif mode == "real_proposals" and not endpoint_all_cases:
+        summary["status"] = "no_valid_evaluator_rows"
     summary_path.write_text(json.dumps(summary, indent=2, default=lambda value: value.item() if isinstance(value, np.generic) else str(value)) + "\n", encoding="utf-8")
     panel_dir, plot_dir = _write_pngs(root, records, artifacts, synthetic=mode == "synthetic_benchmark")
     summary["review_panel_dir"] = str(panel_dir)
@@ -1132,7 +1278,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     summary = evaluate(args.run_dir, args.output_dir, mode=args.mode, sample_size=args.sample_size, seed=args.seed, crop_shape_zyx=args.crop_shape_zyx, threshold_percentile=args.threshold_percentile, min_voxels=args.min_voxels, backend=args.backend, cellpose_min_size=args.cellpose_min_size, cellpose_device=args.cellpose_device, cellpose_z_axis=args.cellpose_z_axis, cellpose_channel_axis=args.cellpose_channel_axis, endpoint_classification=args.endpoint_classification)
     print(json.dumps(summary, indent=2, default=lambda value: value.item() if isinstance(value, np.generic) else str(value)))
-    return 0
+    return 2 if summary.get("status") in {"backend_unavailable", "evaluator_artifact_unavailable", "no_valid_evaluator_rows"} else 0
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised through CLI

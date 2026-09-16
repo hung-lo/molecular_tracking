@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
 from postprocessing.local_segmentation_rescue import (
     RunContext,
     TransformGraph,
+    BackendUnavailable,
+    _preflight_backend,
     _predict_target,
+    _find_real_cases,
     compute_crop_bounds,
     dice_iou,
     rank_candidates,
@@ -78,6 +82,29 @@ def test_prediction_context_is_explicit_and_one_sided_ignores_future():
     two = _predict_target(context, observations, 1, lookup, graph, benchmark_context="internal_gap_two_sided")
     assert one["predicted_xyz"] == [0.0, 0.0, 0.0]
     assert two["predicted_xyz"] == [50.0, 0.0, 0.0]
+
+
+def test_real_evaluator_schema_derives_immediate_next_target(tmp_path: Path):
+    sessions = pd.DataFrame([{"session_id": f"s{i}", "session_index": i} for i in range(3)])
+    context = RunContext(Path("/tmp/run"), Path("/tmp/matching"), pd.DataFrame(), pd.DataFrame(), sessions, pd.DataFrame(), (1, 1, 1), "test", {}, "", "", "", {})
+    artifact = tmp_path / "endpoint_classification.csv"
+    pd.DataFrame([{"endpoint_id": "e1", "track_uid": "t1", "end_session_index": 1, "end_session_id": "s1", "end_label": 7, "classification": "no_mask_near_prediction"}]).to_csv(artifact, index=False)
+    cases = _find_real_cases(context, None, 0, artifact)
+    assert len(cases) == 1
+    assert cases[0]["source_session_index"] == 1
+    assert cases[0]["target_session_index"] == 2
+    assert cases[0]["target_session"] == "s2"
+    assert cases[0]["classification_source_sha256"]
+
+
+def test_cellpose_preflight_fails_cleanly_when_backend_is_missing():
+    try:
+        _preflight_backend("cellpose_sam", device="cuda")
+    except BackendUnavailable:
+        return
+    # A configured Cellpose environment is also valid; the test only asserts
+    # that preflight does not silently return the threshold backend.
+    assert _preflight_backend("cellpose_sam", device="cpu")["pretrained_model"] == "cpsam_v2"
 
 
 def test_transform_graph_direct_and_composed_provenance():

@@ -1,7 +1,7 @@
 from pathlib import Path
 import shutil
 import pytest
-from dataset_catalog import build_manifest_plan, discover_catalog
+from dataset_catalog import _is_vol10_acquisition, build_manifest_plan, discover_catalog
 from project_config import load_project_config
 
 FIX=Path(__file__).parent/"fixtures"/"thorimage"
@@ -50,7 +50,68 @@ def test_missing_experiment_xml_acquisition_is_preserved_and_failed(tmp_path):
     assert rows[0]["settings_qc_pass"] is False
     assert rows[0]["analysis_eligible"] is False
     assert "missing Experiment.xml" in rows[0]["settings_qc_reason"]
-    assert any(error["code"] == "missing_experiment_xml" for error in report["errors"])
+    assert any(error["code"] == "missing_experiment_xml" for error in report["row_ineligible"])
+
+
+def test_vol10_is_token_aware_and_excluded_from_catalog_qc(tmp_path):
+    config, raw = _project(tmp_path)
+    _acq(raw, "session_20260819", "filed_vol10", "square_1050.xml")
+    _acq(raw, "session_20260819", "filed_vol100", "square_1050.xml")
+    rows, report = discover_catalog(config)
+    by_id = {row["acquisition_id"]: row for row in rows}
+    assert _is_vol10_acquisition("vol10") and _is_vol10_acquisition("field_vol10_extra")
+    assert not _is_vol10_acquisition("vol100") and not _is_vol10_acquisition("vol105")
+    assert by_id["filed_vol10"]["is_vol10_control"] is True
+    assert by_id["filed_vol10"]["settings_qc_status"] == "not_applicable_vol10"
+    assert by_id["filed_vol10"]["settings_qc_pass"] is None
+    assert by_id["filed_vol100"]["is_vol10_control"] is False
+    assert report["summary"]["mouse_1"]["vol10_excluded"] == 1
+
+
+def test_vol10_missing_xml_does_not_block_valid_manifest(tmp_path):
+    config, raw = _project(tmp_path)
+    _acq(raw, "session_20260819", "filed_vol50", "square_1050.xml")
+    (raw / "folder" / "session_20260820" / "filed_vol50").mkdir(parents=True)
+    (raw / "folder" / "session_20260821" / "filed_vol10").mkdir(parents=True)
+    rows, report = discover_catalog(config)
+    assert {row["role"] for row in rows} == {"canonical", "missing_xml", "alignment_only"}
+    assert not report["errors"]
+    assert any(item["code"] == "missing_experiment_xml" for item in report["row_ineligible"])
+    plan, ready = build_manifest_plan(config, rows, "mouse_1")
+    assert not ready
+    assert "session_20260819" in plan.read_text()
+    assert "session_20260820" not in plan.read_text()
+    assert "session_20260821" not in plan.read_text()
+
+
+def test_malformed_xml_does_not_block_valid_manifest(tmp_path):
+    config, raw = _project(tmp_path)
+    _acq(raw, "session_20260819", "filed_vol50", "square_1050.xml")
+    malformed = raw / "folder" / "session_20260820" / "filed_vol50"
+    malformed.mkdir(parents=True)
+    (malformed / "Experiment.xml").write_text("<Experiment>", encoding="utf-8")
+    rows, report = discover_catalog(config)
+    assert any(row["role"] == "malformed_xml" for row in rows)
+    assert not report["errors"]
+    assert any(item["code"] == "malformed_xml" for item in report["row_ineligible"])
+    plan, _ = build_manifest_plan(config, rows, "mouse_1")
+    assert "session_20260819" in plan.read_text()
+
+
+def test_unconfigured_fucci_requires_explicit_manifest_configuration(tmp_path):
+    config, raw = _project(tmp_path)
+    config.paths.mice_csv.write_text(
+        "mouse_id,experimental_group,cohort,raw_mouse_folder,reference_session_or_folder\n"
+        "Fucci-Tri_4,group,cohort,folder,\n"
+    )
+    _acq(raw, "session_20260819", "filed_vol50", "square_1050.xml")
+    rows, report = discover_catalog(config)
+    assert rows[0]["settings_qc_status"] == "not_configured"
+    assert rows[0]["settings_qc_pass"] is None
+    assert rows[0]["analysis_eligible"] is False
+    assert not report["errors"]
+    with pytest.raises(ValueError, match="No acquisition QC configuration"):
+        build_manifest_plan(config, rows, "Fucci-Tri_4")
 
 def test_alignment_and_pairing_and_plan(tmp_path):
     config,raw=_project(tmp_path)

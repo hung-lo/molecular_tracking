@@ -1,4 +1,4 @@
-from acquisition_settings_qc import acquisition_settings_qc, acquisition_settings_qc_table, validate_acquisition_row
+from acquisition_settings_qc import acquisition_settings_qc, acquisition_settings_qc_table, validate_acquisition_row, write_acquisition_settings_qc_artifacts
 
 
 def test_selected_laser_acquisition_changes_warn() -> None:
@@ -98,3 +98,25 @@ def test_non_configured_hard_failure_remains_failed_in_qc_table():
     assert bool(table.iloc[0]["analysis_eligible"]) is False
     assert "missing Experiment.xml" in table.iloc[0]["settings_qc_reason"]
     assert summary["status"] == "FAIL"
+
+
+def test_vol10_rows_are_excluded_from_qc_artifacts(tmp_path):
+    rows = [
+        _configured_row(acquisition_id="filed_vol10", pmt_a_gain=1, pockels_920_start_pct=1, pockels_920_stop_pct=1),
+        _configured_row(acquisition_id="filed_vol50"),
+    ]
+    rows[1]["laser_nm"] = 920
+    table, summary = write_acquisition_settings_qc_artifacts(rows, tmp_path)
+    assert table["acquisition_id"].tolist() == ["filed_vol50"]
+    assert summary["n_vol10_excluded"] == 1
+    assert summary["n_fail"] == 0
+    assert (tmp_path / "acquisition_settings_qc.png").is_file()
+
+
+def test_inactive_laser_zero_is_not_plotted_as_a_mismatch(tmp_path):
+    row = _configured_row(laser_nm=1050, pmt_b_gain=8, pockels_920_start_pct=0, pockels_920_stop_pct=0, pockels_1050_start_pct=60, pockels_1050_stop_pct=60)
+    table, summary = write_acquisition_settings_qc_artifacts([row], tmp_path)
+    assert summary["status"] == "FAIL"
+    assert table.iloc[0]["settings_qc_status"] == "fail"
+    # The plot is generated with the selected-laser mask; the inactive zero is not a QC failure point.
+    assert (tmp_path / "acquisition_settings_qc.png").stat().st_size > 0

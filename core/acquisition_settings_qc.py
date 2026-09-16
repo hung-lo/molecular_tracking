@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+import re
 from typing import Any, Mapping
 
 import pandas as pd
@@ -28,9 +29,11 @@ QC_COLUMNS = [
     "mouse_id", "session_id", "acquisition_date", "acquisition_id", "source_path", "laser_nm",
     "pmt_a_gain", "pmt_b_gain", "pockels_920_start_pct", "pockels_920_stop_pct",
     "pockels_1050_start_pct", "pockels_1050_stop_pct", "expected_pmt_gain_a", "expected_pmt_gain_b",
-    "expected_laser_920_power", "expected_laser_1050_power", "settings_qc_pass", "settings_qc_reason",
+    "expected_laser_920_power", "expected_laser_1050_power", "settings_qc_pass", "settings_qc_status", "settings_qc_reason",
     "analysis_eligible",
 ]
+
+_VOL10_RE = re.compile(r"(?<![A-Za-z0-9])vol10(?![A-Za-z0-9])", re.IGNORECASE)
 
 
 def _selected_laser(value: Any, wavelength: int) -> bool:
@@ -91,33 +94,56 @@ def acquisition_settings_qc_table(rows: list[dict[str, Any]], *, tolerance: floa
     """Return a deterministic per-acquisition QC table and summary."""
 
     records: list[dict[str, Any]] = []
+    n_vol10_excluded = 0
     for row in rows:
+        if bool(row.get("is_vol10_control")) or _VOL10_RE.search(str(row.get("acquisition_id", ""))):
+            n_vol10_excluded += 1
+            continue
+        if not row.get("analysis_included", True) and row.get("role") in {"alignment_only", "auxiliary_or_test", "noncanonical"}:
+            continue
         mouse_id = str(row.get("mouse_id", ""))
         expected = EXPECTED_ACQUISITION_SETTINGS.get(mouse_id, {})
-        if expected:
+        if row.get("role") in {"missing_xml", "malformed_xml"} and row.get("settings_qc_pass") is False:
+            result = {
+                "settings_qc_pass": False,
+                "analysis_eligible": False,
+                "settings_qc_status": "fail",
+                "settings_qc_reason": str(row.get("settings_qc_reason") or "acquisition metadata unavailable"),
+            }
+        elif expected:
             result = validate_acquisition_row(row, tolerance=tolerance)
+            result["settings_qc_status"] = "pass" if result["settings_qc_pass"] else "fail"
+        elif row.get("settings_qc_status") == "not_configured":
+            result = {
+                "settings_qc_pass": None,
+                "analysis_eligible": False,
+                "settings_qc_status": "not_configured",
+                "settings_qc_reason": str(row.get("settings_qc_reason") or "no acquisition QC configuration for Fucci mouse"),
+            }
         elif row.get("settings_qc_pass") is False:
             result = {
                 "settings_qc_pass": False,
                 "analysis_eligible": False,
+                "settings_qc_status": "fail",
                 "settings_qc_reason": str(row.get("settings_qc_reason") or "acquisition metadata unavailable"),
             }
         else:
-            result = {"settings_qc_pass": True, "analysis_eligible": bool(row.get("analysis_included", True)), "settings_qc_reason": "not a configured Fucci workflow"}
+            result = {"settings_qc_pass": True, "analysis_eligible": bool(row.get("analysis_included", True)), "settings_qc_status": "pass", "settings_qc_reason": "not a configured Fucci workflow"}
         record = {key: row.get(key) for key in QC_COLUMNS}
         record.update({
             "expected_pmt_gain_a": expected.get("pmt_gain_a"), "expected_pmt_gain_b": expected.get("pmt_gain_b"),
             "expected_laser_920_power": expected.get("laser_920_power"), "expected_laser_1050_power": expected.get("laser_1050_power"),
-            **{key: result[key] for key in ("settings_qc_pass", "settings_qc_reason", "analysis_eligible")},
+            **{key: result[key] for key in ("settings_qc_pass", "settings_qc_status", "settings_qc_reason", "analysis_eligible")},
         })
         records.append(record)
     table = pd.DataFrame(records, columns=QC_COLUMNS)
-    failed = table.loc[~table["settings_qc_pass"].fillna(False)] if not table.empty else table
+    failed = table.loc[table["settings_qc_status"].eq("fail")] if not table.empty else table
     return table, {
         "status": "PASS" if failed.empty else "FAIL",
-        "n_sessions": int(len(table)), "n_pass": int(table["settings_qc_pass"].fillna(False).sum()) if not table.empty else 0,
-        "n_fail": int(len(failed)), "numeric_tolerance": tolerance,
-        "failed_sessions": [{"session_id": str(row.session_id), "reason": str(row.settings_qc_reason)} for row in failed.itertuples(index=False)],
+        "n_sessions": int(len(table)), "n_pass": int(table["settings_qc_status"].eq("pass").sum()) if not table.empty else 0,
+        "n_fail": int(len(failed)), "n_vol10_excluded": n_vol10_excluded, "n_not_configured": int(table["settings_qc_status"].eq("not_configured").sum()) if not table.empty else 0,
+        "numeric_tolerance": tolerance,
+        "failed_sessions": [{"session_id": str(row.session_id), "acquisition_id": str(row.acquisition_id), "reason": str(row.settings_qc_reason)} for row in failed.itertuples(index=False)],
     }
 
 
@@ -130,48 +156,99 @@ def write_acquisition_settings_qc_artifacts(rows: list[dict[str, Any]], output_d
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(3, 1, figsize=(max(8, 0.45 * max(len(table), 1)), 7), sharex=True)
-    labels = table["session_id"].astype(str).tolist() if not table.empty else []
+    fig, axes = plt.subplots(4, 1, figsize=(max(11, 0.55 * max(len(table), 1)), 11), sharex=True)
+    labels = []
+    if not table.empty:
+        base_labels = [
+            str(row.acquisition_date if pd.notna(row.acquisition_date) and row.acquisition_date else row.session_id)
+            for row in table.itertuples(index=False)
+        ]
+        counts = pd.Series(base_labels).value_counts()
+        labels = [
+            f"{base}\\n{row.acquisition_id}" if counts[base] > 1 else base
+            for base, row in zip(base_labels, table.itertuples(index=False), strict=True)
+        ]
     x = list(range(len(labels)))
-    for axis, actual_a, actual_b, expected_a, expected_b, title, wavelength in (
-        (axes[0], "pmt_a_gain", "pmt_b_gain", "expected_pmt_gain_a", "expected_pmt_gain_b", "PMT gains", None),
-        (axes[1], "pockels_920_start_pct", "pockels_920_stop_pct", "expected_laser_920_power", "expected_laser_920_power", "920-nm Pockels power", 920),
-        (axes[2], "pockels_1050_start_pct", "pockels_1050_stop_pct", "expected_laser_1050_power", "expected_laser_1050_power", "1050-nm Pockels power", 1050),
-    ):
+    panels = (
+        ("pmt_a_gain", None, "expected_pmt_gain_a", None, "PMT A gain", "gain", None),
+        ("pmt_b_gain", None, "expected_pmt_gain_b", None, "PMT B gain", "gain", None),
+        ("pockels_920_start_pct", "pockels_920_stop_pct", "expected_laser_920_power", "expected_laser_920_power", "920-nm Pockels power", "%", 920),
+        ("pockels_1050_start_pct", "pockels_1050_stop_pct", "expected_laser_1050_power", "expected_laser_1050_power", "1050-nm Pockels power", "%", 1050),
+    )
+    statuses = table["settings_qc_status"].astype(str) if not table.empty else pd.Series(dtype=str)
+    for axis, (actual_a, actual_b, expected_a, expected_b, title, ylabel, wavelength) in zip(axes, panels, strict=True):
+        active = pd.Series(True, index=table.index)
+        if labels and wavelength is not None:
+            active = pd.Series(
+                [
+                    _laser_is_active(
+                        table.iloc[i][actual_a], table.iloc[i][actual_b],
+                        selected=_selected_laser(table.iloc[i]["laser_nm"], wavelength),
+                        tolerance=tolerance,
+                    )
+                    for i in range(len(table))
+                ],
+                index=table.index,
+            )
         if labels:
-            actual_a_values = pd.to_numeric(table[actual_a], errors="coerce")
-            actual_b_values = pd.to_numeric(table[actual_b], errors="coerce")
-            axis.plot(x, actual_a_values, "o", label="start/A")
-            axis.plot(x, actual_b_values, "x", label="stop/B")
-            expected_values = pd.to_numeric(table[expected_a], errors="coerce")
-            axis.plot(x, expected_values, "--", color="black", label="expected")
-            failed_x = [i for i, passed in enumerate(table["settings_qc_pass"].fillna(False)) if not passed]
-            if failed_x:
-                for failed_index in failed_x:
-                    axis.axvline(failed_index, color="red", alpha=0.18, linewidth=3)
-                if expected_values.notna().any():
-                    if wavelength is None:
-                        eligible_indices = failed_x
-                    else:
-                        selected = table["laser_nm"]
-                        eligible_indices = [
-                            i for i in failed_x
-                            if _laser_is_active(
-                                actual_a_values.iloc[i], actual_b_values.iloc[i],
-                                selected=_selected_laser(selected.iloc[i], wavelength),
-                                tolerance=tolerance,
-                            )
-                        ]
-                    bad_a = [i for i in eligible_indices if pd.notna(actual_a_values.iloc[i]) and pd.notna(expected_values.iloc[i]) and not math.isclose(float(actual_a_values.iloc[i]), float(expected_values.iloc[i]), rel_tol=tolerance, abs_tol=tolerance)]
-                    bad_b = [i for i in eligible_indices if pd.notna(actual_b_values.iloc[i]) and pd.notna(expected_values.iloc[i]) and not math.isclose(float(actual_b_values.iloc[i]), float(expected_values.iloc[i]), rel_tol=tolerance, abs_tol=tolerance)]
-                    if bad_a:
-                        axis.plot(bad_a, actual_a_values.iloc[bad_a], "X", color="red", markersize=10, label="QC FAIL")
-                    if bad_b:
-                        axis.plot(bad_b, actual_b_values.iloc[bad_b], "X", color="red", markersize=10)
-        axis.set_title(title); axis.grid(alpha=0.25)
-    axes[-1].set_xticks(x); axes[-1].set_xticklabels(labels, rotation=70, ha="right", fontsize=7)
-    axes[0].legend(loc="best", fontsize=8)
-    fig.tight_layout(); fig.savefig(output / "acquisition_settings_qc.png", dpi=150); plt.close(fig)
+            series = [(actual_a, expected_a, "start/A" if actual_b else "actual")]
+            if actual_b:
+                series.append((actual_b, expected_b, "stop/B"))
+            plotted_values = []
+            for actual_name, expected_name, point_label in series:
+                actual_values = pd.to_numeric(table[actual_name], errors="coerce").where(active)
+                expected_values = pd.to_numeric(table[expected_name], errors="coerce").where(active)
+                plotted_values.extend([actual_values, expected_values])
+                pass_indices = [i for i, value in enumerate(statuses.eq("pass") & actual_values.notna()) if value]
+                fail_indices = [i for i, value in enumerate(statuses.eq("fail") & actual_values.notna()) if value]
+                if pass_indices:
+                    axis.plot(pass_indices, actual_values.iloc[pass_indices], "o", color="tab:green", label="actual / pass")
+                if fail_indices:
+                    axis.plot(fail_indices, actual_values.iloc[fail_indices], "o", color="tab:orange", alpha=0.7, label="actual / failed session")
+                if expected_values.notna().any() and (expected_name != expected_a or point_label in {"actual", "start/A"}):
+                    axis.plot(x, expected_values, "--", color="black", label="expected" if point_label in {"actual", "start/A"} else None)
+                for i in range(len(table)):
+                    if statuses.iloc[i] != "fail" or not active.iloc[i] or pd.isna(actual_values.iloc[i]) or pd.isna(expected_values.iloc[i]):
+                        continue
+                    if math.isclose(float(actual_values.iloc[i]), float(expected_values.iloc[i]), rel_tol=tolerance, abs_tol=tolerance):
+                        continue
+                    axis.plot([i], [actual_values.iloc[i]], "X", color="red", markersize=10, label="QC mismatch")
+                    marker_label = "PMT A" if actual_name == "pmt_a_gain" else "PMT B" if actual_name == "pmt_b_gain" else f"{wavelength} {point_label.split('/')[0]}"
+                    axis.annotate(f"{marker_label}={float(actual_values.iloc[i]):g}", (i, actual_values.iloc[i]), xytext=(4, 5), textcoords="offset points", fontsize=7, color="red")
+            for index in [i for i, value in enumerate(statuses.eq("fail")) if value]:
+                axis.axvspan(index - 0.45, index + 0.45, color="red", alpha=0.08)
+            values = pd.concat(plotted_values).dropna()
+            if not values.empty:
+                low, high = float(values.min()), float(values.max())
+                pad = max((high - low) * 0.15, abs((high + low) / 2) * 0.05, 0.5)
+                axis.set_ylim(low - pad, high + pad)
+        axis.set_title(title, loc="left")
+        axis.set_ylabel(ylabel)
+        axis.grid(alpha=0.25)
+    axes[-1].set_xticks(x)
+    axes[-1].set_xticklabels(labels, rotation=55, ha="right", fontsize=7)
+    mouse_ids = sorted({str(value) for value in table["mouse_id"].dropna()}) if not table.empty else []
+    expected_text = "; ".join(
+        f"{mouse}: PMT=10, 920={EXPECTED_ACQUISITION_SETTINGS[mouse]['laser_920_power']:g}, 1050={EXPECTED_ACQUISITION_SETTINGS[mouse]['laser_1050_power']:g}"
+        for mouse in mouse_ids if mouse in EXPECTED_ACQUISITION_SETTINGS
+    )
+    n_pass = int(table["settings_qc_status"].eq("pass").sum()) if not table.empty else 0
+    n_fail = int(table["settings_qc_status"].eq("fail").sum()) if not table.empty else 0
+    fig.suptitle(
+        f"Acquisition settings QC — {', '.join(mouse_ids) or 'no analysis acquisitions'}\n"
+        f"{expected_text or 'No configured Fucci settings'} | n analysis acquisitions={len(table)}, pass={n_pass}, fail={n_fail}",
+        fontsize=12,
+    )
+    handles, labels_legend = [], []
+    for axis in axes:
+        for handle, label in zip(*axis.get_legend_handles_labels(), strict=True):
+            if label and label not in labels_legend:
+                handles.append(handle); labels_legend.append(label)
+    if handles:
+        fig.legend(handles, labels_legend, loc="upper right", bbox_to_anchor=(0.99, 0.985), fontsize=8)
+    fig.subplots_adjust(top=0.86, bottom=0.2, hspace=0.48, right=0.88)
+    fig.savefig(output / "acquisition_settings_qc.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
     return table, summary
 
 

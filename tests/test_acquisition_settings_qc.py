@@ -1,4 +1,4 @@
-from acquisition_settings_qc import acquisition_settings_qc
+from acquisition_settings_qc import acquisition_settings_qc, acquisition_settings_qc_table, validate_acquisition_row
 
 
 def test_selected_laser_acquisition_changes_warn() -> None:
@@ -34,3 +34,43 @@ def test_software_change_warns_but_is_not_strict_numeric_failure() -> None:
     _, qc = acquisition_settings_qc(rows, ["s0", "s1"], 1050)
     assert qc["status"] == "warning"
     assert qc["changed_required_fields"] == []
+
+
+def _configured_row(**overrides):
+    row = {
+        "mouse_id": "Fucci-Tri_3", "session_id": "s0", "acquisition_date": "2026-08-20", "acquisition_id": "a0",
+        "pmt_a_gain": 10, "pmt_b_gain": 10, "pockels_920_start_pct": 60, "pockels_920_stop_pct": 60,
+        "pockels_1050_start_pct": 0, "pockels_1050_stop_pct": 0,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_configured_session_passes_and_is_analysis_eligible():
+    result = validate_acquisition_row(_configured_row())
+    assert result["settings_qc_pass"] is True and result["analysis_eligible"] is True
+
+
+def test_wrong_pmt_reports_named_mismatch():
+    result = validate_acquisition_row(_configured_row(pmt_b_gain=8))
+    assert result["settings_qc_pass"] is False and "PMT_B=8 expected 10" in result["settings_qc_reason"]
+
+
+def test_wrong_laser_and_multiple_problems_are_all_reported():
+    result = validate_acquisition_row(_configured_row(pmt_a_gain=9, pockels_920_stop_pct=50))
+    assert "PMT_A=9 expected 10" in result["settings_qc_reason"]
+    assert "920=50 expected 60" in result["settings_qc_reason"]
+
+
+def test_missing_fields_fail_closed_and_unknown_mouse_is_not_guessed():
+    missing = validate_acquisition_row({"mouse_id": "Fucci-Dead_1"})
+    unknown = validate_acquisition_row({"mouse_id": "unknown"})
+    assert missing["settings_qc_pass"] is False and missing["analysis_eligible"] is False
+    assert unknown["settings_qc_pass"] is False and unknown["analysis_eligible"] is False
+    assert "no acquisition QC configuration" in unknown["settings_qc_reason"]
+
+
+def test_qc_table_has_required_gate_columns():
+    table, summary = acquisition_settings_qc_table([_configured_row()])
+    assert {"settings_qc_pass", "settings_qc_reason", "analysis_eligible"}.issubset(table.columns)
+    assert summary["status"] == "PASS"

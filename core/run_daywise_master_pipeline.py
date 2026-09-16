@@ -58,7 +58,7 @@ for _import_dir in (
 
 from affine_overlap_matcher import AffineOverlapParams, VoxelSpacing
 from analysis_paths import get_dataset_analysis_dir, resolve_dataset_dir
-from acquisition_settings_qc import acquisition_settings_qc
+from acquisition_settings_qc import acquisition_settings_qc, acquisition_settings_qc_table, write_acquisition_settings_qc_artifacts
 from project_cli import catalog_path, catalog_spacing, file_sha256, ready_manifest_path, resolve_selection, selected_catalog_rows, selected_mouse_metadata
 from run_daywise_graph_matching import run_daywise_graph_matching
 from run_daywise_matched_roi_pipeline import (
@@ -1090,15 +1090,33 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
     )
 
     if config.mode == "project":
-        acquisition_table, acquisition_qc = acquisition_settings_qc(
+        qc_rows = list(config.acquisition_settings_rows)
+        catalog_source = Path((config.project_provenance or {}).get("source_catalog_path", ""))
+        if catalog_source.is_file():
+            try:
+                catalog_frame = pd.read_csv(catalog_source, low_memory=False)
+                qc_rows = catalog_frame.loc[
+                    catalog_frame["mouse_id"].astype(str).eq(str((config.project_provenance or {}).get("mouse_id", "")))
+                    & catalog_frame["laser_nm"].astype(str).eq(str((config.project_provenance or {}).get("laser_nm", "")))
+                ].to_dict("records")
+            except (OSError, KeyError, pd.errors.ParserError):
+                pass
+        qc_table, acquisition_qc = acquisition_settings_qc_table(qc_rows)
+        qc_table.to_csv(run_dir / "acquisition_settings_qc.csv", index=False)
+        # This writes only derived QC artifacts under the run directory.
+        write_acquisition_settings_qc_artifacts(qc_rows, run_dir)
+        acquisition_table, consistency_qc = acquisition_settings_qc(
             list(config.acquisition_settings_rows),
             [str(record.session_id) for record in selected_records],
             int((config.project_provenance or {})["laser_nm"]),
         )
+        acquisition_qc["consistency"] = consistency_qc
+        for failed in acquisition_qc.get("failed_sessions", []):
+            _log(start_seconds, f"[QC SKIP] session={failed['session_id']} reason={failed['reason']}")
         acquisition_table.to_csv(run_dir / "acquisition_settings_by_session.csv", index=False)
         _write_json(run_dir / "acquisition_settings_qc.json", acquisition_qc)
-        if config.require_acquisition_settings_consistent and acquisition_qc["changed_required_fields"]:
-            raise ValueError("Required acquisition settings changed across selected sessions: " + ", ".join(acquisition_qc["changed_required_fields"]))
+        if config.require_acquisition_settings_consistent and consistency_qc["changed_required_fields"]:
+            raise ValueError("Required acquisition settings changed across selected sessions: " + ", ".join(consistency_qc["changed_required_fields"]))
     else:
         acquisition_table, acquisition_qc = acquisition_settings_qc([], [], 1050)
         acquisition_table.to_csv(run_dir / "acquisition_settings_by_session.csv", index=False)

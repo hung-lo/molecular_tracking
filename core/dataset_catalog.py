@@ -14,6 +14,7 @@ from typing import Any
 
 from project_config import ProjectConfig,validate_output_path
 from thorimage_xml import ThorImageMetadata,ThorImageParseError,parse_experiment_xml
+from acquisition_settings_qc import validate_acquisition_row, write_acquisition_settings_qc_artifacts
 
 NULL_COMPAT={"TBD","NA","N/A"}; CATALOG_VERSION="thorimage_catalog_v1"
 _FLAT_SESSION_RE = re.compile(r"^WT_(.+)_(\d{8})$")
@@ -139,11 +140,20 @@ def discover_catalog(config:ProjectConfig)->tuple[list[dict[str,Any]],dict[str,A
         for acq in sorted(p for p in session.iterdir() if p.is_dir() and (p/"Experiment.xml").is_file()):
                 xml=acq/"Experiment.xml"
                 try: meta=parse_experiment_xml(xml)
-                except ThorImageParseError as exc: errors.append({"code":"malformed_xml","path":str(xml),"message":str(exc)}); continue
+                except ThorImageParseError as exc:
+                    # Preserve the acquisition in the catalog so the failed
+                    # session remains auditable and downstream-ineligible.
+                    errors.append({"code":"malformed_xml","path":str(xml),"message":str(exc)})
+                    rows.append({"mouse_id":mouse.mouse_id,"experimental_group":mouse.values["experimental_group"],"cohort":mouse.values["cohort"],"session_id":session.name,"acquisition_date":session_date,"discovery_layout":found.discovery_layout,"acquisition_id":acq.name,"source_path":str(acq.resolve()),"role":"malformed_xml","analysis_included":False,"laser_nm":None,"is_primary":False,"xml_date":None,"software_version":"","experiment_status":"","pixel_x":None,"pixel_y":None,"width_um":None,"height_um":None,"pixel_size_x_um":None,"pixel_size_y_um":None,"z_imaging_planes":None,"flyback_planes":None,"z_step_um":None,"timepoints":None,"streaming_frames":None,"pockels_920_start_pct":None,"pockels_920_stop_pct":None,"pockels_1050_start_pct":None,"pockels_1050_stop_pct":None,"pockels_node_count":None,"pmt_a_gain":None,"pmt_b_gain":None,"average_num":None,"raw_image_path":"","settings_qc_pass":False,"settings_qc_reason":f"malformed Experiment.xml: {exc}","analysis_eligible":False,"warnings":"malformed_xml"})
+                    continue
                 role,included,laser,codes=_classification(acq.name,meta,config)
                 if meta.experiment_date!=session_date: codes.append("session_xml_date_mismatch")
                 p=list(meta.pockels)+[None,None]; raw=acq/"Image_001_001.raw"
                 row={"mouse_id":mouse.mouse_id,"experimental_group":mouse.values["experimental_group"],"cohort":mouse.values["cohort"],"session_id":session.name,"acquisition_date":session_date,"discovery_layout":found.discovery_layout,"acquisition_id":acq.name,"source_path":str(acq.resolve()),"role":role,"analysis_included":included,"laser_nm":laser,"is_primary":laser==config.rig.primary_laser_nm and included,"xml_date":meta.experiment_date,"software_version":meta.software_version,"experiment_status":meta.experiment_status,"pixel_x":meta.pixel_x,"pixel_y":meta.pixel_y,"width_um":meta.width_um,"height_um":meta.height_um,"pixel_size_x_um":meta.pixel_width_um,"pixel_size_y_um":meta.pixel_height_um,"z_imaging_planes":meta.z_steps,"flyback_planes":meta.flyback_frames,"z_step_um":meta.z_step_um,"timepoints":meta.timepoints,"streaming_frames":meta.streaming_frames,"pockels_920_start_pct":p[0].start if p[0] else None,"pockels_920_stop_pct":p[0].stop if p[0] else None,"pockels_1050_start_pct":p[1].start if p[1] else None,"pockels_1050_stop_pct":p[1].stop if p[1] else None,"pockels_node_count":len(meta.pockels),"pmt_a_gain":meta.pmt_a_gain,"pmt_b_gain":meta.pmt_b_gain,"average_num":meta.average_num,"raw_image_path":str(raw.resolve()) if raw.exists() else "","warnings":";".join(sorted(set(codes)))}
+                qc = validate_acquisition_row(row)
+                row.update({"settings_qc_pass": qc["settings_qc_pass"], "settings_qc_reason": qc["settings_qc_reason"], "analysis_eligible": bool(included and qc["analysis_eligible"])})
+                if not mouse.mouse_id.startswith("Fucci-"):
+                    row.update({"settings_qc_pass": True, "settings_qc_reason": "not a configured Fucci workflow", "analysis_eligible": bool(included)})
                 rows.append(row)
     rows.sort(key=lambda r:(r["mouse_id"],r["acquisition_date"],r["acquisition_id"]))
     for mouse in mice:
@@ -164,7 +174,7 @@ def catalog_summary(rows,config):
     result={}; primary=config.rig.primary_laser_nm; optional=config.rig.optional_laser_nm
     for mouse in sorted({r["mouse_id"] for r in rows}):
         subset=[r for r in rows if r["mouse_id"]==mouse]
-        result[mouse]={"sessions":len({r["session_id"] for r in subset if r["analysis_included"] and r["laser_nm"]==primary}),f"canonical_{primary}":sum(r["analysis_included"] and r["laser_nm"]==primary for r in subset),f"canonical_{optional}":sum(r["analysis_included"] and r["laser_nm"]==optional for r in subset),"alignment_only":sum(r["role"]=="alignment_only" for r in subset),"noncanonical":sum(r["role"]=="noncanonical" for r in subset),"auxiliary_or_test":sum(r["role"]=="auxiliary_or_test" for r in subset)}
+        result[mouse]={"sessions":len({r["session_id"] for r in subset if r["analysis_included"] and r.get("analysis_eligible", True) and r["laser_nm"]==primary}),f"canonical_{primary}":sum(r["analysis_included"] and r["laser_nm"]==primary for r in subset),f"canonical_{optional}":sum(r["analysis_included"] and r["laser_nm"]==optional for r in subset),"settings_qc_pass":sum(bool(r.get("settings_qc_pass", True)) for r in subset),"settings_qc_fail":sum(not bool(r.get("settings_qc_pass", True)) for r in subset),"alignment_only":sum(r["role"]=="alignment_only" for r in subset),"noncanonical":sum(r["role"]=="noncanonical" for r in subset),"auxiliary_or_test":sum(r["role"]=="auxiliary_or_test" for r in subset)}
     return result
 
 def _atomic_text(path:Path,text:str)->None:
@@ -186,6 +196,7 @@ def write_catalog(config,rows,report)->Path:
         chosen=[r for r in rows if (r["mouse_id"],r["session_id"],r["acquisition_date"])==key]
         sessions.append({"mouse_id":key[0],"session_id":key[1],"acquisition_date":key[2],f"has_{config.rig.primary_laser_nm}":any(r["analysis_included"] and r["laser_nm"]==config.rig.primary_laser_nm for r in chosen),f"has_{config.rig.optional_laser_nm}":any(r["analysis_included"] and r["laser_nm"]==config.rig.optional_laser_nm for r in chosen)})
     _atomic_csv(output/"sessions.generated.csv",sessions,list(sessions[0]) if sessions else ["mouse_id","session_id","acquisition_date"])
+    write_acquisition_settings_qc_artifacts(rows, output)
     mice=[m.values for m in load_mice(config.paths.mice_csv)]; _atomic_csv(output/"mice.validated.csv",mice,list(mice[0]))
     _atomic_text(output/"validation_report.json",json.dumps(report,indent=2,sort_keys=True))
     return output
@@ -195,7 +206,7 @@ def _sha(path:Path)->str:return hashlib.sha256(path.read_bytes()).hexdigest()
 def build_manifest_plan(config,rows,mouse_id:str,laser_nm:int|None=None,*,source_catalog:Path|None=None,validation_report:dict|None=None)->tuple[Path,bool]:
     laser=int(laser_nm if laser_nm is not None else config.rig.primary_laser_nm); mice={m.mouse_id:m for m in load_mice(config.paths.mice_csv)}
     if mouse_id not in mice: raise ValueError(f"Unknown mouse_id {mouse_id!r}")
-    selected=[r for r in rows if r["mouse_id"]==mouse_id and bool(r["analysis_included"]) and int(r["laser_nm"])==laser]
+    selected=[r for r in rows if r["mouse_id"]==mouse_id and bool(r["analysis_included"]) and bool(r.get("analysis_eligible", True)) and r.get("laser_nm") not in (None, "", "nan") and int(r["laser_nm"])==laser]
     grouped={}
     for row in selected: grouped.setdefault((row["session_id"],row["acquisition_date"],laser),[]).append(row)
     duplicates=[key for key,value in grouped.items() if len(value)!=1]
@@ -204,7 +215,7 @@ def build_manifest_plan(config,rows,mouse_id:str,laser_nm:int|None=None,*,source
     relevant=[e for e in (validation_report or {}).get("errors",[]) if e.get("mouse_id")==mouse_id]
     if relevant: raise ValueError(f"Catalog validation errors prevent manifest generation for {mouse_id}: {relevant}")
     selected=[grouped[key][0] for key in sorted(grouped,key=lambda k:(k[1],k[0]))]
-    primary=[r for r in rows if r["mouse_id"]==mouse_id and bool(r["analysis_included"]) and int(r["laser_nm"])==config.rig.primary_laser_nm]
+    primary=[r for r in rows if r["mouse_id"]==mouse_id and bool(r["analysis_included"]) and bool(r.get("analysis_eligible", True)) and r.get("laser_nm") not in (None, "", "nan") and int(r["laser_nm"])==config.rig.primary_laser_nm]
     override=mice[mouse_id].values.get("reference_session_or_folder","")
     candidates=[r for r in primary if (r["session_id"]==override or r["acquisition_id"]==override or r["source_path"]==override or Path(r["source_path"]).name==override)] if override else sorted(primary,key=lambda r:(r["acquisition_date"],r["session_id"]))[:1]
     if len(candidates)!=1: raise ValueError(f"Reference override {override!r} resolved to {len(candidates)} acquisitions")

@@ -13,6 +13,7 @@ from run_daywise_master_pipeline import (
     SessionSelection,
     _parse_session_selection,
     _select_session_records,
+    _validate_selected_plan_ready,
     _session_selection_provenance,
     _verify_resume_session_selection,
     _has_current_extraction,
@@ -183,6 +184,25 @@ def test_select_session_records_preserves_source_order_and_rejects_oversized(tmp
     assert [record.session_index for record in _select_session_records(records, _parse_session_selection("last:3"))] == [3, 4, 5]
     with pytest.raises(ValueError, match="contains only 6 sessions"):
         _select_session_records(records, _parse_session_selection("first:7"))
+
+
+def test_plan_readiness_checks_only_the_selected_subset(tmp_path: Path) -> None:
+    plan = tmp_path / "session_manifest_plan.csv"
+    plan.write_text(
+        "session_index,session_id,acquisition_date,mask_path,red_image_path,green_image_path,required,status\n"
+        + "\n".join(
+            f"{index},s{index},2026-08-{index + 1:02d},/missing/mask{index},/missing/red{index},/missing/green{index},true,"
+            f"{'segmentation_required' if index == 5 else 'ready'}"
+            for index in range(6)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    records = load_session_manifest(plan, check_paths=False)
+
+    _validate_selected_plan_ready(plan, _select_session_records(records, _parse_session_selection("first:5")))
+    with pytest.raises(FileNotFoundError, match="2026-08-06: segmentation_required"):
+        _validate_selected_plan_ready(plan, _select_session_records(records, _parse_session_selection("last:2")))
 
 
 def test_subset_default_run_names_reflect_selected_scope(tmp_path: Path) -> None:

@@ -59,7 +59,7 @@ for _import_dir in (
 from affine_overlap_matcher import AffineOverlapParams, VoxelSpacing
 from analysis_paths import get_dataset_analysis_dir, resolve_dataset_dir
 from acquisition_settings_qc import acquisition_settings_qc, acquisition_settings_qc_table, write_acquisition_settings_qc_artifacts
-from project_cli import catalog_path, catalog_spacing, file_sha256, ready_manifest_path, resolve_selection, selected_catalog_rows, selected_mouse_metadata
+from project_cli import catalog_path, catalog_spacing, file_sha256, manifest_plan_path, ready_manifest_path, resolve_selection, selected_catalog_rows, selected_mouse_metadata
 from run_daywise_graph_matching import run_daywise_graph_matching
 from run_daywise_matched_roi_pipeline import (
     DaywiseMatchedPipelineConfig,
@@ -199,6 +199,18 @@ def _select_session_records(
     if selection.mode == "last":
         return source_records[-count:]
     raise AssertionError(f"Unsupported session selection mode: {selection.mode!r}")
+
+
+def _validate_selected_plan_ready(path: Path, records: list[SessionRecord]) -> None:
+    """Fail only for unready rows in the requested plan subset."""
+    with path.open(encoding="utf-8", newline="") as handle:
+        statuses = {(row["session_id"], row["acquisition_date"]): row.get("status", "ready") for row in csv.DictReader(handle)}
+    unready = [
+        f"  {record.acquisition_date}: {statuses[(record.session_id, record.acquisition_date.isoformat())]}"
+        for record in records
+        if statuses.get((record.session_id, record.acquisition_date.isoformat())) != "ready"
+    ]
+    if unready: raise FileNotFoundError("Selected session inputs are not ready:\n" + "\n".join(unready))
 
 
 def _records_metadata(records: list[SessionRecord]) -> dict[str, Any]:
@@ -1080,10 +1092,11 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
     stage_durations_seconds: dict[str, float] = {}
     source_manifest_path = Path(config.manifest).expanduser().resolve()
     dataset_dir = resolve_dataset_dir(config.dataset)
-    source_records = load_session_manifest(source_manifest_path)
+    source_records = load_session_manifest(source_manifest_path, check_paths=False)
     source_meta = _records_metadata(source_records)
     selection = _parse_session_selection(config.sessions)
     selected_records = _select_session_records(source_records, selection)
+    _validate_selected_plan_ready(source_manifest_path, selected_records)
     selected_meta = _records_metadata(selected_records)
     run_dir, match_dir, extraction_dir, plots_dir = _prepare_run_directory(
         config, manifest_meta=selected_meta, selection=selection
@@ -1526,7 +1539,7 @@ def main(argv: list[str] | None = None) -> Path:
     if context.project_config is not None:
         if requested_manifest is not None: raise ValueError("Project mode selects its validated manifest automatically; do not pass --manifest.")
         args.dataset = str(context.dataset_dir)
-        args.manifest = str(ready_manifest_path(context))
+        args.manifest = str(manifest_plan_path(context) if args.sessions else ready_manifest_path(context))
         args.output_root = str(context.analysis_dir)
         catalog_x, catalog_y, catalog_z = catalog_spacing(context)
         if catalog_x != catalog_y: raise ValueError("Master pipeline currently requires equal catalog X/Y spacing")

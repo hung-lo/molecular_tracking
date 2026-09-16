@@ -107,17 +107,27 @@ def catalog_spacing(context: DatasetContext) -> tuple[float,float,float]:
     if len(values)!=1: raise ValueError("Included project sessions do not have uniform XML-derived X/Y/Z spacing")
     return next(iter(values))
 
-def ready_manifest_path(context: DatasetContext) -> Path:
-    """Return a current ready manifest only after state, catalog, rows, and files validate."""
+
+def _current_manifest_state(context: DatasetContext) -> tuple[Path, dict[str, Any]]:
     if context.project_config is None: raise ValueError("Ready manifests are project-only")
-    manifest_dir=context.dataset_dir/"manifests"
-    path=manifest_dir/"daywise_session_manifest.csv"; state_path=manifest_dir/"manifest_state.json"
+    manifest_dir=context.dataset_dir/"manifests"; state_path=manifest_dir/"manifest_state.json"
     if not state_path.is_file(): raise FileNotFoundError(f"Manifest state was not found: {state_path}")
-    state=json.loads(state_path.read_text(encoding="utf-8"))
-    if not state.get("ready"): raise FileNotFoundError(f"Project inputs are not ready; see {manifest_dir/'session_manifest_plan.csv'}")
-    current_catalog=catalog_path(context)
+    state=json.loads(state_path.read_text(encoding="utf-8")); current_catalog=catalog_path(context)
     if state.get("catalog_path")!=str(current_catalog.resolve()) or state.get("catalog_sha256")!=file_sha256(current_catalog):
         raise ValueError("Manifest is stale because its source acquisition catalog changed")
+    return manifest_dir,state
+
+def manifest_plan_path(context: DatasetContext) -> Path:
+    """Return the current plan so a requested subset can validate itself."""
+    manifest_dir,_=_current_manifest_state(context); path=manifest_dir/"session_manifest_plan.csv"
+    if not path.is_file(): raise FileNotFoundError(f"Session manifest plan was not found: {path}")
+    return path
+
+def ready_manifest_path(context: DatasetContext) -> Path:
+    """Return a current ready manifest only after state, catalog, rows, and files validate."""
+    manifest_dir,state=_current_manifest_state(context)
+    path=manifest_dir/"daywise_session_manifest.csv"
+    if not state.get("ready"): raise FileNotFoundError(f"Project inputs are not ready; see {manifest_dir/'session_manifest_plan.csv'}")
     if not path.is_file(): raise FileNotFoundError(f"Analysis-ready manifest was not found: {path}")
     allowed={(r["session_id"],r["acquisition_date"]) for r in selected_catalog_rows(context)}
     seen=set()

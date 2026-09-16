@@ -78,7 +78,7 @@ def _parse_required_field(raw_value: str | None, *, row_number: int) -> bool:
     return _parse_strict_bool(raw_value, field_name="required", row_number=row_number)
 
 
-def load_session_manifest(path: str | Path) -> list[SessionRecord]:
+def load_session_manifest(path: str | Path, *, check_paths: bool = True) -> list[SessionRecord]:
     """Load a CSV manifest and return sorted session records."""
 
     manifest_path = Path(path).resolve()
@@ -171,11 +171,11 @@ def load_session_manifest(path: str | Path) -> list[SessionRecord]:
             )
 
     records = sorted(records, key=lambda record: record.session_index)
-    validate_manifest_for_matching(records)
+    validate_manifest_for_matching(records, check_paths=check_paths)
     return records
 
 
-def validate_manifest_for_matching(records: list[SessionRecord]) -> None:
+def validate_manifest_for_matching(records: list[SessionRecord], *, check_paths: bool = True) -> None:
     """Validate the manifest contract needed for matching-only workflows."""
 
     if len(records) < 2:
@@ -199,9 +199,9 @@ def validate_manifest_for_matching(records: list[SessionRecord]) -> None:
     for record in records:
         if record.mask_path.name == "":
             raise ValueError(f"Session {record.session_id}: empty mask_path.")
-        if not record.mask_path.exists():
+        if check_paths and not record.mask_path.exists():
             raise FileNotFoundError(f"Mask file was not found: {record.mask_path}")
-        if not record.mask_path.is_file():
+        if check_paths and not record.mask_path.is_file():
             raise FileNotFoundError(f"Mask path is not a file: {record.mask_path}")
 
 
@@ -224,4 +224,3 @@ def validate_manifest_for_intensity(records: list[SessionRecord]) -> None:
                 raise FileNotFoundError(f"Image file was not found: {path}")
             if not path.is_file():
                 raise FileNotFoundError(f"Image path is not a file: {path}")
-

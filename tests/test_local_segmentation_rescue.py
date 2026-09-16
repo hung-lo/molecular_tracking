@@ -4,7 +4,9 @@ import numpy as np
 import pandas as pd
 
 from postprocessing.local_segmentation_rescue import (
+    RunContext,
     TransformGraph,
+    _predict_target,
     compute_crop_bounds,
     dice_iou,
     rank_candidates,
@@ -46,6 +48,36 @@ def test_candidate_ranking_ignores_biological_state_columns():
     assert [item["candidate_id"] for item in ranked] == [2, 1]
     candidates[0]["eclipse_z"] = 1000
     assert rank_candidates(candidates, [5, 5, 5], (1, 1, 1))[0]["candidate_id"] == 2
+
+
+def test_hidden_target_volume_cannot_change_candidate_ranking():
+    candidates = [
+        {"candidate_id": 1, "centroid_xyz": [5, 5, 5], "volume_um3": 10, "touches_crop_edge": False},
+        {"candidate_id": 2, "centroid_xyz": [6, 5, 5], "volume_um3": 1000, "touches_crop_edge": False},
+    ]
+    first = [row["candidate_id"] for row in rank_candidates(candidates, [5.2, 5, 5], (1, 1, 1), 10)]
+    second = [row["candidate_id"] for row in rank_candidates(candidates, [5.2, 5, 5], (1, 1, 1), 10000)]
+    assert first == second
+
+
+def test_prediction_context_is_explicit_and_one_sided_ignores_future():
+    sessions = pd.DataFrame([{"session_id": f"s{i}", "session_index": i} for i in range(3)])
+    features = pd.DataFrame([
+        {"session_id": "s0", "label": 1, "centroid_z": 0, "centroid_y": 0, "centroid_x": 0},
+        {"session_id": "s2", "label": 1, "centroid_z": 0, "centroid_y": 0, "centroid_x": 100},
+    ])
+    transforms = pd.DataFrame([
+        {"day_a": "s0", "day_b": "s1"},
+        {"day_a": "s1", "day_b": "s2"},
+    ])
+    context = RunContext(__import__("pathlib").Path("/tmp/run"), __import__("pathlib").Path("/tmp/matching"), features, pd.DataFrame(), sessions, transforms, (1, 1, 1), "test", {}, "", "", "", {})
+    lookup = {(str(row.session_id), int(row.label)): row for _, row in features.iterrows()}
+    graph = TransformGraph(transforms)
+    observations = {0: ("s0", 1), 2: ("s2", 1)}
+    one = _predict_target(context, observations, 1, lookup, graph, benchmark_context="endpoint_one_sided")
+    two = _predict_target(context, observations, 1, lookup, graph, benchmark_context="internal_gap_two_sided")
+    assert one["predicted_xyz"] == [0.0, 0.0, 0.0]
+    assert two["predicted_xyz"] == [50.0, 0.0, 0.0]
 
 
 def test_transform_graph_direct_and_composed_provenance():

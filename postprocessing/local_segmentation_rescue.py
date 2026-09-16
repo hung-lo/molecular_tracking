@@ -680,6 +680,10 @@ def _find_real_cases(
             continue
         source_session = str(row.get("source_session", row.get("session_id", row.get("end_session_id", ""))))
         target_session = str(row.get("target_session", row.get("target_session_id", "")))
+        if source_session in {"", "nan", "None"} and 0 <= source_index < len(context.sessions):
+            source_session = str(context.sessions.iloc[source_index].session_id)
+        if target_session in {"", "nan", "None"} and 0 <= target_index < len(context.sessions):
+            target_session = str(context.sessions.iloc[target_index].session_id)
         source_label = row.get("source_label", row.get("roi_id", row.get("end_label", np.nan)))
         if not source_session or not target_session or not np.isfinite(_finite(source_label)):
             continue

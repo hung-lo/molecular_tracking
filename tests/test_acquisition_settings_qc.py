@@ -1,4 +1,4 @@
-from acquisition_settings_qc import acquisition_settings_qc, acquisition_settings_qc_table, validate_acquisition_row, write_acquisition_settings_qc_artifacts
+from acquisition_settings_qc import _session_plot_rows, acquisition_settings_qc, acquisition_settings_qc_table, validate_acquisition_row, write_acquisition_settings_qc_artifacts
 
 
 def test_selected_laser_acquisition_changes_warn() -> None:
@@ -144,3 +144,28 @@ def test_inactive_laser_zero_is_not_plotted_as_a_mismatch(tmp_path):
     assert table.iloc[0]["settings_qc_status"] == "fail"
     # The plot is generated with the selected-laser mask; the inactive zero is not a QC failure point.
     assert (tmp_path / "acquisition_settings_qc.png").stat().st_size > 0
+
+
+def test_qc_plot_rows_collapse_canonical_lasers_to_one_session_point():
+    rows = [
+        _configured_row(laser_nm=920, acquisition_id="a920"),
+        _configured_row(laser_nm=1050, acquisition_id="a1050", pockels_920_start_pct=0, pockels_920_stop_pct=0, pockels_1050_start_pct=50, pockels_1050_stop_pct=50),
+    ]
+    table, _ = acquisition_settings_qc_table(rows)
+    summary = _session_plot_rows(table)[0]
+
+    assert summary["pmt_a_gain"] == [10]
+    assert summary["pmt_b_gain"] == [10]
+    assert summary["laser_920"] == [60]
+    assert summary["laser_1050"] == [50]
+    assert summary["issues"] == ["1050=50 != 60"]
+
+
+def test_qc_plot_rows_preserve_real_laser_start_stop_disagreement():
+    table, _ = acquisition_settings_qc_table([
+        _configured_row(laser_nm=1050, pockels_920_start_pct=0, pockels_920_stop_pct=0, pockels_1050_start_pct=50, pockels_1050_stop_pct=55)
+    ])
+    summary = _session_plot_rows(table)[0]
+
+    assert summary["laser_1050"] == [50, 55]
+    assert summary["issues"] == ["1050 start=50 stop=55"]

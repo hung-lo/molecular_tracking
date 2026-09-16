@@ -203,6 +203,51 @@ def acquisition_settings_qc_table(rows: list[dict[str, Any]], *, tolerance: floa
     }
 
 
+def _plot_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _unique_plot_values(values: list[float], tolerance: float) -> list[float]:
+    return [value for index, value in enumerate(values) if not any(math.isclose(value, prior, rel_tol=tolerance, abs_tol=tolerance) for prior in values[:index])]
+
+
+def _session_plot_rows(table: pd.DataFrame, *, tolerance: float = 1e-6) -> list[dict[str, Any]]:
+    """Collapse canonical acquisition rows into one plotting record per session."""
+    rows = table.loc[table["pipeline_enabled"] & table["analysis_included"] & table["mouse_id"].isin(EXPECTED_ACQUISITION_SETTINGS)]
+    summaries = []
+    for (mouse_id, acquisition_date, session_id), frame in rows.groupby(["mouse_id", "acquisition_date", "session_id"], sort=True):
+        expected = EXPECTED_ACQUISITION_SETTINGS[str(mouse_id)]
+        summary: dict[str, Any] = {"mouse_id": str(mouse_id), "acquisition_date": str(acquisition_date), "session_id": str(session_id), "issues": []}
+        for column, label, expected_key in (("pmt_a_gain", "PMT A", "pmt_gain_a"), ("pmt_b_gain", "PMT B", "pmt_gain_b")):
+            values = _unique_plot_values([value for value in (_plot_number(item) for item in frame[column]) if value is not None], tolerance)
+            summary[column] = values
+            if len(values) > 1:
+                summary["issues"].append(f"{label} inconsistent: {'/'.join(f'{value:g}' for value in values)}")
+            elif values and not math.isclose(values[0], expected[expected_key], rel_tol=tolerance, abs_tol=tolerance):
+                summary["issues"].append(f"{label}={values[0]:g} != {expected[expected_key]:g}")
+        for wavelength in (920, 1050):
+            selected = frame.loc[pd.to_numeric(frame["laser_nm"], errors="coerce").eq(wavelength)]
+            values: list[float] = []
+            disagreements: list[tuple[float, float]] = []
+            for item in selected.itertuples(index=False):
+                start = _plot_number(getattr(item, f"pockels_{wavelength}_start_pct")); stop = _plot_number(getattr(item, f"pockels_{wavelength}_stop_pct"))
+                if start is not None: values.append(start)
+                if stop is not None and (start is None or not math.isclose(start, stop, rel_tol=tolerance, abs_tol=tolerance)): values.append(stop)
+                if start is not None and stop is not None and not math.isclose(start, stop, rel_tol=tolerance, abs_tol=tolerance): disagreements.append((start, stop))
+            values = _unique_plot_values(values, tolerance); summary[f"laser_{wavelength}"] = values
+            expected_power = expected[f"laser_{wavelength}_power"]
+            if disagreements:
+                summary["issues"].append(f"{wavelength} start={disagreements[0][0]:g} stop={disagreements[0][1]:g}")
+            elif values and not all(math.isclose(value, expected_power, rel_tol=tolerance, abs_tol=tolerance) for value in values):
+                summary["issues"].append(f"{wavelength}={'/'.join(f'{value:g}' for value in values)} != {expected_power:g}")
+        summaries.append(summary)
+    return summaries
+
+
 def write_acquisition_settings_qc_artifacts(rows: list[dict[str, Any]], output_dir: str | Path, *, tolerance: float = 1e-6) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Write the full audit CSV and a compact, analysis-only PNG."""
 
@@ -215,12 +260,10 @@ def write_acquisition_settings_qc_artifacts(rows: list[dict[str, Any]], output_d
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    plot_rows = table.loc[
-        table["pipeline_enabled"] & table["analysis_included"] & table["mouse_id"].isin(EXPECTED_ACQUISITION_SETTINGS)
-    ].copy()
-    configured_mice = [mouse for mouse in EXPECTED_ACQUISITION_SETTINGS if mouse in set(plot_rows["mouse_id"])]
+    summaries = _session_plot_rows(table, tolerance=tolerance)
+    configured_mice = [mouse for mouse in EXPECTED_ACQUISITION_SETTINGS if mouse in {row["mouse_id"] for row in summaries}]
     if not configured_mice:
-        configured_mice = sorted(set(plot_rows["mouse_id"]))
+        configured_mice = sorted({row["mouse_id"] for row in summaries})
     n_rows = max(len(configured_mice), 1)
     fig, axes = plt.subplots(n_rows, 2, figsize=(15.5, max(3.0, 2.35 * n_rows)), squeeze=False)
     fig.suptitle("Acquisition settings QC — analysis-relevant canonical acquisitions", fontsize=14, fontweight="bold")
@@ -228,72 +271,29 @@ def write_acquisition_settings_qc_artifacts(rows: list[dict[str, Any]], output_d
     for row_index, mouse in enumerate(configured_mice or ["no analysis acquisitions"]):
         pmt_axis, laser_axis = axes[row_index]
         expected = EXPECTED_ACQUISITION_SETTINGS.get(mouse, {})
-        frame = plot_rows.loc[plot_rows["mouse_id"].eq(mouse)].copy()
-        session_keys = sorted({(str(row.acquisition_date), str(row.session_id)) for row in frame.itertuples(index=False)})
-        session_x = {key: index for index, key in enumerate(session_keys)}
-        if not frame.empty:
-            frame["x"] = [session_x[(str(row.acquisition_date), str(row.session_id))] for row in frame.itertuples(index=False)]
-        labels = [
-            key[0][5:] if re.fullmatch(r"\d{4}-\d{2}-\d{2}", key[0]) else key[1]
-            for key in session_keys
-        ]
-        failed_x = sorted({
-            int(row.x) for row in frame.loc[frame["settings_qc_status"].eq("fail")].itertuples(index=False)
-        })
+        frame = [row for row in summaries if row["mouse_id"] == mouse]
+        labels = [row["acquisition_date"][5:] if re.fullmatch(r"\d{4}-\d{2}-\d{2}", row["acquisition_date"]) else row["session_id"] for row in frame]
+        failed_x = [index for index, row in enumerate(frame) if row["issues"]]
         n_fail = len(failed_x)
-        n_pass = len(session_keys) - n_fail
+        n_pass = len(frame) - n_fail
         expected_pmt = expected.get("pmt_gain_a")
         expected_power = expected.get("laser_1050_power")
         pmt_axis.text(-0.17, 0.5, mouse, transform=pmt_axis.transAxes, ha="right", va="center", fontsize=11, fontweight="bold")
         pmt_axis.set_title(
             f"expected PMT {expected.get('pmt_gain_a', '—')}/{expected.get('pmt_gain_b', '—')}, "
             f"power {expected_power if expected_power is not None else '—'} | "
-            f"{len(session_keys)} sessions | {n_pass} PASS / {n_fail} FAIL",
+            f"{len(frame)} sessions | {n_pass} PASS / {n_fail} FAIL",
             loc="left", fontsize=9,
         )
 
-        pmt_specs = [
-            ("pmt_a_gain", "PMT A", "o", "tab:blue", -0.07),
-            ("pmt_b_gain", "PMT B", "s", "tab:orange", 0.07),
-        ]
-        laser_specs = [
-            ("pockels_920_start_pct", "920 start", "o", "tab:blue", -0.08, 920),
-            ("pockels_920_stop_pct", "920 stop", "o", "tab:blue", 0.08, 920),
-            ("pockels_1050_start_pct", "1050 start", "s", "tab:orange", -0.08, 1050),
-            ("pockels_1050_stop_pct", "1050 stop", "s", "tab:orange", 0.08, 1050),
-        ]
         pmt_values: list[float] = [float(expected_pmt)] if expected_pmt is not None else []
         laser_values: list[float] = [float(expected_power)] if expected_power is not None else []
-
-        for column, label, marker, color, offset in pmt_specs:
-            values = pd.to_numeric(frame.get(column, pd.Series(dtype=float)), errors="coerce")
-            valid = values.notna()
-            if valid.any():
-                pmt_axis.scatter(frame.loc[valid, "x"] + offset, values.loc[valid], marker=marker, color=color, s=28, label=label)
-                pmt_values.extend(values.loc[valid].astype(float).tolist())
-            expected_value = expected.get("pmt_gain_a" if column == "pmt_a_gain" else "pmt_gain_b")
-            for item in frame.loc[valid & frame["settings_qc_status"].eq("fail")].itertuples(index=False):
-                value = float(getattr(item, column))
-                if expected_value is not None and not math.isclose(value, float(expected_value), rel_tol=tolerance, abs_tol=tolerance):
-                    pmt_axis.scatter([item.x + offset], [value], marker="x", color="red", s=70, linewidths=1.8, label="QC mismatch")
-                    pmt_axis.annotate(f"{label}={value:g}", (item.x + offset, value), xytext=(3, 4), textcoords="offset points", fontsize=7, color="red")
-
-        for column, label, marker, color, offset, wavelength in laser_specs:
-            active = pd.Series([
-                _laser_is_active(getattr(row, f"pockels_{wavelength}_start_pct"), getattr(row, f"pockels_{wavelength}_stop_pct"), selected=_selected_laser(row.laser_nm, wavelength), tolerance=tolerance)
-                for row in frame.itertuples(index=False)
-            ], index=frame.index)
-            values = pd.to_numeric(frame.get(column, pd.Series(dtype=float)), errors="coerce")
-            valid = active & values.notna()
-            if valid.any():
-                laser_axis.scatter(frame.loc[valid, "x"] + offset, values.loc[valid], marker=marker, color=color, s=28, alpha=0.7 if "stop" in label else 1.0, label="_nolegend_" if "stop" in label else label)
-                laser_values.extend(values.loc[valid].astype(float).tolist())
-            expected_value = expected.get(f"laser_{wavelength}_power")
-            for item in frame.loc[valid & frame["settings_qc_status"].eq("fail")].itertuples(index=False):
-                value = float(getattr(item, column))
-                if expected_value is not None and not math.isclose(value, float(expected_value), rel_tol=tolerance, abs_tol=tolerance):
-                    laser_axis.scatter([item.x + offset], [value], marker="x", color="red", s=70, linewidths=1.8, label="QC mismatch")
-                    laser_axis.annotate(f"{label}={value:g}", (item.x + offset, value), xytext=(3, 4), textcoords="offset points", fontsize=7, color="red")
+        for column, label, marker, color, offset, expected_key, axis in (("pmt_a_gain", "PMT A", "o", "tab:blue", -0.07, "pmt_gain_a", pmt_axis), ("pmt_b_gain", "PMT B", "s", "tab:orange", 0.07, "pmt_gain_b", pmt_axis), ("laser_920", "920", "o", "tab:blue", -0.07, "laser_920_power", laser_axis), ("laser_1050", "1050", "s", "tab:orange", 0.07, "laser_1050_power", laser_axis)):
+            for x, row in enumerate(frame):
+                for value in row[column]:
+                    axis.scatter([x + offset], [value], marker=marker, color=color, s=28, label=label)
+                    if not math.isclose(value, expected[expected_key], rel_tol=tolerance, abs_tol=tolerance): axis.scatter([x + offset], [value], marker="x", color="red", s=70, linewidths=1.8, label="QC mismatch")
+                    (pmt_values if axis is pmt_axis else laser_values).append(value)
 
         for axis, reference, values, ylabel in (
             (pmt_axis, expected_pmt, pmt_values, "gain"),
@@ -309,18 +309,17 @@ def write_acquisition_settings_qc_artifacts(rows: list[dict[str, Any]], output_d
                 axis.axvspan(x - 0.4, x + 0.4, color="red", alpha=0.08)
             axis.set_ylabel(ylabel)
             axis.grid(alpha=0.25)
-            axis.set_xlim(-0.6, max(len(session_keys) - 0.4, 0.6))
-            tick_step = 1 if len(session_keys) <= 15 else 2 if len(session_keys) <= 30 else max(3, (len(session_keys) + 14) // 15)
-            tick_positions = sorted(set(range(0, len(session_keys), tick_step)) | set(failed_x))
+            axis.set_xlim(-0.6, max(len(frame) - 0.4, 0.6))
+            tick_step = 1 if len(frame) <= 15 else 2 if len(frame) <= 30 else max(3, (len(frame) + 14) // 15)
+            tick_positions = sorted(set(range(0, len(frame), tick_step)) | set(failed_x))
             axis.set_xticks(tick_positions)
             axis.set_xticklabels([labels[x] for x in tick_positions], rotation=0, fontsize=8)
 
-        if failed_x:
-            reasons = frame.loc[frame["settings_qc_status"].eq("fail"), ["x", "settings_qc_reason"]].drop_duplicates()
-            for item in reasons.itertuples(index=False):
+        for x, row in enumerate(frame):
+            if row["issues"]:
                 laser_axis.annotate(
-                    str(item.settings_qc_reason).replace("; ", "\n")[:80],
-                    (item.x, laser_axis.get_ylim()[1]), xytext=(0, -3), textcoords="offset points",
+                    "\n".join(row["issues"])[:80],
+                    (x, laser_axis.get_ylim()[1]), xytext=(0, -3), textcoords="offset points",
                     ha="center", va="top", fontsize=7, color="red",
                 )
 

@@ -22,6 +22,27 @@ def test_discovery_uses_mouse_mapping_and_optional_920(tmp_path):
     assert len(rows)==1 and rows[0]["mouse_id"]=="mouse_1" and rows[0]["laser_nm"]==1050
     assert not report["errors"]
 
+
+def test_discovery_recognizes_field_prefixed_acquisition(tmp_path):
+    config, raw = _project(tmp_path)
+    _acq(raw, "session_20260819", "field100_res1024_ulFoV_zstack100to300_vol50", "square_1050.xml")
+    rows, report = discover_catalog(config)
+    assert len(rows) == 1 and rows[0]["analysis_included"] is True
+    assert not report["errors"]
+
+
+def test_missing_experiment_xml_acquisition_is_preserved_and_failed(tmp_path):
+    config, raw = _project(tmp_path)
+    missing = raw / "folder" / "session_20260821" / "filed_vol50"
+    missing.mkdir(parents=True)
+    rows, report = discover_catalog(config)
+    assert len(rows) == 1
+    assert rows[0]["role"] == "missing_xml"
+    assert rows[0]["settings_qc_pass"] is False
+    assert rows[0]["analysis_eligible"] is False
+    assert "missing Experiment.xml" in rows[0]["settings_qc_reason"]
+    assert any(error["code"] == "missing_experiment_xml" for error in report["errors"])
+
 def test_alignment_and_pairing_and_plan(tmp_path):
     config,raw=_project(tmp_path)
     _acq(raw,"session_20260820","filed_vol50","rectangular_1050.xml")

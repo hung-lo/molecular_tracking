@@ -79,3 +79,10 @@ def test_qc_table_has_required_gate_columns():
     table, summary = acquisition_settings_qc_table([_configured_row()])
     assert {"settings_qc_pass", "settings_qc_reason", "analysis_eligible"}.issubset(table.columns)
     assert summary["status"] == "PASS"
+
+
+def test_non_fucci_rows_are_not_reported_as_fucci_failures():
+    table, summary = acquisition_settings_qc_table([{"mouse_id": "mouse_1", "session_id": "s0", "analysis_included": True, "pmt_a_gain": 999}])
+    assert bool(table.iloc[0]["settings_qc_pass"]) is True
+    assert bool(table.iloc[0]["analysis_eligible"]) is True
+    assert summary["status"] == "PASS"

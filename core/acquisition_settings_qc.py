@@ -85,8 +85,12 @@ def acquisition_settings_qc_table(rows: list[dict[str, Any]], *, tolerance: floa
 
     records: list[dict[str, Any]] = []
     for row in rows:
-        expected = EXPECTED_ACQUISITION_SETTINGS.get(str(row.get("mouse_id", "")), {})
-        result = validate_acquisition_row(row, tolerance=tolerance)
+        mouse_id = str(row.get("mouse_id", ""))
+        expected = EXPECTED_ACQUISITION_SETTINGS.get(mouse_id, {})
+        if expected:
+            result = validate_acquisition_row(row, tolerance=tolerance)
+        else:
+            result = {"settings_qc_pass": True, "analysis_eligible": bool(row.get("analysis_included", True)), "settings_qc_reason": "not a configured Fucci workflow"}
         record = {key: row.get(key) for key in QC_COLUMNS}
         record.update({
             "expected_pmt_gain_a": expected.get("pmt_gain_a"), "expected_pmt_gain_b": expected.get("pmt_gain_b"),
@@ -122,13 +126,23 @@ def write_acquisition_settings_qc_artifacts(rows: list[dict[str, Any]], output_d
         (axes[2], "pockels_1050_start_pct", "pockels_1050_stop_pct", "expected_laser_1050_power", "expected_laser_1050_power", "1050-nm Pockels power"),
     ):
         if labels:
-            axis.plot(x, pd.to_numeric(table[actual_a], errors="coerce"), "o", label="start/A")
-            axis.plot(x, pd.to_numeric(table[actual_b], errors="coerce"), "x", label="stop/B")
+            actual_a_values = pd.to_numeric(table[actual_a], errors="coerce")
+            actual_b_values = pd.to_numeric(table[actual_b], errors="coerce")
+            axis.plot(x, actual_a_values, "o", label="start/A")
+            axis.plot(x, actual_b_values, "x", label="stop/B")
             expected_values = pd.to_numeric(table[expected_a], errors="coerce")
             axis.plot(x, expected_values, "--", color="black", label="expected")
             failed_x = [i for i, passed in enumerate(table["settings_qc_pass"].fillna(False)) if not passed]
             if failed_x:
-                axis.plot(failed_x, [0] * len(failed_x), "x", color="red", markersize=9, label="QC FAIL")
+                for failed_index in failed_x:
+                    axis.axvline(failed_index, color="red", alpha=0.18, linewidth=3)
+                if expected_values.notna().any():
+                    bad_a = [i for i in failed_x if pd.notna(actual_a_values.iloc[i]) and pd.notna(expected_values.iloc[i]) and not math.isclose(float(actual_a_values.iloc[i]), float(expected_values.iloc[i]), rel_tol=tolerance, abs_tol=tolerance)]
+                    bad_b = [i for i in failed_x if pd.notna(actual_b_values.iloc[i]) and pd.notna(expected_values.iloc[i]) and not math.isclose(float(actual_b_values.iloc[i]), float(expected_values.iloc[i]), rel_tol=tolerance, abs_tol=tolerance)]
+                    if bad_a:
+                        axis.plot(bad_a, actual_a_values.iloc[bad_a], "X", color="red", markersize=10, label="QC FAIL")
+                    if bad_b:
+                        axis.plot(bad_b, actual_b_values.iloc[bad_b], "X", color="red", markersize=10)
         axis.set_title(title); axis.grid(alpha=0.25)
     axes[-1].set_xticks(x); axes[-1].set_xticklabels(labels, rotation=70, ha="right", fontsize=7)
     axes[0].legend(loc="best", fontsize=8)

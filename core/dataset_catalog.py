@@ -116,6 +116,22 @@ def _discover_sessions(raw_root: Path, mice: list[Mouse], errors: list[dict], wa
                 discovered.append(DiscoveredSession(by_id[mouse_id], session, session_date, "flat"))
     return discovered
 
+
+def _is_acquisition_candidate(path: Path) -> bool:
+    """Recognize likely ThorImage acquisition folders without treating outputs as inputs."""
+
+    name = path.name.lower()
+    excluded = ("segmentation", "preprocessing", "matching", "extraction", "analysis", "output", "registered", "qc", "cellposesam")
+    if any(token in name for token in excluded):
+        return False
+    return (path / "Image_001_001.raw").is_file() or bool(
+        re.search(r"(?:^|_)(?:field|filed|acq)(?:\d+)?(?:_|$)|(?:^|_)vol\d+(?:_|$)|(?:^|_)laser\d+(?:_|$)", name)
+    )
+
+
+def _unavailable_acquisition_row(mouse: Mouse, found: DiscoveredSession, acq: Path, *, role: str, reason: str) -> dict[str, Any]:
+    return {"mouse_id":mouse.mouse_id,"experimental_group":mouse.values["experimental_group"],"cohort":mouse.values["cohort"],"session_id":found.path.name,"acquisition_date":found.session_date,"discovery_layout":found.discovery_layout,"acquisition_id":acq.name,"source_path":str(acq.resolve()),"role":role,"analysis_included":False,"laser_nm":None,"is_primary":False,"xml_date":None,"software_version":"","experiment_status":"","pixel_x":None,"pixel_y":None,"width_um":None,"height_um":None,"pixel_size_x_um":None,"pixel_size_y_um":None,"z_imaging_planes":None,"flyback_planes":None,"z_step_um":None,"timepoints":None,"streaming_frames":None,"pockels_920_start_pct":None,"pockels_920_stop_pct":None,"pockels_1050_start_pct":None,"pockels_1050_stop_pct":None,"pockels_node_count":None,"pmt_a_gain":None,"pmt_b_gain":None,"average_num":None,"raw_image_path":"","settings_qc_pass":False,"settings_qc_reason":reason,"analysis_eligible":False,"warnings":role}
+
 def discover_catalog(config:ProjectConfig)->tuple[list[dict[str,Any]],dict[str,Any]]:
     rows=[]; errors=[]; warnings=[]; mice=load_mice(config.paths.mice_csv)
     for mouse in mice:
@@ -137,14 +153,19 @@ def discover_catalog(config:ProjectConfig)->tuple[list[dict[str,Any]],dict[str,A
             errors.append({"code":"missing_mouse_folder","mouse_id":mouse.mouse_id,"path":str(config.paths.raw_root / mouse.raw_mouse_folder)})
     for found in sorted(discovered, key=lambda s: (s.mouse.mouse_id, s.session_date, s.path.name)):
         mouse, session, session_date = found.mouse, found.path, found.session_date
-        for acq in sorted(p for p in session.iterdir() if p.is_dir() and (p/"Experiment.xml").is_file()):
+        for acq in sorted(p for p in session.iterdir() if p.is_dir() and _is_acquisition_candidate(p)):
+                if not (acq / "Experiment.xml").is_file():
+                    reason = "missing Experiment.xml"
+                    rows.append(_unavailable_acquisition_row(mouse, found, acq, role="missing_xml", reason=reason))
+                    errors.append({"code":"missing_experiment_xml","mouse_id":mouse.mouse_id,"session_id":session.name,"path":str(acq)})
+                    continue
                 xml=acq/"Experiment.xml"
                 try: meta=parse_experiment_xml(xml)
                 except ThorImageParseError as exc:
                     # Preserve the acquisition in the catalog so the failed
                     # session remains auditable and downstream-ineligible.
                     errors.append({"code":"malformed_xml","path":str(xml),"message":str(exc)})
-                    rows.append({"mouse_id":mouse.mouse_id,"experimental_group":mouse.values["experimental_group"],"cohort":mouse.values["cohort"],"session_id":session.name,"acquisition_date":session_date,"discovery_layout":found.discovery_layout,"acquisition_id":acq.name,"source_path":str(acq.resolve()),"role":"malformed_xml","analysis_included":False,"laser_nm":None,"is_primary":False,"xml_date":None,"software_version":"","experiment_status":"","pixel_x":None,"pixel_y":None,"width_um":None,"height_um":None,"pixel_size_x_um":None,"pixel_size_y_um":None,"z_imaging_planes":None,"flyback_planes":None,"z_step_um":None,"timepoints":None,"streaming_frames":None,"pockels_920_start_pct":None,"pockels_920_stop_pct":None,"pockels_1050_start_pct":None,"pockels_1050_stop_pct":None,"pockels_node_count":None,"pmt_a_gain":None,"pmt_b_gain":None,"average_num":None,"raw_image_path":"","settings_qc_pass":False,"settings_qc_reason":f"malformed Experiment.xml: {exc}","analysis_eligible":False,"warnings":"malformed_xml"})
+                    rows.append(_unavailable_acquisition_row(mouse, found, acq, role="malformed_xml", reason=f"malformed Experiment.xml: {exc}"))
                     continue
                 role,included,laser,codes=_classification(acq.name,meta,config)
                 if meta.experiment_date!=session_date: codes.append("session_xml_date_mismatch")
@@ -194,7 +215,7 @@ def write_catalog(config,rows,report)->Path:
     sessions=[]
     for key in sorted({(r["mouse_id"],r["session_id"],r["acquisition_date"]) for r in rows}):
         chosen=[r for r in rows if (r["mouse_id"],r["session_id"],r["acquisition_date"])==key]
-        sessions.append({"mouse_id":key[0],"session_id":key[1],"acquisition_date":key[2],f"has_{config.rig.primary_laser_nm}":any(r["analysis_included"] and r["laser_nm"]==config.rig.primary_laser_nm for r in chosen),f"has_{config.rig.optional_laser_nm}":any(r["analysis_included"] and r["laser_nm"]==config.rig.optional_laser_nm for r in chosen)})
+        sessions.append({"mouse_id":key[0],"session_id":key[1],"acquisition_date":key[2],f"has_{config.rig.primary_laser_nm}":any(r["analysis_included"] and r["laser_nm"]==config.rig.primary_laser_nm for r in chosen),f"has_{config.rig.optional_laser_nm}":any(r["analysis_included"] and r["laser_nm"]==config.rig.optional_laser_nm for r in chosen),f"eligible_{config.rig.primary_laser_nm}":any(r["analysis_included"] and r.get("analysis_eligible", True) and r["laser_nm"]==config.rig.primary_laser_nm for r in chosen),f"eligible_{config.rig.optional_laser_nm}":any(r["analysis_included"] and r.get("analysis_eligible", True) and r["laser_nm"]==config.rig.optional_laser_nm for r in chosen)})
     _atomic_csv(output/"sessions.generated.csv",sessions,list(sessions[0]) if sessions else ["mouse_id","session_id","acquisition_date"])
     write_acquisition_settings_qc_artifacts(rows, output)
     mice=[m.values for m in load_mice(config.paths.mice_csv)]; _atomic_csv(output/"mice.validated.csv",mice,list(mice[0]))

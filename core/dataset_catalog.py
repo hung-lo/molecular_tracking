@@ -145,6 +145,33 @@ def _is_vol10_acquisition(name: str | Path) -> bool:
     return bool(_VOL10_RE.search(Path(name).name if isinstance(name, Path) else str(name)))
 
 
+def _catalog_bool(value: Any, *, field: str, default: bool) -> bool:
+    """Read catalog booleans consistently from native rows and CSV rows."""
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    if isinstance(value, bool):
+        return value
+    token = str(value).strip().lower()
+    if token == "true":
+        return True
+    if token == "false":
+        return False
+    raise ValueError(f"Invalid {field} boolean value: {value!r}")
+
+
+def _manifest_candidate(row: dict[str, Any], mouse_id: str, laser_nm: int) -> bool:
+    return (
+        row["mouse_id"] == mouse_id
+        and _catalog_bool(row.get("analysis_included"), field="analysis_included", default=False)
+        and not _catalog_bool(row.get("is_vol10_control"), field="is_vol10_control", default=False)
+        and not _is_vol10_acquisition(row.get("acquisition_id", ""))
+        and _catalog_bool(row.get("analysis_eligible"), field="analysis_eligible", default=True)
+        and row.get("laser_nm") not in (None, "", "nan")
+        and int(row["laser_nm"]) == laser_nm
+    )
+
+
 def _unavailable_acquisition_row(mouse: Mouse, found: DiscoveredSession, acq: Path, *, role: str, reason: str) -> dict[str, Any]:
     excluded = not mouse.pipeline_enabled
     return {"mouse_id":mouse.mouse_id,"pipeline_enabled":mouse.pipeline_enabled,"pipeline_exclusion_reason":mouse.pipeline_exclusion_reason,"experimental_group":mouse.values["experimental_group"],"cohort":mouse.values["cohort"],"session_id":found.path.name,"acquisition_date":found.session_date,"discovery_layout":found.discovery_layout,"acquisition_id":acq.name,"source_path":str(acq.resolve()),"role":role,"analysis_included":False,"laser_nm":None,"is_primary":False,"xml_date":None,"software_version":"","experiment_status":"","pixel_x":None,"pixel_y":None,"width_um":None,"height_um":None,"pixel_size_x_um":None,"pixel_size_y_um":None,"z_imaging_planes":None,"flyback_planes":None,"z_step_um":None,"timepoints":None,"streaming_frames":None,"pockels_920_start_pct":None,"pockels_920_stop_pct":None,"pockels_1050_start_pct":None,"pockels_1050_stop_pct":None,"pockels_node_count":None,"pmt_a_gain":None,"pmt_b_gain":None,"average_num":None,"raw_image_path":"","settings_qc_pass":None if excluded else False,"settings_qc_status":"not_applicable_pipeline_excluded" if excluded else "fail","settings_qc_reason":f"pipeline excluded: {mouse.pipeline_exclusion_reason}" if excluded else reason,"analysis_eligible":False,"is_vol10_control":False,"warnings":role}
@@ -284,7 +311,7 @@ def build_manifest_plan(config,rows,mouse_id:str,laser_nm:int|None=None,*,source
         raise ValueError(f"No acquisition QC configuration for Fucci mouse {mouse_id!r}; configure expected settings before manifest generation")
     if mouse_id.startswith("Fucci-") and rows and not {"settings_qc_pass", "settings_qc_reason", "analysis_eligible"}.issubset(rows[0]):
         raise ValueError("Acquisition rows lack settings QC fields; rebuild the catalog with tools/build_data_catalog.py")
-    selected=[r for r in rows if r["mouse_id"]==mouse_id and bool(r["analysis_included"]) and not bool(r.get("is_vol10_control")) and not _is_vol10_acquisition(r.get("acquisition_id", "")) and bool(r.get("analysis_eligible", True)) and r.get("laser_nm") not in (None, "", "nan") and int(r["laser_nm"])==laser]
+    selected=[r for r in rows if _manifest_candidate(r, mouse_id, laser)]
     grouped={}
     for row in selected: grouped.setdefault((row["session_id"],row["acquisition_date"],laser),[]).append(row)
     duplicates=[key for key,value in grouped.items() if len(value)!=1]
@@ -300,7 +327,7 @@ def build_manifest_plan(config,rows,mouse_id:str,laser_nm:int|None=None,*,source
     relevant=[e for e in fatal_errors if e.get("mouse_id")==mouse_id]
     if relevant: raise ValueError(f"Catalog validation errors prevent manifest generation for {mouse_id}: {relevant}")
     selected=[grouped[key][0] for key in sorted(grouped,key=lambda k:(k[1],k[0]))]
-    primary=[r for r in rows if r["mouse_id"]==mouse_id and bool(r["analysis_included"]) and not bool(r.get("is_vol10_control")) and not _is_vol10_acquisition(r.get("acquisition_id", "")) and bool(r.get("analysis_eligible", True)) and r.get("laser_nm") not in (None, "", "nan") and int(r["laser_nm"])==config.rig.primary_laser_nm]
+    primary=[r for r in rows if _manifest_candidate(r, mouse_id, config.rig.primary_laser_nm)]
     override=mice[mouse_id].values.get("reference_session_or_folder","")
     candidates=[r for r in primary if (r["session_id"]==override or r["acquisition_id"]==override or r["source_path"]==override or Path(r["source_path"]).name==override)] if override else sorted(primary,key=lambda r:(r["acquisition_date"],r["session_id"]))[:1]
     if len(candidates)!=1: raise ValueError(f"Reference override {override!r} resolved to {len(candidates)} acquisitions")

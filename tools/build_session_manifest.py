@@ -15,7 +15,7 @@ def main(argv=None):
     if not catalog.is_file(): raise FileNotFoundError(f"Acquisition catalog was not found: {catalog}")
     with catalog.open(encoding="utf-8",newline="") as h: rows=list(csv.DictReader(h))
     for row in rows:
-        row["analysis_included"]=str(row["analysis_included"]).lower()=="true"; row["analysis_eligible"]=str(row.get("analysis_eligible", "true")).lower()=="true"; row["laser_nm"]=int(row["laser_nm"]) if row["laser_nm"] else None
+        row["laser_nm"]=int(row["laser_nm"]) if row["laser_nm"] else None
     report_path=config.paths.derivatives_root/"_catalog"/"validation_report.json"
     report=json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
     path,ready=build_manifest_plan(config,rows,args.mouse_id,args.laser_nm,source_catalog=catalog,validation_report=report); print(f"{'manifest' if ready else 'plan'}={path}")

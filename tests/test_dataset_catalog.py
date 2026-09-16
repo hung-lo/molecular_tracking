@@ -1,3 +1,4 @@
+import csv
 from pathlib import Path
 import shutil
 import pytest
@@ -205,6 +206,31 @@ def _manifest_rows(config, count: int = 1) -> list[dict]:
         }
         for index in range(count)
     ]
+
+
+def test_manifest_plan_parses_csv_boolean_values_and_rejects_invalid_values(tmp_path):
+    config, _ = _project(tmp_path)
+    rows = _manifest_rows(config, count=4)
+    rows[0].update({"analysis_included": "True", "analysis_eligible": "TRUE", "is_vol10_control": "False", "laser_nm": "1050"})
+    rows[1].update({"analysis_included": True, "analysis_eligible": True, "is_vol10_control": False})
+    rows[2].update({"analysis_included": "True", "analysis_eligible": "False", "is_vol10_control": "False", "laser_nm": "1050"})
+    rows[3].update({"analysis_included": "False", "analysis_eligible": "False", "is_vol10_control": "True", "laser_nm": "1050"})
+    catalog = tmp_path / "acquisitions.generated.csv"
+    with catalog.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=rows[0])
+        writer.writeheader()
+        writer.writerows(rows)
+    with catalog.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+    plan, ready = build_manifest_plan(config, rows, "mouse_1")
+
+    assert not ready
+    with plan.open(newline="") as handle:
+        assert {row["session_id"] for row in csv.DictReader(handle)} == {"session_0", "session_1"}
+    rows[0]["analysis_eligible"] = "not-a-boolean"
+    with pytest.raises(ValueError, match="Invalid analysis_eligible boolean value"):
+        build_manifest_plan(config, rows, "mouse_1")
 
 
 def _write_manifest_inputs(config, rows: list[dict], ready: set[int]) -> None:

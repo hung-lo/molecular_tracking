@@ -153,7 +153,11 @@ def discover_catalog(config:ProjectConfig)->tuple[list[dict[str,Any]],dict[str,A
             errors.append({"code":"missing_mouse_folder","mouse_id":mouse.mouse_id,"path":str(config.paths.raw_root / mouse.raw_mouse_folder)})
     for found in sorted(discovered, key=lambda s: (s.mouse.mouse_id, s.session_date, s.path.name)):
         mouse, session, session_date = found.mouse, found.path, found.session_date
-        for acq in sorted(p for p in session.iterdir() if p.is_dir() and _is_acquisition_candidate(p)):
+        for acq in sorted(
+            p
+            for p in session.iterdir()
+            if p.is_dir() and ((p / "Experiment.xml").is_file() or _is_acquisition_candidate(p))
+        ):
                 if not (acq / "Experiment.xml").is_file():
                     reason = "missing Experiment.xml"
                     rows.append(_unavailable_acquisition_row(mouse, found, acq, role="missing_xml", reason=reason))
@@ -215,7 +219,7 @@ def write_catalog(config,rows,report)->Path:
     sessions=[]
     for key in sorted({(r["mouse_id"],r["session_id"],r["acquisition_date"]) for r in rows}):
         chosen=[r for r in rows if (r["mouse_id"],r["session_id"],r["acquisition_date"])==key]
-        sessions.append({"mouse_id":key[0],"session_id":key[1],"acquisition_date":key[2],f"has_{config.rig.primary_laser_nm}":any(r["analysis_included"] and r["laser_nm"]==config.rig.primary_laser_nm for r in chosen),f"has_{config.rig.optional_laser_nm}":any(r["analysis_included"] and r["laser_nm"]==config.rig.optional_laser_nm for r in chosen),f"eligible_{config.rig.primary_laser_nm}":any(r["analysis_included"] and r.get("analysis_eligible", True) and r["laser_nm"]==config.rig.primary_laser_nm for r in chosen),f"eligible_{config.rig.optional_laser_nm}":any(r["analysis_included"] and r.get("analysis_eligible", True) and r["laser_nm"]==config.rig.optional_laser_nm for r in chosen)})
+        sessions.append({"mouse_id":key[0],"session_id":key[1],"acquisition_date":key[2],f"has_{config.rig.primary_laser_nm}":any(r["analysis_included"] and r["laser_nm"]==config.rig.primary_laser_nm for r in chosen),f"has_{config.rig.optional_laser_nm}":any(r["analysis_included"] and r["laser_nm"]==config.rig.optional_laser_nm for r in chosen),f"eligible_{config.rig.primary_laser_nm}":any(r["analysis_included"] and r.get("analysis_eligible", False) and r["laser_nm"]==config.rig.primary_laser_nm for r in chosen),f"eligible_{config.rig.optional_laser_nm}":any(r["analysis_included"] and r.get("analysis_eligible", False) and r["laser_nm"]==config.rig.optional_laser_nm for r in chosen)})
     _atomic_csv(output/"sessions.generated.csv",sessions,list(sessions[0]) if sessions else ["mouse_id","session_id","acquisition_date"])
     write_acquisition_settings_qc_artifacts(rows, output)
     mice=[m.values for m in load_mice(config.paths.mice_csv)]; _atomic_csv(output/"mice.validated.csv",mice,list(mice[0]))

@@ -33,6 +33,21 @@ QC_COLUMNS = [
 ]
 
 
+def _selected_laser(value: Any, wavelength: int) -> bool:
+    try:
+        return int(float(value)) == wavelength
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _laser_is_active(start: Any, stop: Any, *, selected: bool, tolerance: float) -> bool:
+    try:
+        active = abs(float(start)) > tolerance or abs(float(stop)) > tolerance
+    except (TypeError, ValueError, OverflowError):
+        active = selected
+    return active or selected
+
+
 def validate_acquisition_row(row: Mapping[str, Any], *, tolerance: float = 1e-6) -> dict[str, Any]:
     """Validate one catalog row against configured settings, returning all mismatches."""
 
@@ -58,16 +73,8 @@ def validate_acquisition_row(row: Mapping[str, Any], *, tolerance: float = 1e-6)
     for wavelength in (920, 1050):
         start = row.get(f"pockels_{wavelength}_start_pct")
         stop = row.get(f"pockels_{wavelength}_stop_pct")
-        try:
-            selected_laser = int(float(row.get("laser_nm"))) == wavelength
-        except (TypeError, ValueError):
-            selected_laser = False
-        try:
-            active = abs(float(start)) > tolerance or abs(float(stop)) > tolerance
-        except (TypeError, ValueError):
-            active = selected_laser
-        active = active or selected_laser
-        if active:
+        selected_laser = _selected_laser(row.get("laser_nm"), wavelength)
+        if _laser_is_active(start, stop, selected=selected_laser, tolerance=tolerance):
             expected_power = expected[f"laser_{wavelength}_power"]
             check(f"pockels_{wavelength}_start_pct", start, expected_power, str(wavelength))
             check(f"pockels_{wavelength}_stop_pct", stop, expected_power, str(wavelength))
@@ -89,6 +96,12 @@ def acquisition_settings_qc_table(rows: list[dict[str, Any]], *, tolerance: floa
         expected = EXPECTED_ACQUISITION_SETTINGS.get(mouse_id, {})
         if expected:
             result = validate_acquisition_row(row, tolerance=tolerance)
+        elif row.get("settings_qc_pass") is False:
+            result = {
+                "settings_qc_pass": False,
+                "analysis_eligible": False,
+                "settings_qc_reason": str(row.get("settings_qc_reason") or "acquisition metadata unavailable"),
+            }
         else:
             result = {"settings_qc_pass": True, "analysis_eligible": bool(row.get("analysis_included", True)), "settings_qc_reason": "not a configured Fucci workflow"}
         record = {key: row.get(key) for key in QC_COLUMNS}
@@ -120,10 +133,10 @@ def write_acquisition_settings_qc_artifacts(rows: list[dict[str, Any]], output_d
     fig, axes = plt.subplots(3, 1, figsize=(max(8, 0.45 * max(len(table), 1)), 7), sharex=True)
     labels = table["session_id"].astype(str).tolist() if not table.empty else []
     x = list(range(len(labels)))
-    for axis, actual_a, actual_b, expected_a, expected_b, title in (
-        (axes[0], "pmt_a_gain", "pmt_b_gain", "expected_pmt_gain_a", "expected_pmt_gain_b", "PMT gains"),
-        (axes[1], "pockels_920_start_pct", "pockels_920_stop_pct", "expected_laser_920_power", "expected_laser_920_power", "920-nm Pockels power"),
-        (axes[2], "pockels_1050_start_pct", "pockels_1050_stop_pct", "expected_laser_1050_power", "expected_laser_1050_power", "1050-nm Pockels power"),
+    for axis, actual_a, actual_b, expected_a, expected_b, title, wavelength in (
+        (axes[0], "pmt_a_gain", "pmt_b_gain", "expected_pmt_gain_a", "expected_pmt_gain_b", "PMT gains", None),
+        (axes[1], "pockels_920_start_pct", "pockels_920_stop_pct", "expected_laser_920_power", "expected_laser_920_power", "920-nm Pockels power", 920),
+        (axes[2], "pockels_1050_start_pct", "pockels_1050_stop_pct", "expected_laser_1050_power", "expected_laser_1050_power", "1050-nm Pockels power", 1050),
     ):
         if labels:
             actual_a_values = pd.to_numeric(table[actual_a], errors="coerce")
@@ -137,8 +150,20 @@ def write_acquisition_settings_qc_artifacts(rows: list[dict[str, Any]], output_d
                 for failed_index in failed_x:
                     axis.axvline(failed_index, color="red", alpha=0.18, linewidth=3)
                 if expected_values.notna().any():
-                    bad_a = [i for i in failed_x if pd.notna(actual_a_values.iloc[i]) and pd.notna(expected_values.iloc[i]) and not math.isclose(float(actual_a_values.iloc[i]), float(expected_values.iloc[i]), rel_tol=tolerance, abs_tol=tolerance)]
-                    bad_b = [i for i in failed_x if pd.notna(actual_b_values.iloc[i]) and pd.notna(expected_values.iloc[i]) and not math.isclose(float(actual_b_values.iloc[i]), float(expected_values.iloc[i]), rel_tol=tolerance, abs_tol=tolerance)]
+                    if wavelength is None:
+                        eligible_indices = failed_x
+                    else:
+                        selected = table["laser_nm"]
+                        eligible_indices = [
+                            i for i in failed_x
+                            if _laser_is_active(
+                                actual_a_values.iloc[i], actual_b_values.iloc[i],
+                                selected=_selected_laser(selected.iloc[i], wavelength),
+                                tolerance=tolerance,
+                            )
+                        ]
+                    bad_a = [i for i in eligible_indices if pd.notna(actual_a_values.iloc[i]) and pd.notna(expected_values.iloc[i]) and not math.isclose(float(actual_a_values.iloc[i]), float(expected_values.iloc[i]), rel_tol=tolerance, abs_tol=tolerance)]
+                    bad_b = [i for i in eligible_indices if pd.notna(actual_b_values.iloc[i]) and pd.notna(expected_values.iloc[i]) and not math.isclose(float(actual_b_values.iloc[i]), float(expected_values.iloc[i]), rel_tol=tolerance, abs_tol=tolerance)]
                     if bad_a:
                         axis.plot(bad_a, actual_a_values.iloc[bad_a], "X", color="red", markersize=10, label="QC FAIL")
                     if bad_b:

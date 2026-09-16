@@ -31,6 +31,15 @@ def test_discovery_recognizes_field_prefixed_acquisition(tmp_path):
     assert not report["errors"]
 
 
+def test_discovery_preserves_xml_acquisition_with_nonstandard_name(tmp_path):
+    config, raw = _project(tmp_path)
+    _acq(raw, "session_20260819", "unexpected_acquisition_name", "square_1050.xml")
+    rows, report = discover_catalog(config)
+    assert len(rows) == 1 and rows[0]["analysis_included"] is True
+    assert rows[0]["role"] == "canonical"
+    assert not report["errors"]
+
+
 def test_missing_experiment_xml_acquisition_is_preserved_and_failed(tmp_path):
     config, raw = _project(tmp_path)
     missing = raw / "folder" / "session_20260821" / "filed_vol50"

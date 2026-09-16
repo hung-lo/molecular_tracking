@@ -86,3 +86,15 @@ def test_non_fucci_rows_are_not_reported_as_fucci_failures():
     assert bool(table.iloc[0]["settings_qc_pass"]) is True
     assert bool(table.iloc[0]["analysis_eligible"]) is True
     assert summary["status"] == "PASS"
+
+
+def test_non_configured_hard_failure_remains_failed_in_qc_table():
+    table, summary = acquisition_settings_qc_table([{
+        "mouse_id": "mouse_1", "session_id": "s0", "role": "missing_xml",
+        "analysis_included": False, "settings_qc_pass": False,
+        "analysis_eligible": False, "settings_qc_reason": "missing Experiment.xml",
+    }])
+    assert bool(table.iloc[0]["settings_qc_pass"]) is False
+    assert bool(table.iloc[0]["analysis_eligible"]) is False
+    assert "missing Experiment.xml" in table.iloc[0]["settings_qc_reason"]
+    assert summary["status"] == "FAIL"

@@ -1,9 +1,9 @@
 # Phase D1 Local Segmentation Rescue Pre-Pilot Hardening Report (2026-09-16)
 
 baseline: `2e53dc4`
-ending commit: `87c0f530c0c0a8f82fba9613fb32c32ec81bdd7a`
-focused tests: `32 passed`
-full suite: `331 passed, 2 skipped`
+ending commit: `9acef387718375d8f1fad70f8be2a5135d0c5f60`
+focused tests: `33 passed`
+full suite: `332 passed, 2 skipped`
 
 ## TRUSTED SYNTHETIC SET
 

@@ -1,6 +1,7 @@
 from pathlib import Path
 import shutil
 import pytest
+from acquisition_settings_qc import acquisition_settings_qc_table
 from dataset_catalog import _is_vol10_acquisition, build_manifest_plan, discover_catalog
 from project_config import load_project_config
 
@@ -105,10 +106,23 @@ def test_pipeline_excluded_fucci_is_kept_in_catalog_but_cannot_make_manifest(tmp
         "Fucci-Tri_2,group,cohort,folder,,false,poor FoV quality\n"
     )
     _acq(raw, "session_20260819", "filed_vol50", "square_1050.xml")
+    _acq(raw, "session_20260819", "filed_vol10", "square_1050.xml")
     rows, report = discover_catalog(config)
-    assert rows[0]["settings_qc_status"] == "not_applicable_pipeline_excluded"
-    assert rows[0]["settings_qc_pass"] is None
-    assert rows[0]["analysis_eligible"] is False
+    canonical = next(row for row in rows if row["acquisition_id"] == "filed_vol50")
+    vol10 = next(row for row in rows if row["acquisition_id"] == "filed_vol10")
+    assert canonical["settings_qc_status"] == "not_applicable_pipeline_excluded"
+    assert canonical["settings_qc_pass"] is None
+    assert canonical["analysis_eligible"] is False
+    assert vol10["pipeline_enabled"] is False
+    assert vol10["pipeline_exclusion_reason"] == "poor FoV quality"
+    assert vol10["settings_qc_status"] == "not_applicable_pipeline_excluded"
+    assert vol10["analysis_eligible"] is False
+    qc_table, qc_summary = acquisition_settings_qc_table(rows)
+    qc_vol10 = qc_table.loc[qc_table["acquisition_id"].eq("filed_vol10")].iloc[0]
+    assert bool(qc_vol10["pipeline_enabled"]) is False
+    assert qc_vol10["settings_qc_status"] == "not_applicable_pipeline_excluded"
+    assert bool(qc_vol10["analysis_eligible"]) is False
+    assert qc_summary["n_fail"] == 0
     assert not report["errors"]
     assert report["summary"]["Fucci-Tri_2"]["pipeline_exclusion_reason"] == "poor FoV quality"
     with pytest.raises(ValueError, match="excluded from the longitudinal pipeline"):

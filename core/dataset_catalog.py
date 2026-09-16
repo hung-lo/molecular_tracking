@@ -155,7 +155,9 @@ def _vol10_acquisition_row(mouse: Mouse, found: DiscoveredSession, acq: Path) ->
         mouse, found, acq, role="alignment_only",
         reason="excluded: _vol10 acquisition is not used for analysis",
     )
-    row.update({"settings_qc_pass": None, "settings_qc_status": "not_applicable_vol10", "is_vol10_control": True})
+    row["is_vol10_control"] = True
+    if mouse.pipeline_enabled:
+        row.update({"settings_qc_pass": None, "settings_qc_status": "not_applicable_vol10"})
     return row
 
 def discover_catalog(config:ProjectConfig)->tuple[list[dict[str,Any]],dict[str,Any]]:

@@ -31,6 +31,10 @@ class Mouse:
     def mouse_id(self): return self.values["mouse_id"]
     @property
     def raw_mouse_folder(self): return self.values["raw_mouse_folder"]
+    @property
+    def pipeline_enabled(self) -> bool: return self.values.get("pipeline_enabled", "true") == "true"
+    @property
+    def pipeline_exclusion_reason(self) -> str: return self.values.get("pipeline_exclusion_reason", "")
 
 def load_mice(path: str|Path) -> list[Mouse]:
     source=Path(path)
@@ -42,6 +46,12 @@ def load_mice(path: str|Path) -> list[Mouse]:
     for row in rows:
         nulls=tuple(sorted(k for k,v in row.items() if str(v or "").strip().upper() in NULL_COMPAT))
         normalized={k:("" if k in nulls else str(v or "").strip()) for k,v in row.items()}
+        enabled=normalized.get("pipeline_enabled", "true").lower()
+        if enabled not in {"true", "false"}: raise ValueError(f"pipeline_enabled must be true or false for {normalized['mouse_id']}")
+        normalized["pipeline_enabled"]=enabled
+        normalized.setdefault("pipeline_exclusion_reason", "")
+        if enabled == "false" and not normalized["pipeline_exclusion_reason"]:
+            raise ValueError(f"Disabled mouse {normalized['mouse_id']} requires pipeline_exclusion_reason")
         if normalized["mouse_id"] in ids: raise ValueError(f"Duplicate mouse_id: {normalized['mouse_id']}")
         if normalized["raw_mouse_folder"] in folders: raise ValueError(f"Duplicate raw_mouse_folder mapping: {normalized['raw_mouse_folder']}")
         ids.add(normalized["mouse_id"]); folders.add(normalized["raw_mouse_folder"]); output.append(Mouse(normalized,nulls))
@@ -136,7 +146,8 @@ def _is_vol10_acquisition(name: str | Path) -> bool:
 
 
 def _unavailable_acquisition_row(mouse: Mouse, found: DiscoveredSession, acq: Path, *, role: str, reason: str) -> dict[str, Any]:
-    return {"mouse_id":mouse.mouse_id,"experimental_group":mouse.values["experimental_group"],"cohort":mouse.values["cohort"],"session_id":found.path.name,"acquisition_date":found.session_date,"discovery_layout":found.discovery_layout,"acquisition_id":acq.name,"source_path":str(acq.resolve()),"role":role,"analysis_included":False,"laser_nm":None,"is_primary":False,"xml_date":None,"software_version":"","experiment_status":"","pixel_x":None,"pixel_y":None,"width_um":None,"height_um":None,"pixel_size_x_um":None,"pixel_size_y_um":None,"z_imaging_planes":None,"flyback_planes":None,"z_step_um":None,"timepoints":None,"streaming_frames":None,"pockels_920_start_pct":None,"pockels_920_stop_pct":None,"pockels_1050_start_pct":None,"pockels_1050_stop_pct":None,"pockels_node_count":None,"pmt_a_gain":None,"pmt_b_gain":None,"average_num":None,"raw_image_path":"","settings_qc_pass":False,"settings_qc_status":"fail","settings_qc_reason":reason,"analysis_eligible":False,"is_vol10_control":False,"warnings":role}
+    excluded = not mouse.pipeline_enabled
+    return {"mouse_id":mouse.mouse_id,"pipeline_enabled":mouse.pipeline_enabled,"pipeline_exclusion_reason":mouse.pipeline_exclusion_reason,"experimental_group":mouse.values["experimental_group"],"cohort":mouse.values["cohort"],"session_id":found.path.name,"acquisition_date":found.session_date,"discovery_layout":found.discovery_layout,"acquisition_id":acq.name,"source_path":str(acq.resolve()),"role":role,"analysis_included":False,"laser_nm":None,"is_primary":False,"xml_date":None,"software_version":"","experiment_status":"","pixel_x":None,"pixel_y":None,"width_um":None,"height_um":None,"pixel_size_x_um":None,"pixel_size_y_um":None,"z_imaging_planes":None,"flyback_planes":None,"z_step_um":None,"timepoints":None,"streaming_frames":None,"pockels_920_start_pct":None,"pockels_920_stop_pct":None,"pockels_1050_start_pct":None,"pockels_1050_stop_pct":None,"pockels_node_count":None,"pmt_a_gain":None,"pmt_b_gain":None,"average_num":None,"raw_image_path":"","settings_qc_pass":None if excluded else False,"settings_qc_status":"not_applicable_pipeline_excluded" if excluded else "fail","settings_qc_reason":f"pipeline excluded: {mouse.pipeline_exclusion_reason}" if excluded else reason,"analysis_eligible":False,"is_vol10_control":False,"warnings":role}
 
 
 def _vol10_acquisition_row(mouse: Mouse, found: DiscoveredSession, acq: Path) -> dict[str, Any]:
@@ -164,7 +175,7 @@ def discover_catalog(config:ProjectConfig)->tuple[list[dict[str,Any]],dict[str,A
     discovered = [found for found in discovered if (found.mouse.mouse_id, found.session_date) not in conflicting_keys]
     grouped_mouse_ids = {s.mouse.mouse_id for s in discovered if s.discovery_layout == "grouped"}
     for mouse in mice:
-        if mouse.mouse_id not in grouped_mouse_ids and not any(s.mouse.mouse_id == mouse.mouse_id and s.discovery_layout == "flat" for s in discovered):
+        if mouse.pipeline_enabled and mouse.mouse_id not in grouped_mouse_ids and not any(s.mouse.mouse_id == mouse.mouse_id and s.discovery_layout == "flat" for s in discovered):
             errors.append({"code":"missing_mouse_folder","mouse_id":mouse.mouse_id,"path":str(config.paths.raw_root / mouse.raw_mouse_folder)})
     for found in sorted(discovered, key=lambda s: (s.mouse.mouse_id, s.session_date, s.path.name)):
         mouse, session, session_date = found.mouse, found.path, found.session_date
@@ -175,21 +186,23 @@ def discover_catalog(config:ProjectConfig)->tuple[list[dict[str,Any]],dict[str,A
                 if not (acq / "Experiment.xml").is_file():
                     reason = "missing Experiment.xml"
                     rows.append(_unavailable_acquisition_row(mouse, found, acq, role="missing_xml", reason=reason))
-                    row_ineligible.append({"code":"missing_experiment_xml","severity":"row_ineligible","mouse_id":mouse.mouse_id,"session_id":session.name,"path":str(acq)})
+                    if mouse.pipeline_enabled: row_ineligible.append({"code":"missing_experiment_xml","severity":"row_ineligible","mouse_id":mouse.mouse_id,"session_id":session.name,"path":str(acq)})
                     continue
                 xml=acq/"Experiment.xml"
                 try: meta=parse_experiment_xml(xml)
                 except ThorImageParseError as exc:
                     # Preserve the acquisition in the catalog so the failed
                     # session remains auditable and downstream-ineligible.
-                    row_ineligible.append({"code":"malformed_xml","severity":"row_ineligible","mouse_id":mouse.mouse_id,"session_id":session.name,"path":str(xml),"message":str(exc)})
+                    if mouse.pipeline_enabled: row_ineligible.append({"code":"malformed_xml","severity":"row_ineligible","mouse_id":mouse.mouse_id,"session_id":session.name,"path":str(xml),"message":str(exc)})
                     rows.append(_unavailable_acquisition_row(mouse, found, acq, role="malformed_xml", reason=f"malformed Experiment.xml: {exc}"))
                     continue
                 role,included,laser,codes=_classification(acq.name,meta,config)
                 if meta.experiment_date!=session_date: codes.append("session_xml_date_mismatch")
                 p=list(meta.pockels)+[None,None]; raw=acq/"Image_001_001.raw"
-                row={"mouse_id":mouse.mouse_id,"experimental_group":mouse.values["experimental_group"],"cohort":mouse.values["cohort"],"session_id":session.name,"acquisition_date":session_date,"discovery_layout":found.discovery_layout,"acquisition_id":acq.name,"source_path":str(acq.resolve()),"role":role,"analysis_included":included,"laser_nm":laser,"is_primary":laser==config.rig.primary_laser_nm and included,"xml_date":meta.experiment_date,"software_version":meta.software_version,"experiment_status":meta.experiment_status,"pixel_x":meta.pixel_x,"pixel_y":meta.pixel_y,"width_um":meta.width_um,"height_um":meta.height_um,"pixel_size_x_um":meta.pixel_width_um,"pixel_size_y_um":meta.pixel_height_um,"z_imaging_planes":meta.z_steps,"flyback_planes":meta.flyback_frames,"z_step_um":meta.z_step_um,"timepoints":meta.timepoints,"streaming_frames":meta.streaming_frames,"pockels_920_start_pct":p[0].start if p[0] else None,"pockels_920_stop_pct":p[0].stop if p[0] else None,"pockels_1050_start_pct":p[1].start if p[1] else None,"pockels_1050_stop_pct":p[1].stop if p[1] else None,"pockels_node_count":len(meta.pockels),"pmt_a_gain":meta.pmt_a_gain,"pmt_b_gain":meta.pmt_b_gain,"average_num":meta.average_num,"raw_image_path":str(raw.resolve()) if raw.exists() else "","is_vol10_control":False,"warnings":";".join(sorted(set(codes)))}
-                if not included:
+                row={"mouse_id":mouse.mouse_id,"pipeline_enabled":mouse.pipeline_enabled,"pipeline_exclusion_reason":mouse.pipeline_exclusion_reason,"experimental_group":mouse.values["experimental_group"],"cohort":mouse.values["cohort"],"session_id":session.name,"acquisition_date":session_date,"discovery_layout":found.discovery_layout,"acquisition_id":acq.name,"source_path":str(acq.resolve()),"role":role,"analysis_included":included,"laser_nm":laser,"is_primary":laser==config.rig.primary_laser_nm and included,"xml_date":meta.experiment_date,"software_version":meta.software_version,"experiment_status":meta.experiment_status,"pixel_x":meta.pixel_x,"pixel_y":meta.pixel_y,"width_um":meta.width_um,"height_um":meta.height_um,"pixel_size_x_um":meta.pixel_width_um,"pixel_size_y_um":meta.pixel_height_um,"z_imaging_planes":meta.z_steps,"flyback_planes":meta.flyback_frames,"z_step_um":meta.z_step_um,"timepoints":meta.timepoints,"streaming_frames":meta.streaming_frames,"pockels_920_start_pct":p[0].start if p[0] else None,"pockels_920_stop_pct":p[0].stop if p[0] else None,"pockels_1050_start_pct":p[1].start if p[1] else None,"pockels_1050_stop_pct":p[1].stop if p[1] else None,"pockels_node_count":len(meta.pockels),"pmt_a_gain":meta.pmt_a_gain,"pmt_b_gain":meta.pmt_b_gain,"average_num":meta.average_num,"raw_image_path":str(raw.resolve()) if raw.exists() else "","is_vol10_control":False,"warnings":";".join(sorted(set(codes)))}
+                if not mouse.pipeline_enabled:
+                    row.update({"analysis_included":False,"is_primary":False,"settings_qc_pass":None,"settings_qc_status":"not_applicable_pipeline_excluded","settings_qc_reason":f"pipeline excluded: {mouse.pipeline_exclusion_reason}","analysis_eligible":False})
+                elif not included:
                     row.update({"settings_qc_pass": None, "settings_qc_status":"not_applicable", "settings_qc_reason": f"excluded: {role} acquisition is not used for analysis", "analysis_eligible": False})
                 elif mouse.mouse_id.startswith("Fucci-") and mouse.mouse_id not in EXPECTED_ACQUISITION_SETTINGS:
                     row.update({"settings_qc_pass": None, "settings_qc_status":"not_configured", "settings_qc_reason": "no acquisition QC configuration for Fucci mouse", "analysis_eligible": False})
@@ -222,10 +235,10 @@ def discover_catalog(config:ProjectConfig)->tuple[list[dict[str,Any]],dict[str,A
 
 def catalog_summary(rows,config):
     result={}; primary=config.rig.primary_laser_nm; optional=config.rig.optional_laser_nm
-    for mouse in sorted({r["mouse_id"] for r in rows}):
-        subset=[r for r in rows if r["mouse_id"]==mouse]
-        applicable=[r for r in subset if r.get("settings_qc_status") not in {"not_applicable_vol10", "not_configured"}]
-        result[mouse]={"sessions":len({r["session_id"] for r in subset if r["analysis_included"] and r.get("analysis_eligible", False) and r["laser_nm"]==primary}),f"canonical_{primary}":sum(r["analysis_included"] and r["laser_nm"]==primary for r in subset),f"canonical_{optional}":sum(r["analysis_included"] and r["laser_nm"]==optional for r in subset),"settings_qc_pass":sum(r.get("settings_qc_status")=="pass" for r in applicable),"settings_qc_fail":sum(r.get("settings_qc_status")=="fail" for r in applicable),"vol10_excluded":sum(bool(r.get("is_vol10_control")) for r in subset),"not_configured":sum(r.get("settings_qc_status")=="not_configured" for r in subset),"alignment_only":sum(r["role"]=="alignment_only" for r in subset),"noncanonical":sum(r["role"]=="noncanonical" for r in subset),"auxiliary_or_test":sum(r["role"]=="auxiliary_or_test" for r in subset)}
+    for metadata in load_mice(config.paths.mice_csv):
+        mouse=metadata.mouse_id; subset=[r for r in rows if r["mouse_id"]==mouse]
+        applicable=[r for r in subset if r.get("settings_qc_status") not in {"not_applicable_vol10", "not_applicable_pipeline_excluded", "not_configured"}]
+        result[mouse]={"pipeline_enabled":metadata.pipeline_enabled,"pipeline_exclusion_reason":metadata.pipeline_exclusion_reason,"catalog_acquisitions":len(subset),"sessions":len({r["session_id"] for r in subset if r["analysis_included"] and r.get("analysis_eligible", False) and r["laser_nm"]==primary}),f"canonical_{primary}":sum(r["analysis_included"] and r["laser_nm"]==primary for r in subset),f"canonical_{optional}":sum(r["analysis_included"] and r["laser_nm"]==optional for r in subset),"settings_qc_pass":sum(r.get("settings_qc_status")=="pass" for r in applicable),"settings_qc_fail":sum(r.get("settings_qc_status")=="fail" for r in applicable),"vol10_excluded":sum(bool(r.get("is_vol10_control")) for r in subset),"not_configured":sum(r.get("settings_qc_status")=="not_configured" for r in subset),"alignment_only":sum(r["role"]=="alignment_only" for r in subset),"noncanonical":sum(r["role"]=="noncanonical" for r in subset),"auxiliary_or_test":sum(r["role"]=="auxiliary_or_test" for r in subset)}
     return result
 
 def _atomic_text(path:Path,text:str)->None:
@@ -248,6 +261,11 @@ def write_catalog(config,rows,report)->Path:
         sessions.append({"mouse_id":key[0],"session_id":key[1],"acquisition_date":key[2],f"has_{config.rig.primary_laser_nm}":any(r["analysis_included"] and not _is_vol10_acquisition(r.get("acquisition_id", "")) and r["laser_nm"]==config.rig.primary_laser_nm for r in chosen),f"has_{config.rig.optional_laser_nm}":any(r["analysis_included"] and not _is_vol10_acquisition(r.get("acquisition_id", "")) and r["laser_nm"]==config.rig.optional_laser_nm for r in chosen),f"eligible_{config.rig.primary_laser_nm}":any(r["analysis_included"] and not _is_vol10_acquisition(r.get("acquisition_id", "")) and r.get("analysis_eligible", False) and r["laser_nm"]==config.rig.primary_laser_nm for r in chosen),f"eligible_{config.rig.optional_laser_nm}":any(r["analysis_included"] and not _is_vol10_acquisition(r.get("acquisition_id", "")) and r.get("analysis_eligible", False) and r["laser_nm"]==config.rig.optional_laser_nm for r in chosen)})
     _atomic_csv(output/"sessions.generated.csv",sessions,list(sessions[0]) if sessions else ["mouse_id","session_id","acquisition_date"])
     _, qc_summary = write_acquisition_settings_qc_artifacts(rows, output)
+    qc_summary["pipeline_excluded_mice"] = [
+        {"mouse_id": mouse, "reason": details["pipeline_exclusion_reason"]}
+        for mouse, details in report["summary"].items()
+        if not details["pipeline_enabled"]
+    ]
     _atomic_text(output/"acquisition_settings_qc.json", json.dumps(qc_summary, indent=2, sort_keys=True))
     mice=[m.values for m in load_mice(config.paths.mice_csv)]; _atomic_csv(output/"mice.validated.csv",mice,list(mice[0]))
     _atomic_text(output/"validation_report.json",json.dumps(report,indent=2,sort_keys=True))
@@ -258,6 +276,8 @@ def _sha(path:Path)->str:return hashlib.sha256(path.read_bytes()).hexdigest()
 def build_manifest_plan(config,rows,mouse_id:str,laser_nm:int|None=None,*,source_catalog:Path|None=None,validation_report:dict|None=None)->tuple[Path,bool]:
     laser=int(laser_nm if laser_nm is not None else config.rig.primary_laser_nm); mice={m.mouse_id:m for m in load_mice(config.paths.mice_csv)}
     if mouse_id not in mice: raise ValueError(f"Unknown mouse_id {mouse_id!r}")
+    if not mice[mouse_id].pipeline_enabled:
+        raise ValueError(f"Mouse {mouse_id!r} is excluded from the longitudinal pipeline: {mice[mouse_id].pipeline_exclusion_reason}")
     if mouse_id.startswith("Fucci-") and mouse_id not in EXPECTED_ACQUISITION_SETTINGS:
         raise ValueError(f"No acquisition QC configuration for Fucci mouse {mouse_id!r}; configure expected settings before manifest generation")
     if mouse_id.startswith("Fucci-") and rows and not {"settings_qc_pass", "settings_qc_reason", "analysis_eligible"}.issubset(rows[0]):

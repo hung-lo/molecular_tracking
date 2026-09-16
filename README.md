@@ -168,16 +168,20 @@ Acquisition QC happens before sessions are allowed into the quantitative longitu
 
 The currently configured Fucci acquisition expectations are:
 
-| Mouse | PMT A | PMT B | 920-nm power | 1050-nm power |
-|---|---:|---:|---:|---:|
-| `Fucci-Tri_1` | 10 | 10 | 50 | 50 |
-| `Fucci-Tri_3` | 10 | 10 | 60 | 60 |
-| `Fucci-Dead_1` | 10 | 10 | 70 | 70 |
-| `Fucci-Dead_2` | 10 | 10 | 70 | 70 |
+| Mouse | Pipeline | PMT A | PMT B | 920-nm power | 1050-nm power |
+|---|---|---:|---:|---:|---:|
+| `Fucci-Tri_1` | enabled | 10 | 10 | 50 | 50 |
+| `Fucci-Tri_2` | excluded — poor FoV quality | n/a | n/a | n/a | n/a |
+| `Fucci-Tri_3` | enabled | 10 | 10 | 60 | 60 |
+| `Fucci-Tri_4` | enabled | 10 | 10 | 70 | 70 |
+| `Fucci-Dead_1` | enabled | 10 | 10 | 70 | 70 |
+| `Fucci-Dead_2` | enabled | 10 | 10 | 70 | 70 |
 
 For an active laser, both Pockels start and stop values must match the configured expected power. The selected laser is always treated as active, so an accidentally zero or incorrect selected-laser power fails QC.
 
 A Fucci acquisition that fails this check is marked `analysis_eligible = False` and is excluded from manifest generation.
+
+`Fucci-Tri_2` is explicitly disabled from the longitudinal pipeline because of poor FoV quality. Its raw acquisitions remain in the catalog for provenance, but it is omitted from analysis manifests and the primary QC plot; it is not reported as an acquisition-settings failure.
 
 The Fucci workflow also **fails closed on old catalogs** that do not contain the acquisition-QC fields. Rebuild them with `tools/build_data_catalog.py` rather than silently analyzing data with unknown acquisition settings.
 
@@ -205,6 +209,7 @@ For the current Fucci project:
 - **1050 nm is the primary longitudinal analysis channel.**
 - **920 nm is optional** and is used as a validation/cross-laser layer rather than as a requirement for the main 1050 trajectory analysis.
 - Acquisitions containing `_vol10` are alignment-only and are excluded from quantitative manifests.
+- `Fucci-Tri_2` is pipeline-excluded for poor FoV quality; all other listed Fucci mice are enabled.
 - Raw acquisition folders are never modified by the pipeline.
 - Generated products belong under the configured derivatives root.
 

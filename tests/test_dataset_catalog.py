@@ -98,20 +98,21 @@ def test_malformed_xml_does_not_block_valid_manifest(tmp_path):
     assert "session_20260819" in plan.read_text()
 
 
-def test_unconfigured_fucci_requires_explicit_manifest_configuration(tmp_path):
+def test_pipeline_excluded_fucci_is_kept_in_catalog_but_cannot_make_manifest(tmp_path):
     config, raw = _project(tmp_path)
     config.paths.mice_csv.write_text(
-        "mouse_id,experimental_group,cohort,raw_mouse_folder,reference_session_or_folder\n"
-        "Fucci-Tri_4,group,cohort,folder,\n"
+        "mouse_id,experimental_group,cohort,raw_mouse_folder,reference_session_or_folder,pipeline_enabled,pipeline_exclusion_reason\n"
+        "Fucci-Tri_2,group,cohort,folder,,false,poor FoV quality\n"
     )
     _acq(raw, "session_20260819", "filed_vol50", "square_1050.xml")
     rows, report = discover_catalog(config)
-    assert rows[0]["settings_qc_status"] == "not_configured"
+    assert rows[0]["settings_qc_status"] == "not_applicable_pipeline_excluded"
     assert rows[0]["settings_qc_pass"] is None
     assert rows[0]["analysis_eligible"] is False
     assert not report["errors"]
-    with pytest.raises(ValueError, match="No acquisition QC configuration"):
-        build_manifest_plan(config, rows, "Fucci-Tri_4")
+    assert report["summary"]["Fucci-Tri_2"]["pipeline_exclusion_reason"] == "poor FoV quality"
+    with pytest.raises(ValueError, match="excluded from the longitudinal pipeline"):
+        build_manifest_plan(config, rows, "Fucci-Tri_2")
 
 def test_alignment_and_pairing_and_plan(tmp_path):
     config,raw=_project(tmp_path)

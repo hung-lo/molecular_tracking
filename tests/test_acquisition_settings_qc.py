@@ -75,6 +75,18 @@ def test_selected_laser_must_have_an_active_expected_power():
     assert result["settings_qc_pass"] is False and "1050=0 expected 60" in result["settings_qc_reason"]
 
 
+def test_tri4_uses_70_percent_powers_and_fails_wrong_selected_laser():
+    row = {
+        "mouse_id": "Fucci-Tri_4", "laser_nm": 1050,
+        "pmt_a_gain": 10, "pmt_b_gain": 10,
+        "pockels_920_start_pct": 0, "pockels_920_stop_pct": 0,
+        "pockels_1050_start_pct": 70, "pockels_1050_stop_pct": 70,
+    }
+    assert validate_acquisition_row(row)["settings_qc_pass"] is True
+    row["pockels_1050_stop_pct"] = 60
+    assert validate_acquisition_row(row)["settings_qc_pass"] is False
+
+
 def test_qc_table_has_required_gate_columns():
     table, summary = acquisition_settings_qc_table([_configured_row()])
     assert {"settings_qc_pass", "settings_qc_reason", "analysis_eligible"}.issubset(table.columns)
@@ -100,17 +112,29 @@ def test_non_configured_hard_failure_remains_failed_in_qc_table():
     assert summary["status"] == "FAIL"
 
 
-def test_vol10_rows_are_excluded_from_qc_artifacts(tmp_path):
+def test_qc_csv_keeps_vol10_rows_but_the_main_summary_excludes_them(tmp_path):
     rows = [
         _configured_row(acquisition_id="filed_vol10", pmt_a_gain=1, pockels_920_start_pct=1, pockels_920_stop_pct=1),
         _configured_row(acquisition_id="filed_vol50"),
     ]
     rows[1]["laser_nm"] = 920
     table, summary = write_acquisition_settings_qc_artifacts(rows, tmp_path)
-    assert table["acquisition_id"].tolist() == ["filed_vol50"]
+    assert table["acquisition_id"].tolist() == ["filed_vol10", "filed_vol50"]
+    assert table.loc[table["acquisition_id"].eq("filed_vol10"), "settings_qc_status"].item() == "not_applicable_vol10"
     assert summary["n_vol10_excluded"] == 1
     assert summary["n_fail"] == 0
     assert (tmp_path / "acquisition_settings_qc.png").is_file()
+
+
+def test_pipeline_excluded_mouse_is_audit_only_not_a_qc_failure(tmp_path):
+    row = _configured_row(
+        mouse_id="Fucci-Tri_2", pipeline_enabled=False,
+        pipeline_exclusion_reason="poor FoV quality", pmt_a_gain=1,
+    )
+    table, summary = write_acquisition_settings_qc_artifacts([row], tmp_path)
+    assert table.iloc[0]["settings_qc_status"] == "not_applicable_pipeline_excluded"
+    assert summary["n_fail"] == 0
+    assert summary["pipeline_excluded_mice"] == [{"mouse_id": "Fucci-Tri_2", "reason": "poor FoV quality"}]
 
 
 def test_inactive_laser_zero_is_not_plotted_as_a_mismatch(tmp_path):

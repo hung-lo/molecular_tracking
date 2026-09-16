@@ -35,6 +35,9 @@ def _mouse_rows(config: ProjectConfig) -> list[dict[str, str]]:
     with config.paths.mice_csv.open(encoding="utf-8", newline="") as handle:
         return list(csv.DictReader(handle))
 
+def _pipeline_enabled(row: dict[str, str]) -> bool:
+    return str(row.get("pipeline_enabled", "true")).strip().lower() == "true"
+
 def selected_mouse_metadata(context: DatasetContext) -> dict[str, str]:
     if context.project_config is None or context.mouse_id is None:
         raise ValueError("Mouse metadata is available only in project mode")
@@ -61,8 +64,12 @@ def resolve_selection(*, dataset: str|Path|None=None, project_config: str|Path|N
     if not project_config or not mouse_id:
         raise ValueError("Project mode requires both --project-config and --mouse-id.")
     config=load_project_config(project_config)
-    known={row.get("mouse_id") for row in _mouse_rows(config)}
+    mouse_rows=_mouse_rows(config)
+    known={row.get("mouse_id") for row in mouse_rows}
     if mouse_id not in known: raise ValueError(f"Unknown mouse_id {mouse_id!r}; expected one of {sorted(known)}")
+    metadata=next(row for row in mouse_rows if row.get("mouse_id")==mouse_id)
+    if not _pipeline_enabled(metadata):
+        raise ValueError(f"Mouse {mouse_id!r} is excluded from the longitudinal pipeline: {metadata.get('pipeline_exclusion_reason') or 'no reason supplied'}")
     selected_laser=int(laser_nm if laser_nm is not None else config.rig.primary_laser_nm)
     allowed={config.rig.primary_laser_nm,config.rig.optional_laser_nm}
     if selected_laser not in allowed: raise ValueError(f"Unsupported laser_nm={selected_laser}; expected {sorted(allowed)}")

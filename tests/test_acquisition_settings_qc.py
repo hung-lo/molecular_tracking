@@ -70,6 +70,11 @@ def test_missing_fields_fail_closed_and_unknown_mouse_is_not_guessed():
     assert "no acquisition QC configuration" in unknown["settings_qc_reason"]
 
 
+def test_selected_laser_must_have_an_active_expected_power():
+    result = validate_acquisition_row(_configured_row(laser_nm=1050, pockels_920_start_pct=0, pockels_920_stop_pct=0))
+    assert result["settings_qc_pass"] is False and "1050=0 expected 60" in result["settings_qc_reason"]
+
+
 def test_qc_table_has_required_gate_columns():
     table, summary = acquisition_settings_qc_table([_configured_row()])
     assert {"settings_qc_pass", "settings_qc_reason", "analysis_eligible"}.issubset(table.columns)

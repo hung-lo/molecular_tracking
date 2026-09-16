@@ -59,9 +59,14 @@ def validate_acquisition_row(row: Mapping[str, Any], *, tolerance: float = 1e-6)
         start = row.get(f"pockels_{wavelength}_start_pct")
         stop = row.get(f"pockels_{wavelength}_stop_pct")
         try:
+            selected_laser = int(float(row.get("laser_nm"))) == wavelength
+        except (TypeError, ValueError):
+            selected_laser = False
+        try:
             active = abs(float(start)) > tolerance or abs(float(stop)) > tolerance
         except (TypeError, ValueError):
-            active = True
+            active = selected_laser
+        active = active or selected_laser
         if active:
             expected_power = expected[f"laser_{wavelength}_power"]
             check(f"pockels_{wavelength}_start_pct", start, expected_power, str(wavelength))

@@ -39,7 +39,13 @@ from run_daywise_roi_matching import (
     PAIRWISE_TRANSFORM_COLUMNS,
     run_daywise_roi_matching,
 )
-from spatial_graph_matcher import GRAPH_MATCHER_ALGORITHM_VERSION, GraphPairMatchResult, SpatialGraphParams, refine_pair_with_spatial_graph
+from spatial_graph_matcher import (
+    GRAPH_MATCHER_ALGORITHM_VERSION,
+    GRAPH_MATCHER_IMPLEMENTATION_VERSION,
+    GraphPairMatchResult,
+    SpatialGraphParams,
+    refine_pair_with_spatial_graph,
+)
 from session_manifest import load_session_manifest
 
 GRAPH_PAIRWISE_SUMMARY_COLUMNS = PAIRWISE_SUMMARY_COLUMNS + [
@@ -162,11 +168,18 @@ def _build_features_by_session(roi_features: pd.DataFrame) -> dict[str, pd.DataF
     return features_by_session
 
 
-def _pair_table_group(table: pd.DataFrame, day_a: str, day_b: str) -> pd.DataFrame:
+def _pair_table_groups(table: pd.DataFrame) -> dict[tuple[str, str], pd.DataFrame]:
     if table.empty:
-        return table.copy()
-    mask = (table["day_a"].astype(str) == str(day_a)) & (table["day_b"].astype(str) == str(day_b))
-    return table.loc[mask].copy().reset_index(drop=True)
+        return {}
+    day_a_values = table["day_a"].astype(str).to_numpy()
+    day_b_values = table["day_b"].astype(str).to_numpy()
+    positions_by_pair: dict[tuple[str, str], list[int]] = {}
+    for position, key in enumerate(zip(day_a_values, day_b_values)):
+        positions_by_pair.setdefault((str(key[0]), str(key[1])), []).append(position)
+    return {
+        key: table.iloc[positions].copy().reset_index(drop=True)
+        for key, positions in positions_by_pair.items()
+    }
 
 
 def _graph_pair_task(
@@ -271,17 +284,21 @@ def run_daywise_graph_matching(
     if "session_id" in roi_features.columns:
         roi_features["session_id"] = roi_features["session_id"].astype(str)
     features_by_session = _build_features_by_session(roi_features)
+    pairwise_candidates_by_pair = _pair_table_groups(pairwise_candidates)
+    pairwise_high_by_pair = _pair_table_groups(pairwise_high)
+    pairwise_balanced_by_pair = _pair_table_groups(pairwise_balanced)
+    pairwise_summary_by_pair = _pair_table_groups(pairwise_summary)
     graph_input_loading_seconds = time.perf_counter() - stage_start_seconds
 
     graph_tasks = []
     for row in pairwise_transforms.itertuples(index=False):
         day_a = str(row.day_a)
         day_b = str(row.day_b)
-        pair_candidates_table = _pair_table_group(pairwise_candidates, day_a, day_b)
-        pair_high_table = _pair_table_group(pairwise_high, day_a, day_b)
-        pair_balanced_table = _pair_table_group(pairwise_balanced, day_a, day_b)
-        pair_summary_row = pairwise_summary.loc[(pairwise_summary["day_a"].astype(str) == day_a) & (pairwise_summary["day_b"].astype(str) == day_b)]
-        if pair_summary_row.empty:
+        pair_candidates_table = pairwise_candidates_by_pair.get((day_a, day_b), pairwise_candidates.iloc[0:0].copy())
+        pair_high_table = pairwise_high_by_pair.get((day_a, day_b), pairwise_high.iloc[0:0].copy())
+        pair_balanced_table = pairwise_balanced_by_pair.get((day_a, day_b), pairwise_balanced.iloc[0:0].copy())
+        pair_summary_rows = pairwise_summary_by_pair.get((day_a, day_b))
+        if pair_summary_rows is None or pair_summary_rows.empty:
             raise ValueError(f"Missing pairwise summary row for {day_a} -> {day_b}.")
         baseline_result = _pair_result_from_outputs(
             day_a=day_a,
@@ -289,7 +306,7 @@ def run_daywise_graph_matching(
             pair_candidates=pair_candidates_table,
             pair_high=pair_high_table,
             pair_balanced=pair_balanced_table,
-            pair_summary=pair_summary_row.iloc[0],
+            pair_summary=pair_summary_rows.iloc[0],
             pair_transform=pd.Series(row._asdict()),
         )
         graph_tasks.append((
@@ -300,7 +317,7 @@ def run_daywise_graph_matching(
             features_by_session[day_b],
             spacing,
             graph_params,
-            int(pair_summary_row.iloc[0].get("pair_gap", 0)) if "pair_gap" in pair_summary_row.columns else 0,
+            int(pair_summary_rows.iloc[0].get("pair_gap", 0)) if "pair_gap" in pair_summary_rows.columns else 0,
         ))
 
     stage_start_seconds = time.perf_counter()
@@ -338,6 +355,9 @@ def run_daywise_graph_matching(
         pair_tables=graph_pair_tables,
         match_policy="graph",
     )
+    graph_track_building_seconds = time.perf_counter() - stage_start_seconds
+
+    stage_start_seconds = time.perf_counter()
     graph_cycle_summary, graph_cycle_edge_checks = build_cycle_consistency_tables(
         day_names=ordered_sessions,
         pair_tables=graph_pair_tables,
@@ -346,7 +366,7 @@ def run_daywise_graph_matching(
     )
     graph_tracks = summarize_track_cycle_metadata(graph_tracks, graph_cycle_edge_checks)
     graph_length_summary = build_track_length_summary_table(graph_tracks)
-    graph_track_construction_seconds = time.perf_counter() - stage_start_seconds
+    graph_cycle_consistency_seconds = time.perf_counter() - stage_start_seconds
 
     stage_start_seconds = time.perf_counter()
     graph_pairwise_matches = pd.concat([result.graph_matches for result in graph_results], ignore_index=True) if graph_results else pd.DataFrame(columns=GRAPH_PAIRWISE_MATCH_COLUMNS)
@@ -369,6 +389,7 @@ def run_daywise_graph_matching(
     warnings: list[str] = []
     qc_output_path = Path(qc_output_dir).resolve() if qc_output_dir is not None else output_dir / "qc"
     graph_runner_git_commit = _git_commit()
+    graph_total_wall_seconds = float(time.perf_counter() - run_start_seconds)
     run_log_payload.update(
         {
             # Backward-compatible top-level provenance identifies the final graph stage.
@@ -377,6 +398,7 @@ def run_daywise_graph_matching(
             "affine_matcher_git_commit": affine_matcher_git_commit,
             "graph_runner_git_commit": graph_runner_git_commit,
             "graph_matcher_algorithm_version": GRAPH_MATCHER_ALGORITHM_VERSION,
+            "graph_matcher_implementation_version": GRAPH_MATCHER_IMPLEMENTATION_VERSION,
             "graph_runner_version": GRAPH_RUNNER_ALGORITHM_VERSION,
             "graph_params": asdict(graph_params),
             "pair_workers": pair_workers,
@@ -415,11 +437,15 @@ def run_daywise_graph_matching(
     runtime_profile["graph_stage_durations_seconds"] = {
         "input_and_transform_loading": float(graph_input_loading_seconds),
         "graph_support_anchor_and_pairwise_assignment": float(graph_pair_processing_seconds),
-        "track_graph_construction": float(graph_track_construction_seconds),
+        "track_graph_construction": float(graph_track_building_seconds),
+        "pair_refinement_total": float(graph_pair_processing_seconds),
+        "graph_track_building_total": float(graph_track_building_seconds),
+        "graph_cycle_consistency_total": float(graph_cycle_consistency_seconds),
         "pairwise_and_track_output_serialization": float(graph_serialization_seconds),
+        "graph_runner_total": graph_total_wall_seconds,
     }
     runtime_profile["graph_pair_timings_seconds"] = graph_pair_timings
-    runtime_profile["graph_total_wall_seconds"] = float(time.perf_counter() - run_start_seconds)
+    runtime_profile["graph_total_wall_seconds"] = graph_total_wall_seconds
     runtime_profile["matcher_total_wall_seconds"] = float(time.perf_counter() - workflow_start_seconds)
     _export_json(output_dir / "run_log.json", run_log_payload)
 

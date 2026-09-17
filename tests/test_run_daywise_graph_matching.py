@@ -11,7 +11,7 @@ import tifffile
 
 import run_daywise_graph_matching as graph_runner
 import run_daywise_roi_matching as affine_runner
-from run_daywise_graph_matching import _affine_git_commit_from_log, run_daywise_graph_matching
+from run_daywise_graph_matching import _affine_git_commit_from_log, _pair_table_groups, run_daywise_graph_matching
 from tools.compare_matcher_outputs import compare_matcher_outputs
 
 
@@ -53,6 +53,7 @@ def test_run_daywise_graph_matching_exports_graph_tables(tmp_path: Path, monkeyp
 
     run_log = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
     assert run_log["graph_matcher_algorithm_version"] == "local_spatial_graph_v1"
+    assert run_log["graph_matcher_implementation_version"] == "kdtree_prefilter_v1"
     assert run_log["graph_row_counts"]["tracks_graph"] > 0
     assert run_log["graph_output_paths"]["tracks_graph"].endswith("tracks_graph.csv")
     assert run_log["affine_matcher_git_commit"] == "same-stage-commit"
@@ -64,6 +65,22 @@ def test_run_daywise_graph_matching_exports_graph_tables(tmp_path: Path, monkeyp
         "graph_roi_matching",
     ]
     assert all(duration >= 0 for _key, duration in stages)
+    graph_timings = run_log["runtime_profile"]["graph_stage_durations_seconds"]
+    assert all(graph_timings[key] >= 0 for key in ("pair_refinement_total", "graph_track_building_total", "graph_cycle_consistency_total", "graph_runner_total"))
+
+
+def test_pair_table_groups_normalize_keys_and_preserve_row_order() -> None:
+    table = pd.DataFrame(
+        [
+            {"day_a": 20260512, "day_b": 20260513, "row": "first"},
+            {"day_a": 20260511, "day_b": 20260512, "row": "second"},
+            {"day_a": 20260512, "day_b": 20260513, "row": "third"},
+        ]
+    )
+    groups = _pair_table_groups(table)
+    assert list(groups) == [("20260512", "20260513"), ("20260511", "20260512")]
+    assert groups[("20260512", "20260513")]["row"].tolist() == ["first", "third"]
+    assert groups[("20260511", "20260512")]["row"].tolist() == ["second"]
 
 
 def test_graph_pair_workers_preserve_exact_scientific_outputs(tmp_path: Path) -> None:

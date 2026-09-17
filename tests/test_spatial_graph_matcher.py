@@ -288,6 +288,15 @@ def test_whole_candidate_table_matches_reference() -> None:
     assert list(zip(actual_matches["label_a"], actual_matches["label_b"])) == [(1, 101), (11, 111), (12, 112)]
 
 
+def test_no_anchor_fallback_matches_reference() -> None:
+    candidates, anchors, coords_a, coords_b, params = _candidate_table()
+    empty_anchors = anchors.iloc[0:0].copy()
+    expected = _reference_add_graph_consistency_scores(candidates, empty_anchors, coords_a, coords_b, params)
+    actual = add_graph_consistency_scores(candidates, empty_anchors, coords_a, coords_b, params)
+    pd.testing.assert_frame_equal(actual, expected, check_exact=True)
+    assert actual.loc[actual["graph_rule"], "graph_status"].tolist() == ["no_anchor_fallback"] * 3
+
+
 def test_end_to_end_pair_matches_reference_scoring() -> None:
     candidates, _unused_anchors, coords_a, coords_b, params = _candidate_table()
     features_a = pd.DataFrame(

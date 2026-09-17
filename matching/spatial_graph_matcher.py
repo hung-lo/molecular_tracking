@@ -293,73 +293,102 @@ def add_graph_consistency_scores(
         return pd.DataFrame(columns=GRAPH_CANDIDATE_COLUMNS)
 
     table = candidates.copy()
-    table["base_score"] = pd.to_numeric(table.get("score", np.nan), errors="coerce")
-    table["graph_rule"] = table.get("balanced_rule", False).astype(bool)
-    table["graph_status"] = "not_balanced"
-    table["match_policy"] = "graph"
-    table["graph_support_count"] = 0
-    table["graph_support_fraction"] = 0.0
-    table["graph_residual_median_um"] = np.nan
-    table["graph_residual_mean_um"] = np.nan
-    table["graph_residual_p90_um"] = np.nan
-    table["graph_inlier_fraction"] = np.nan
-    table["graph_score"] = np.nan
-    table["refined_score"] = table["base_score"]
-    table["is_graph_anchor"] = False
+    n_rows = len(table)
+    label_a_values = table["label_a"].to_numpy(dtype=int)
+    label_b_values = table["label_b"].to_numpy(dtype=int)
+    score_source = table["score"] if "score" in table.columns else pd.Series(np.nan, index=table.index)
+    base_score_values = pd.to_numeric(score_source, errors="coerce").to_numpy(dtype=float)
+    graph_rule_source = table["balanced_rule"] if "balanced_rule" in table.columns else pd.Series(False, index=table.index)
+    graph_rule_values = graph_rule_source.astype(bool).to_numpy()
+    graph_positions = np.flatnonzero(graph_rule_values)
 
-    if anchors is None or anchors.empty:
-        table.loc[table["graph_rule"], "graph_status"] = "no_anchor_fallback"
-        return table
+    graph_status = np.full(n_rows, "not_balanced", dtype=object)
+    graph_support_count = np.zeros(n_rows, dtype=int)
+    graph_support_fraction = np.zeros(n_rows, dtype=float)
+    graph_residual_median_um = np.full(n_rows, np.nan, dtype=float)
+    graph_residual_mean_um = np.full(n_rows, np.nan, dtype=float)
+    graph_residual_p90_um = np.full(n_rows, np.nan, dtype=float)
+    graph_inlier_fraction = np.full(n_rows, np.nan, dtype=float)
+    graph_score = np.full(n_rows, np.nan, dtype=float)
+    refined_score = base_score_values.copy()
+    is_graph_anchor = np.zeros(n_rows, dtype=bool)
 
-    anchor_pairs = {(int(row.label_a), int(row.label_b)) for row in anchors.itertuples(index=False)}
-    anchor_a = anchors["label_a"].astype(int).to_numpy()
-    anchor_b = anchors["label_b"].astype(int).to_numpy()
-    prepared_geometry = _prepare_anchor_geometry(anchor_a, anchor_b, coords_a_by_label, coords_b_by_label)
-    scored_candidates = table.loc[
-        table["graph_rule"]
-        & ~pd.MultiIndex.from_frame(table[["label_a", "label_b"]]).isin(anchor_pairs)
-    ]
-    rough_neighbors: list[np.ndarray] = []
-    if not scored_candidates.empty:
-        candidate_coords_a = np.vstack([
-            coords_a_by_label[int(label)]
-            for label in scored_candidates["label_a"].to_numpy(dtype=int)
-        ])
-        rough_neighbors = [
-            np.sort(np.asarray(indices, dtype=int))
-            for indices in prepared_geometry.tree_a.query_ball_point(
-                candidate_coords_a,
-                r=_anchor_query_radius(float(params.radius_um)),
-                p=2.0,
-                eps=0.0,
-                workers=1,
-            )
-        ]
-    rough_neighbors_iter = iter(rough_neighbors)
-    for index, row in table.loc[table["graph_rule"]].iterrows():
-        label_a = int(row["label_a"])
-        label_b = int(row["label_b"])
-        if (label_a, label_b) in anchor_pairs:
-            table.at[index, "is_graph_anchor"] = True
-            table.at[index, "graph_status"] = "anchor"
-            table.at[index, "graph_score"] = 1.0
-            table.at[index, "refined_score"] = float(row["base_score"])
-            continue
-        stats = _local_support_stats(
-            label_a=label_a,
-            label_b=label_b,
-            prepared_geometry=prepared_geometry,
-            rough_anchor_indices=next(rough_neighbors_iter),
-            coords_a_by_label=coords_a_by_label,
-            coords_b_by_label=coords_b_by_label,
-            params=params,
+    if anchors is not None and not anchors.empty:
+        anchor_pairs = {(int(row.label_a), int(row.label_b)) for row in anchors.itertuples(index=False)}
+        anchor_a = anchors["label_a"].astype(int).to_numpy()
+        anchor_b = anchors["label_b"].astype(int).to_numpy()
+        prepared_geometry = _prepare_anchor_geometry(anchor_a, anchor_b, coords_a_by_label, coords_b_by_label)
+        non_anchor_graph_positions = np.asarray(
+            [
+                position
+                for position in graph_positions
+                if (int(label_a_values[position]), int(label_b_values[position])) not in anchor_pairs
+            ],
+            dtype=int,
         )
-        for key, value in stats.items():
-            table.at[index, key] = value
-        if table.at[index, "graph_status"] == "scored":
-            table.at[index, "refined_score"] = float((1.0 - float(params.graph_weight)) * float(row["base_score"]) + float(params.graph_weight) * float(stats["graph_score"]))
-        else:
-            table.at[index, "refined_score"] = float(row["base_score"])
+        rough_neighbors: list[np.ndarray] = []
+        if non_anchor_graph_positions.size:
+            candidate_coords_a = np.vstack([coords_a_by_label[int(label_a_values[position])] for position in non_anchor_graph_positions])
+            rough_neighbors = [
+                np.sort(np.asarray(indices, dtype=int))
+                for indices in prepared_geometry.tree_a.query_ball_point(
+                    candidate_coords_a,
+                    r=_anchor_query_radius(float(params.radius_um)),
+                    p=2.0,
+                    eps=0.0,
+                    workers=1,
+                )
+            ]
+
+        rough_neighbor_position = 0
+        for position in graph_positions:
+            label_a = int(label_a_values[position])
+            label_b = int(label_b_values[position])
+            if (label_a, label_b) in anchor_pairs:
+                is_graph_anchor[position] = True
+                graph_status[position] = "anchor"
+                graph_score[position] = 1.0
+                refined_score[position] = base_score_values[position]
+                continue
+            stats = _local_support_stats(
+                label_a=label_a,
+                label_b=label_b,
+                prepared_geometry=prepared_geometry,
+                rough_anchor_indices=rough_neighbors[rough_neighbor_position],
+                coords_a_by_label=coords_a_by_label,
+                coords_b_by_label=coords_b_by_label,
+                params=params,
+            )
+            rough_neighbor_position += 1
+            graph_status[position] = stats["graph_status"]
+            graph_support_count[position] = int(stats["graph_support_count"])
+            graph_support_fraction[position] = float(stats["graph_support_fraction"])
+            graph_residual_median_um[position] = float(stats["graph_residual_median_um"])
+            graph_residual_mean_um[position] = float(stats["graph_residual_mean_um"])
+            graph_residual_p90_um[position] = float(stats["graph_residual_p90_um"])
+            graph_inlier_fraction[position] = float(stats["graph_inlier_fraction"])
+            graph_score[position] = float(stats["graph_score"])
+            if graph_status[position] == "scored":
+                refined_score[position] = float(
+                    (1.0 - float(params.graph_weight)) * base_score_values[position]
+                    + float(params.graph_weight) * float(stats["graph_score"])
+                )
+    else:
+        graph_status[graph_rule_values] = "no_anchor_fallback"
+
+    table["base_score"] = base_score_values
+    table["graph_rule"] = graph_rule_values
+    table["graph_status"] = graph_status
+    table["match_policy"] = "graph"
+    table["graph_support_count"] = graph_support_count
+    table["graph_support_fraction"] = graph_support_fraction
+    table["graph_residual_median_um"] = graph_residual_median_um
+    table["graph_residual_mean_um"] = graph_residual_mean_um
+    table["graph_residual_p90_um"] = graph_residual_p90_um
+    table["graph_inlier_fraction"] = graph_inlier_fraction
+    table["graph_score"] = graph_score
+    table["refined_score"] = refined_score
+    table["is_graph_anchor"] = is_graph_anchor
     return table
 
 

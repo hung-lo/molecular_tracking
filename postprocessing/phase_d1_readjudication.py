@@ -42,6 +42,26 @@ def _truthy(value) -> bool:
     return str(value).strip().casefold() in {"true", "1", "yes"}
 
 
+def _parse_overlap_vector(value) -> list[tuple[int, int]] | None:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    result = []
+    for item in parsed if isinstance(parsed, list) else []:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        try:
+            label, voxels = int(item[0]), int(item[1])
+        except (TypeError, ValueError):
+            continue
+        if label > 0 and voxels > 0:
+            result.append((voxels, label))
+    return sorted(result, key=lambda item: (-item[0], item[1]))
+
+
 def _stats(values: pd.Series) -> dict[str, float | int | None]:
     values = pd.to_numeric(values, errors="coerce").dropna()
     if values.empty:
@@ -73,15 +93,26 @@ def _decompose(cases: pd.DataFrame, candidates: pd.DataFrame) -> pd.DataFrame:
         selected_exists = not selected.empty
         selected_voxels = float(selected_row.get("volume_voxels", np.nan))
         truth_voxels = float(case.get("truth_volume_voxels", np.nan))
+        truth_label = case.get("target_truth_label", np.nan)
         truth_fraction_of_truth = float(case.get("selected_overlap_truth_fraction", np.nan))
-        truth_overlap_voxels = round(truth_fraction_of_truth * truth_voxels) if np.isfinite(truth_fraction_of_truth * truth_voxels) else np.nan
-        top1_fraction = float(case.get("selected_best_overlapping_canonical_fraction", np.nan))
-        top1_voxels = round(top1_fraction * selected_voxels) if np.isfinite(top1_fraction * selected_voxels) else np.nan
-        truth_is_top1 = bool(selected_exists and _truthy(case.get("selected_best_overlapping_is_truth", False)))
+        persisted_overlaps = _parse_overlap_vector(selected_row.get("canonical_overlap_voxels_json", ""))
+        has_persisted_overlaps = persisted_overlaps is not None
+        truth_overlap_voxels = int(selected_row.get("truth_overlap_voxels", 0)) if has_persisted_overlaps else (round(truth_fraction_of_truth * truth_voxels) if np.isfinite(truth_fraction_of_truth * truth_voxels) else np.nan)
+        top1_voxels, top1_label = (persisted_overlaps[0] if persisted_overlaps else (0, np.nan)) if has_persisted_overlaps else (np.nan, case.get("selected_best_overlapping_canonical_label", np.nan))
+        top2_voxels, top2_label = (persisted_overlaps[1] if len(persisted_overlaps) > 1 else (np.nan, np.nan)) if has_persisted_overlaps else (np.nan, np.nan)
+        top1_fraction = top1_voxels / selected_voxels if has_persisted_overlaps and selected_voxels else (float(case.get("selected_best_overlapping_canonical_fraction", np.nan)) if not has_persisted_overlaps else 0.0)
+        top2_fraction = top2_voxels / selected_voxels if has_persisted_overlaps and selected_voxels and len(persisted_overlaps) > 1 else np.nan
+        try:
+            truth_is_top1 = bool(selected_exists and int(top1_label) == int(truth_label))
+        except (TypeError, ValueError):
+            truth_is_top1 = False
         has_truth_overlap = bool(np.isfinite(truth_overlap_voxels) and truth_overlap_voxels > 0)
         top1_overlap_present = bool(np.isfinite(top1_fraction) and top1_fraction > 0)
         raw_top1_label = case.get("selected_best_overlapping_canonical_label", np.nan)
-        top1_label = raw_top1_label if top1_overlap_present else np.nan
+        if not top1_overlap_present:
+            top1_label = np.nan
+        elif not persisted_overlaps:
+            top1_label = raw_top1_label
         if not selected_exists:
             dominant_class = "no_candidate"
         elif truth_is_top1:
@@ -112,16 +143,16 @@ def _decompose(cases: pd.DataFrame, candidates: pd.DataFrame) -> pd.DataFrame:
             "top1_canonical_label": top1_label,
             "top1_overlap_voxels": top1_voxels,
             "top1_overlap_fraction_of_candidate": top1_fraction,
-            "top2_canonical_label": np.nan,
-            "top2_overlap_voxels": np.nan,
-            "top2_overlap_fraction_of_candidate": np.nan,
-            "top1_minus_top2_fraction": np.nan,
-            "top1_to_top2_ratio": np.nan,
-            "n_canonical_labels_overlap_any": np.nan,
-            "n_canonical_labels_overlap_any_lower_bound": 2 if _truthy(case.get("selected_overlaps_multiple_canonical_rois", False)) else 1,
-            "n_canonical_labels_overlap_ge_1pct_candidate": np.nan,
-            "n_canonical_labels_overlap_ge_5pct_candidate": np.nan,
-            "n_canonical_labels_overlap_ge_10pct_candidate": np.nan,
+            "top2_canonical_label": top2_label,
+            "top2_overlap_voxels": top2_voxels,
+            "top2_overlap_fraction_of_candidate": top2_fraction,
+            "top1_minus_top2_fraction": top1_fraction - top2_fraction if np.isfinite(top1_fraction) and np.isfinite(top2_fraction) else np.nan,
+            "top1_to_top2_ratio": top1_fraction / top2_fraction if np.isfinite(top1_fraction) and np.isfinite(top2_fraction) and top2_fraction > 0 else np.nan,
+            "n_canonical_labels_overlap_any": len(persisted_overlaps) if has_persisted_overlaps else np.nan,
+            "n_canonical_labels_overlap_any_lower_bound": len(persisted_overlaps) if has_persisted_overlaps else (2 if _truthy(case.get("selected_overlaps_multiple_canonical_rois", False)) else 1),
+            "n_canonical_labels_overlap_ge_1pct_candidate": sum(voxels / selected_voxels >= 0.01 for voxels, _ in persisted_overlaps) if has_persisted_overlaps and selected_voxels else (0 if has_persisted_overlaps else np.nan),
+            "n_canonical_labels_overlap_ge_5pct_candidate": sum(voxels / selected_voxels >= 0.05 for voxels, _ in persisted_overlaps) if has_persisted_overlaps and selected_voxels else (0 if has_persisted_overlaps else np.nan),
+            "n_canonical_labels_overlap_ge_10pct_candidate": sum(voxels / selected_voxels >= 0.10 for voxels, _ in persisted_overlaps) if has_persisted_overlaps and selected_voxels else (0 if has_persisted_overlaps else np.nan),
             "truth_is_top1": truth_is_top1,
             "not_truth_top1": bool(not truth_is_top1),
             "truth_overlap_present": has_truth_overlap,
@@ -137,7 +168,7 @@ def _decompose(cases: pd.DataFrame, candidates: pd.DataFrame) -> pd.DataFrame:
             "raw_mask_mean_green_relative_difference": case.get("raw_mask_mean_green_relative_difference", np.nan),
             "raw_mask_mean_red_relative_difference": case.get("raw_mask_mean_red_relative_difference", np.nan),
             "raw_mask_ratio_relative_difference": case.get("raw_mask_ratio_relative_difference", np.nan),
-            "top2_data_status": "not_persisted_in_original_pilot_artifact",
+            "top2_data_status": "persisted" if has_persisted_overlaps else "not_persisted_in_original_pilot_artifact",
         })
     return pd.DataFrame(rows)
 

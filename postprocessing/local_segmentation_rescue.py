@@ -1255,11 +1255,19 @@ def _run_case(
                 rescue_ratio = rescue_green / rescue_red if np.isfinite(rescue_green) and np.isfinite(rescue_red) and rescue_red else np.nan
                 bias = {"raw_mask_mean_green_original": truth_green, "raw_mask_mean_green_rescued": rescue_green, "raw_mask_mean_green_absolute_difference": abs(rescue_green - truth_green), "raw_mask_mean_green_relative_difference": (rescue_green - truth_green) / truth_green if truth_green else np.nan, "raw_mask_mean_red_original": truth_red, "raw_mask_mean_red_rescued": rescue_red, "raw_mask_mean_red_absolute_difference": abs(rescue_red - truth_red), "raw_mask_mean_red_relative_difference": (rescue_red - truth_red) / truth_red if truth_red else np.nan, "raw_mask_ratio_original": truth_ratio, "raw_mask_ratio_rescued": rescue_ratio, "raw_mask_ratio_absolute_difference": abs(rescue_ratio - truth_ratio), "raw_mask_ratio_relative_difference": (rescue_ratio - truth_ratio) / truth_ratio if truth_ratio else np.nan, "eclipse_original": np.nan, "eclipse_rescued": np.nan}
     base = {**case, **prediction, "benchmark_context": benchmark_context, "status": status, "failure_reason": "" if status in {"candidate_generated", "multiple_candidates"} else status, "n_candidates": len(ranked), "selected_candidate_id": selected["candidate_id"] if selected else np.nan, "crop_center_xyz": prediction["predicted_xyz"], "crop_start_zyx": list(bounds.start_zyx), "crop_stop_zyx": list(bounds.stop_zyx), "crop_shape_zyx": list(bounds.shape_zyx), "crop_physical_size_um": (np.asarray(bounds.shape_zyx) * context.spacing_zyx).tolist(), "edge_clipping": bounds.edge_clipped, "input_image_path": str(image_path), "input_image_hash": context.image_hashes.get(target_session, {}).get("red_sha256", ""), "threshold": threshold, "voxel_spacing_zyx_um": list(context.spacing_zyx), **truth_metrics, **bias, **_case_provenance(context, target_session, backend=backend, segmentation_parameters=segmentation_parameters, backend_runtime=backend_runtime)}
-    return base, ranked, selected, {"truth_mask": truth_mask, "candidate_labels": labels, "crop": crop, "bounds": bounds, "image_path": image_path}
+    source_crop = None
+    source_bounds = None
+    source_image_path = _path_value(_session_row(context, source_session), "red_image_path")
+    if source_image_path is not None and source_feature is not None:
+        source_image = image_cache.setdefault(str(source_image_path), _load_tif(source_image_path))
+        source_xyz = [float(source_feature["centroid_x"]), float(source_feature["centroid_y"]), float(source_feature["centroid_z"])]
+        source_bounds = compute_crop_bounds(source_xyz, source_image.shape, crop_shape_zyx)
+        source_crop = np.asarray(source_image[source_bounds.slices])
+    return base, ranked, selected, {"truth_mask": truth_mask, "candidate_labels": labels, "canonical_labels": np.asarray(truth_stack[bounds.slices]) if synthetic and truth_mask is not None else None, "crop": crop, "bounds": bounds, "image_path": image_path, "source_crop": source_crop, "source_bounds": source_bounds, "ranked_candidates": ranked}
 
 
 def _write_pngs(output_dir: Path, records: list[dict[str, Any]], artifacts: list[dict[str, Any]], *, synthetic: bool) -> tuple[Path, Path]:
-    """Write a small deterministic set of review panels and required plots."""
+    """Write deterministic category-aware panels and descriptive PNG summaries."""
 
     import matplotlib
     matplotlib.use("Agg")
@@ -1270,37 +1278,99 @@ def _write_pngs(output_dir: Path, records: list[dict[str, Any]], artifacts: list
     panel_dir.mkdir(parents=True, exist_ok=True)
     plot_dir.mkdir(parents=True, exist_ok=True)
     review_items = _select_review_artifacts(artifacts, synthetic=synthetic)
+
+    def _integer(value: Any) -> int | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return int(number) if np.isfinite(number) else None
+
+    def _number(value: Any) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if np.isfinite(number) else None
+
     for index, item in enumerate(review_items):
         record, selected, arrays = item
-        if not arrays:
+        if not arrays or arrays.get("crop") is None:
             continue
-        fig, axes = plt.subplots(1, 3, figsize=(10, 3.2))
         raw = np.asarray(arrays["crop"])
-        axes[0].imshow(np.max(raw, axis=0), cmap="gray")
-        axes[0].set_title("target raw/local")
+        candidate_labels = np.asarray(arrays.get("candidate_labels", np.zeros(raw.shape, dtype=int)))
+        canonical_labels = arrays.get("canonical_labels")
+        canonical_labels = np.asarray(canonical_labels) if canonical_labels is not None else None
         truth = arrays.get("truth_mask")
-        if truth is not None:
-            axes[1].imshow(np.max(raw, axis=0), cmap="gray")
-            axes[1].contour(np.max(truth, axis=0), levels=[0.5], colors="lime")
-            axes[1].set_title("hidden truth")
-        else:
-            axes[1].axis("off")
-        axes[2].imshow(np.max(raw, axis=0), cmap="gray")
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4.2), gridspec_kw={"width_ratios": [1, 1.15, 1.15, 1.45]})
+        source = arrays.get("source_crop")
+        axes[0].imshow(np.max(np.asarray(source if source is not None else raw), axis=0), cmap="gray")
+        axes[0].set_title("source Red crop" if source is not None else "source Red unavailable")
+        axes[1].imshow(np.max(raw, axis=0), cmap="gray")
+        for local_label in sorted(int(value) for value in np.unique(candidate_labels) if int(value) > 0):
+            axes[1].contour(np.max(candidate_labels == local_label, axis=0), levels=[0.5], colors="white", linewidths=0.55, alpha=0.45)
         if selected:
-            labels = arrays["candidate_labels"] == int(selected["local_label"])
-            axes[2].contour(np.max(labels, axis=0), levels=[0.5], colors="cyan")
-        axes[2].set_title("rescued candidate")
-        for axis in axes:
+            axes[1].contour(np.max(candidate_labels == int(selected["local_label"]), axis=0), levels=[0.5], colors="cyan", linewidths=1.8)
+        axes[1].plot(float(record.get("predicted_x", np.nan)) - float(record.get("crop_start_zyx", [0, 0, 0])[2]), float(record.get("predicted_y", np.nan)) - float(record.get("crop_start_zyx", [0, 0, 0])[1]), marker="x", color="yellow", ms=8, mew=1.8)
+        axes[1].set_title("target Red + all candidates")
+        axes[2].imshow(np.max(raw, axis=0), cmap="gray")
+        if truth is not None:
+            axes[2].contour(np.max(truth, axis=0), levels=[0.5], colors="lime", linewidths=1.8)
+        if canonical_labels is not None:
+            top1 = _integer(record.get("top1_canonical_label", record.get("selected_best_overlapping_canonical_label")))
+            top2 = _integer(record.get("top2_canonical_label"))
+            if top1 is not None:
+                axes[2].contour(np.max(canonical_labels == top1, axis=0), levels=[0.5], colors="orange", linewidths=1.4)
+            if top2 is not None:
+                axes[2].contour(np.max(canonical_labels == top2, axis=0), levels=[0.5], colors="yellow", linewidths=1.2)
+        if selected:
+            axes[2].contour(np.max(candidate_labels == int(selected["local_label"]), axis=0), levels=[0.5], colors="cyan", linewidths=1.5)
+        axes[2].set_title("truth / top1 / top2 / selected")
+        axes[3].axis("off")
+        lines = [
+            f"track: {record.get('track_uid', record.get('track_id', ''))}",
+            f"target: {record.get('target_session', '')}",
+            f"identity: {record.get('identity_ranking_category', record.get('identity_category', ''))}",
+            f"truth label: {_integer(record.get('target_truth_label'))}",
+            f"selected ID: {_integer(record.get('selected_candidate_id'))}",
+            f"truth top1: {record.get('truth_is_top1', record.get('selected_best_overlapping_is_truth', ''))}",
+            f"truth overlap: {record.get('truth_overlap_present', '')}",
+            f"top1 label/fraction: {_integer(record.get('top1_canonical_label', record.get('selected_best_overlapping_canonical_label')))} / {_number(record.get('top1_overlap_fraction_of_candidate', record.get('selected_best_overlapping_canonical_fraction')))}",
+            f"top2 label/fraction: {_integer(record.get('top2_canonical_label'))} / {_number(record.get('top2_overlap_fraction_of_candidate'))}",
+            f"truth fraction: {_number(record.get('truth_overlap_fraction_of_candidate'))}",
+            f"Dice / centroid um: {_number(record.get('dice_3d'))} / {_number(record.get('centroid_error_um'))}",
+            f"selected distance / score: {_number(selected.get('distance_from_prediction_um')) if selected else None} / {_number(selected.get('geometric_rank_score')) if selected else None}",
+            "",
+            "top geometric candidates:",
+        ]
+        for candidate in arrays.get("ranked_candidates", [])[:5]:
+            lines.append(f"id {_integer(candidate.get('candidate_id'))}  score {_number(candidate.get('geometric_rank_score'))}  top1 {_number(candidate.get('best_overlapping_canonical_fraction'))}")
+        axes[3].text(0, 1, "\n".join(lines), va="top", family="monospace", fontsize=7.8)
+        for axis in axes[:3]:
             axis.axis("off")
-        fig.suptitle(f"{record.get('track_id', '')} {record.get('target_session', '')} {record.get('status', '')}")
+        fig.suptitle(f"{record.get('track_uid', record.get('track_id', ''))} — evidence review")
         fig.tight_layout()
-        fig.savefig(panel_dir / f"case_{index:04d}.png", dpi=120)
+        fig.savefig(panel_dir / f"case_{index:04d}.png", dpi=160)
         plt.close(fig)
     metrics = pd.DataFrame(records)
-    plot_names = {"centroid_error_distribution": "centroid_error_um", "dice_distribution": "dice_3d", "iou_distribution": "iou_3d", "volume_ratio_distribution": "volume_ratio_rescue_to_truth", "candidate_count_distribution": "n_candidates"}
+
+    plot_names = {
+        "top1_fraction_distribution": "top1_overlap_fraction_of_candidate",
+        "top2_fraction_distribution": "top2_overlap_fraction_of_candidate",
+        "top1_minus_top2_distribution": "top1_minus_top2_fraction",
+        "top1_to_top2_ratio_distribution": "top1_to_top2_ratio",
+        "truth_fraction_distribution": "truth_overlap_fraction_of_candidate",
+        "dice_distribution": "dice_3d",
+        "iou_distribution": "iou_3d",
+        "centroid_error_distribution": "centroid_error_um",
+        "volume_ratio_distribution": "volume_ratio_rescue_to_truth",
+        "green_relative_bias_distribution": "raw_mask_mean_green_relative_difference",
+        "red_relative_bias_distribution": "raw_mask_mean_red_relative_difference",
+        "ratio_relative_bias_distribution": "raw_mask_ratio_relative_difference",
+    }
     for name, column in plot_names.items():
         fig, axis = plt.subplots(figsize=(5, 3))
-        values = pd.to_numeric(metrics.get(column, pd.Series(dtype=float)), errors="coerce").dropna()
+        values = pd.to_numeric(metrics.get(column, pd.Series(dtype=float)), errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
         if len(values):
             axis.hist(values, bins=min(30, max(5, len(values) // 10)), color="#2878b5")
             axis.set_xlabel(column)
@@ -1308,6 +1378,11 @@ def _write_pngs(output_dir: Path, records: list[dict[str, Any]], artifacts: list
             axis.text(0.5, 0.5, "no finite values", ha="center", va="center")
         axis.set_title(name.replace("_", " "))
         fig.tight_layout(); fig.savefig(plot_dir / f"{name}.png", dpi=120); plt.close(fig)
+    fig, axis = plt.subplots(figsize=(5, 3))
+    truth_top1 = pd.to_numeric(metrics.get("truth_is_top1", pd.Series(dtype=float)), errors="coerce").fillna(0).astype(bool)
+    counts = [int(truth_top1.sum()), int((~truth_top1).sum())]
+    axis.bar(["truth top1", "not top1"], counts, color=["#4c9f70", "#d95f02"]); axis.set_ylabel("cases"); axis.set_title("truth-is-top1 counts")
+    fig.tight_layout(); fig.savefig(plot_dir / "truth_is_top1_counts.png", dpi=120); plt.close(fig)
     # These are descriptive only; state variables never enter ranking.
     fig, axis = plt.subplots(figsize=(7, 3))
     if not metrics.empty and "target_session" in metrics and "n_candidates" in metrics:
@@ -1316,10 +1391,10 @@ def _write_pngs(output_dir: Path, records: list[dict[str, Any]], artifacts: list
     else:
         axis.text(0.5, 0.5, "no cases", ha="center", va="center")
     axis.set_title("rescue rate by session"); fig.tight_layout(); fig.savefig(plot_dir / "rescue_rate_by_session.png", dpi=120); plt.close(fig)
-    for name, xcol, ycol in (("rescue_rate_by_local_crowding", "n_candidates", "dice_3d"), ("rescue_quality_vs_prediction_error", "prediction_error_um", "dice_3d"), ("rescue_quality_vs_depth", "truth_volume_voxels", "dice_3d"), ("measurement_bias", "green_absolute_difference", "red_absolute_difference")):
+    for name, xcol, ycol in (("top2_fraction_vs_dice", "top2_overlap_fraction_of_candidate", "dice_3d"), ("top2_fraction_vs_centroid_error", "top2_overlap_fraction_of_candidate", "centroid_error_um"), ("top2_fraction_vs_green_bias", "top2_overlap_fraction_of_candidate", "raw_mask_mean_green_relative_difference"), ("top2_fraction_vs_red_bias", "top2_overlap_fraction_of_candidate", "raw_mask_mean_red_relative_difference"), ("top2_fraction_vs_ratio_bias", "top2_overlap_fraction_of_candidate", "raw_mask_ratio_relative_difference")):
         fig, axis = plt.subplots(figsize=(5, 3))
-        x = pd.to_numeric(metrics.get(xcol, pd.Series(dtype=float)), errors="coerce")
-        y = pd.to_numeric(metrics.get(ycol, pd.Series(dtype=float)), errors="coerce")
+        x = pd.to_numeric(metrics.get(xcol, pd.Series(dtype=float)), errors="coerce").replace([np.inf, -np.inf], np.nan)
+        y = pd.to_numeric(metrics.get(ycol, pd.Series(dtype=float)), errors="coerce").replace([np.inf, -np.inf], np.nan)
         valid = x.notna() & y.notna()
         if valid.any(): axis.scatter(x[valid], y[valid], s=8, alpha=0.45)
         else: axis.text(0.5, 0.5, "no finite values", ha="center", va="center")
@@ -1334,6 +1409,12 @@ def _select_review_artifacts(artifacts: list[dict[str, Any]], *, synthetic: bool
         return []
     chosen: list[dict[str, Any]] = []
     seen: set[int] = set()
+    if synthetic:
+        for index, item in enumerate(artifacts):
+            record = item[0]
+            if bool(record.get("not_truth_top1")) or record.get("identity_ranking_category") in {"no_canonical_overlap", "no_candidate"}:
+                chosen.append(item)
+                seen.add(index)
     strata = [
         ("identity_ranking_category", ["dominant_truth_overlap", "dominant_wrong_label", "no_canonical_overlap", "no_candidate"]),
         ("segmentation_contamination_category", ["single_label_like", "minor_neighbor_contamination", "substantial_neighbor_contamination", "no_canonical_overlap", "no_candidate"]),
@@ -1506,9 +1587,8 @@ def evaluate(
     eligible_case_count = len(cases)
     records: list[dict[str, Any]] = []
     candidate_records: list[dict[str, Any]] = []
-    artifact_buckets: dict[str, list[tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]]] = {}
+    artifacts: list[tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]] = []
     artifact_counts: dict[str, int] = {}
-    review_rng = np.random.default_rng(int(seed))
     image_cache: dict[str, np.ndarray] = {}
     mask_cache: dict[str, np.ndarray] = {}
     for case in ([] if preflight_error else cases):
@@ -1516,20 +1596,11 @@ def evaluate(
         record, candidates, selected, arrays = _run_case(context, case, synthetic=mode == "synthetic_benchmark", crop_shape_zyx=crop_shape, threshold_percentile=threshold_percentile, min_voxels=min_voxels, backend=backend, cellpose_min_size=cellpose_min_size, cellpose_device=cellpose_device, cellpose_do_3d=cellpose_do_3d, cellpose_z_axis=cellpose_z_axis, cellpose_channel_axis=cellpose_channel_axis, backend_runtime=backend_runtime, lookup=lookup, graph=graph, image_cache=image_cache, mask_cache=mask_cache)
         records.append(record)
         candidate_records.extend(candidates)
-        # Keep bounded per-category reservoirs so late benchmark categories are visible.
+        # Keep the full in-memory population so category-aware review can include every failure.
         if arrays:
             category = str(record.get("identity_category") or record.get("status") or "uncategorized")
-            bucket = artifact_buckets.setdefault(category, [])
-            count = artifact_counts.get(category, 0) + 1
-            artifact_counts[category] = count
-            item = (record, selected, arrays)
-            if len(bucket) < 12:
-                bucket.append(item)
-            else:
-                replacement = int(review_rng.integers(count))
-                if replacement < len(bucket):
-                    bucket[replacement] = item
-    artifacts = [item for category in sorted(artifact_buckets) for item in artifact_buckets[category]]
+            artifact_counts[category] = artifact_counts.get(category, 0) + 1
+            artifacts.append((record, selected, arrays))
     cases_path = root / ("synthetic_hide_rescue_cases.csv" if mode == "synthetic_benchmark" else "local_rescue_real_cases.csv")
     candidates_path = root / ("synthetic_hide_rescue_candidates.csv" if mode == "synthetic_benchmark" else "local_rescue_real_candidates.csv")
     metrics_path = root / "synthetic_hide_rescue_metrics.csv"

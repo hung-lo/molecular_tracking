@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 import types
 
@@ -60,6 +61,36 @@ def test_overlap_decomposition_separates_identity_from_contamination():
     assert result["top2_overlap_fraction_of_candidate"] == 0.05
     assert result["n_canonical_labels_overlap_ge_5pct_candidate"] == 3
     assert result["segmentation_contamination_category"] == "minor_neighbor_contamination"
+
+
+def test_overlap_decomposition_identity_categories_and_flags_are_independent():
+    truth = _overlap_decomposition([(90, 7), (10, 9)], 100, 7, 90)
+    wrong_with_truth = _overlap_decomposition([(70, 9), (20, 7)], 100, 7, 20)
+    wrong_without_truth = _overlap_decomposition([(70, 9)], 100, 7, 0)
+    no_canonical = _overlap_decomposition([], 100, 7, 0)
+    no_candidate = _overlap_decomposition([], 0, 7, 0, selected=False)
+
+    assert truth["identity_ranking_category"] == "dominant_truth_overlap"
+    assert truth["truth_overlap_present"] and not truth["no_truth_overlap"]
+    assert wrong_with_truth["identity_ranking_category"] == "dominant_wrong_label"
+    assert wrong_with_truth["truth_overlap_present"]
+    assert wrong_without_truth["identity_ranking_category"] == "dominant_wrong_label"
+    assert wrong_without_truth["no_truth_overlap"]
+    assert no_canonical["identity_ranking_category"] == "no_canonical_overlap"
+    assert no_canonical["no_truth_overlap"]
+    assert no_candidate["identity_ranking_category"] == "no_candidate"
+    assert no_candidate["segmentation_contamination_category"] == "no_candidate"
+
+
+def test_canonical_overlap_serialization_reproduces_top1_top2_deterministically():
+    result = _overlap_decomposition([(12, 6988), (176, 6412), (2, 7001)], 200, 6988, 12)
+    assert result["canonical_overlap_voxels_json"] == "[[6412,176],[6988,12],[7001,2]]"
+    serialized = json.loads(result["canonical_overlap_voxels_json"])
+    assert serialized[0] == [6412, 176] and serialized[1] == [6988, 12]
+    assert result["top1_canonical_label"] == serialized[0][0]
+    assert result["top1_overlap_voxels"] == serialized[0][1]
+    assert result["top2_canonical_label"] == serialized[1][0]
+    assert result["top2_overlap_voxels"] == serialized[1][1]
 
 
 def test_candidate_ranking_ignores_biological_state_columns():
@@ -184,6 +215,33 @@ def test_review_selection_includes_late_categories():
         artifacts.append(({"identity_category": category, "dice_3d": 0.5, "centroid_error_um": 1.0}, None, {}))
     selected = _select_review_artifacts(artifacts, synthetic=True)
     assert any(item[0]["identity_category"] == "wrong_neighbor_identity" for item in selected)
+
+
+def test_review_selection_samples_contamination_field_independently_of_identity():
+    artifact = ({
+        "identity_category": "correct_identity_good_mask",
+        "identity_ranking_category": "dominant_truth_overlap",
+        "segmentation_contamination_category": "substantial_neighbor_contamination",
+        "dice_3d": 0.9,
+        "centroid_error_um": 1.0,
+    }, None, {})
+    selected = _select_review_artifacts([artifact], synthetic=True)
+    assert selected == [artifact]
+    assert selected[0][0]["segmentation_contamination_category"] == "substantial_neighbor_contamination"
+
+
+def test_summary_exposes_independent_identity_counts():
+    context = _synthetic_context(pd.DataFrame())
+    records = [
+        {"selected_candidate_is_correct": True, "identity_ranking_category": "dominant_truth_overlap", "truth_overlap_present": True, "centroid_error_um": 1.0, "dice_3d": 0.8, "iou_3d": 0.7, "volume_ratio_rescue_to_truth": 1.0, "wrong_neighbor": False, "top1_overlap_fraction_of_candidate": 0.9, "top2_overlap_fraction_of_candidate": 0.05, "truth_overlap_fraction_of_candidate": 0.9},
+        {"selected_candidate_is_correct": False, "identity_ranking_category": "dominant_wrong_label", "truth_overlap_present": False, "centroid_error_um": 2.0, "dice_3d": 0.2, "iou_3d": 0.1, "volume_ratio_rescue_to_truth": 0.8, "wrong_neighbor": True, "top1_overlap_fraction_of_candidate": 0.8, "top2_overlap_fraction_of_candidate": 0.1, "truth_overlap_fraction_of_candidate": 0.0},
+        {"selected_candidate_is_correct": False, "identity_ranking_category": "no_candidate", "truth_overlap_present": False, "centroid_error_um": np.nan, "dice_3d": np.nan, "iou_3d": np.nan, "volume_ratio_rescue_to_truth": np.nan, "wrong_neighbor": False, "top1_overlap_fraction_of_candidate": np.nan, "top2_overlap_fraction_of_candidate": np.nan, "truth_overlap_fraction_of_candidate": np.nan},
+    ]
+    summary = rescue._summary(records, [], "synthetic_benchmark", context, 1)
+    assert summary["truth_is_top1_count"] == 1 and summary["truth_is_top1_rate"] == 1 / 3
+    assert summary["not_truth_top1_count"] == 2 and summary["not_truth_top1_rate"] == 2 / 3
+    assert summary["dominant_wrong_label_count"] == 1 and summary["no_canonical_overlap_count"] == 0
+    assert summary["no_truth_overlap_count"] == 2 and summary["no_truth_overlap_rate"] == 2 / 3
 
 
 def test_case_sampling_is_deterministic():

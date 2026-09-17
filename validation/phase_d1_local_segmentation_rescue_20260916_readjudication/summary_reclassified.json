@@ -8,9 +8,19 @@
   "new_descriptive": {
     "truth_is_top1_count": 96,
     "truth_is_top1_rate": 0.96,
-    "dominant_wrong_label_count": 4,
-    "dominant_wrong_label_rate": 0.04,
+    "not_truth_top1_count": 4,
+    "not_truth_top1_rate": 0.04,
+    "dominant_wrong_label_count": 3,
+    "dominant_wrong_label_rate": 0.03,
+    "no_canonical_overlap_count": 1,
+    "no_canonical_overlap_rate": 0.01,
     "no_truth_overlap_count": 4,
+    "no_truth_overlap_rate": 0.04,
+    "identity_ranking_categories": {
+      "dominant_truth_overlap": 96,
+      "dominant_wrong_label": 3,
+      "no_canonical_overlap": 1
+    },
     "top1_fraction": {
       "n": 100,
       "median": 0.935957800743793,
@@ -110,6 +120,216 @@
     "WT_Fucci-Tri_corFront_20260511:2564",
     "WT_Fucci-Tri_corFront_20260528:6586",
     "WT_Fucci-Tri_corFront_20260708:5047"
+  ],
+  "failure_details": [
+    {
+      "track_uid": "WT_Fucci-Tri_corFront_20260519:7222",
+      "truth_overlap_present": false,
+      "no_truth_overlap": true,
+      "top1_overlap_present": true,
+      "top1_canonical_label": 6412,
+      "truth_label": 6988,
+      "top1_fraction": 0.9943502824858758,
+      "selected_candidate_id": 85,
+      "selected_distance_from_prediction_um": 17.74824016163577,
+      "selected_geometric_rank_score": 17.74824016163577,
+      "best_truth_overlap_candidate_id": null,
+      "best_truth_overlap_candidate_dice": null,
+      "best_truth_overlap_candidate_distance_from_prediction_um": null,
+      "ranking_top5": [
+        {
+          "candidate_id": 85,
+          "distance_from_prediction_um": 17.74824016163577,
+          "geometric_rank_score": 17.74824016163577,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": 6412
+        },
+        {
+          "candidate_id": 88,
+          "distance_from_prediction_um": 24.378912869275545,
+          "geometric_rank_score": 24.378912869275545,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": 6990
+        },
+        {
+          "candidate_id": 89,
+          "distance_from_prediction_um": 22.47851157552929,
+          "geometric_rank_score": 24.47851157552929,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": null
+        },
+        {
+          "candidate_id": 82,
+          "distance_from_prediction_um": 26.4220591753716,
+          "geometric_rank_score": 26.4220591753716,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": 6412
+        },
+        {
+          "candidate_id": 84,
+          "distance_from_prediction_um": 26.4832738302348,
+          "geometric_rank_score": 26.4832738302348,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": 6612
+        }
+      ]
+    },
+    {
+      "track_uid": "WT_Fucci-Tri_corFront_20260511:2564",
+      "truth_overlap_present": false,
+      "no_truth_overlap": true,
+      "top1_overlap_present": true,
+      "top1_canonical_label": 2564,
+      "truth_label": 1941,
+      "top1_fraction": 0.8775510204081632,
+      "selected_candidate_id": 26,
+      "selected_distance_from_prediction_um": 11.472431210264746,
+      "selected_geometric_rank_score": 11.472431210264746,
+      "best_truth_overlap_candidate_id": 10,
+      "best_truth_overlap_candidate_dice": 0.0479192938209331,
+      "best_truth_overlap_candidate_distance_from_prediction_um": 22.252880244446537,
+      "ranking_top5": [
+        {
+          "candidate_id": 26,
+          "distance_from_prediction_um": 11.472431210264746,
+          "geometric_rank_score": 11.472431210264746,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": 2564
+        },
+        {
+          "candidate_id": 33,
+          "distance_from_prediction_um": 14.541663845224685,
+          "geometric_rank_score": 14.541663845224685,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": 2568
+        },
+        {
+          "candidate_id": 10,
+          "distance_from_prediction_um": 22.252880244446537,
+          "geometric_rank_score": 22.252880244446537,
+          "truth_dice": 0.0479192938209331,
+          "best_overlapping_canonical_label": 464
+        },
+        {
+          "candidate_id": 12,
+          "distance_from_prediction_um": 22.62707866462137,
+          "geometric_rank_score": 22.62707866462137,
+          "truth_dice": 0.0016129032258064,
+          "best_overlapping_canonical_label": 471
+        },
+        {
+          "candidate_id": 18,
+          "distance_from_prediction_um": 23.25926143569906,
+          "geometric_rank_score": 23.25926143569906,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": 1106
+        }
+      ]
+    },
+    {
+      "track_uid": "WT_Fucci-Tri_corFront_20260528:6586",
+      "truth_overlap_present": false,
+      "no_truth_overlap": true,
+      "top1_overlap_present": false,
+      "top1_canonical_label": null,
+      "truth_label": 6691,
+      "top1_fraction": 0.0,
+      "selected_candidate_id": 69,
+      "selected_distance_from_prediction_um": 12.938214267826282,
+      "selected_geometric_rank_score": 12.938214267826282,
+      "best_truth_overlap_candidate_id": 51,
+      "best_truth_overlap_candidate_dice": 0.4125603864734299,
+      "best_truth_overlap_candidate_distance_from_prediction_um": 14.466343139483625,
+      "ranking_top5": [
+        {
+          "candidate_id": 69,
+          "distance_from_prediction_um": 12.938214267826282,
+          "geometric_rank_score": 12.938214267826282,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": null
+        },
+        {
+          "candidate_id": 51,
+          "distance_from_prediction_um": 14.466343139483625,
+          "geometric_rank_score": 16.466343139483623,
+          "truth_dice": 0.4125603864734299,
+          "best_overlapping_canonical_label": 5633
+        },
+        {
+          "candidate_id": 74,
+          "distance_from_prediction_um": 20.09829601371246,
+          "geometric_rank_score": 20.09829601371246,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": 6834
+        },
+        {
+          "candidate_id": 62,
+          "distance_from_prediction_um": 20.55290970765788,
+          "geometric_rank_score": 20.55290970765788,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": 6406
+        },
+        {
+          "candidate_id": 61,
+          "distance_from_prediction_um": 21.86592942615128,
+          "geometric_rank_score": 21.86592942615128,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": 6056
+        }
+      ]
+    },
+    {
+      "track_uid": "WT_Fucci-Tri_corFront_20260708:5047",
+      "truth_overlap_present": false,
+      "no_truth_overlap": true,
+      "top1_overlap_present": true,
+      "top1_canonical_label": 3943,
+      "truth_label": 4825,
+      "top1_fraction": 0.9371069182389936,
+      "selected_candidate_id": 66,
+      "selected_distance_from_prediction_um": 13.670105342832096,
+      "selected_geometric_rank_score": 13.670105342832096,
+      "best_truth_overlap_candidate_id": null,
+      "best_truth_overlap_candidate_dice": null,
+      "best_truth_overlap_candidate_distance_from_prediction_um": null,
+      "ranking_top5": [
+        {
+          "candidate_id": 66,
+          "distance_from_prediction_um": 13.670105342832096,
+          "geometric_rank_score": 13.670105342832096,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": 3943
+        },
+        {
+          "candidate_id": 52,
+          "distance_from_prediction_um": 14.14770753754572,
+          "geometric_rank_score": 14.14770753754572,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": 4372
+        },
+        {
+          "candidate_id": 39,
+          "distance_from_prediction_um": 15.132579016413567,
+          "geometric_rank_score": 15.132579016413567,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": 3936
+        },
+        {
+          "candidate_id": 71,
+          "distance_from_prediction_um": 20.913121634473537,
+          "geometric_rank_score": 20.913121634473537,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": 5368
+        },
+        {
+          "candidate_id": 49,
+          "distance_from_prediction_um": 21.16561087176784,
+          "geometric_rank_score": 21.16561087176784,
+          "truth_dice": 0.0,
+          "best_overlapping_canonical_label": 3723
+        }
+      ]
+    }
   ],
   "ranker_failure_notes": "The saved artifact contains no candidate masks or per-canonical-label overlap vectors. Failure panels therefore show saved candidate bbox/centroid geometry and rank scores; exact top2 voxel fractions require a future run that persists those vectors.",
   "panel_counts": {

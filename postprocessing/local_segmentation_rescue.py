@@ -100,6 +100,8 @@ def _overlap_decomposition(
     selected_voxels: int,
     truth_label: int | None,
     truth_overlap_voxels: int,
+    *,
+    selected: bool = True,
 ) -> dict[str, Any]:
     """Describe identity and contamination separately from canonical overlaps."""
 
@@ -111,13 +113,18 @@ def _overlap_decomposition(
     top2_fraction = top2_voxels / total if total else np.nan
     truth_fraction = int(truth_overlap_voxels) / total if total else np.nan
     truth_is_top1 = bool(ordered and truth_label is not None and int(top1_label) == int(truth_label))
-    if not ordered:
-        identity_category = "no_truth_overlap"
+    truth_overlap_present = int(truth_overlap_voxels) > 0
+    if not selected:
+        identity_category = "no_candidate"
     elif truth_is_top1:
         identity_category = "dominant_truth_overlap"
-    else:
+    elif ordered:
         identity_category = "dominant_wrong_label"
-    if not ordered:
+    else:
+        identity_category = "no_canonical_overlap"
+    if not selected:
+        contamination_category = "no_candidate"
+    elif not ordered:
         contamination_category = "no_canonical_overlap"
     elif top2_fraction <= 0.01:
         contamination_category = "single_label_like"
@@ -137,11 +144,14 @@ def _overlap_decomposition(
         "top2_overlap_fraction_of_candidate": top2_fraction,
         "top1_minus_top2_fraction": top1_fraction - top2_fraction if np.isfinite(top1_fraction) and np.isfinite(top2_fraction) else np.nan,
         "top1_to_top2_ratio": top1_fraction / top2_fraction if np.isfinite(top1_fraction) and np.isfinite(top2_fraction) and top2_fraction > 0 else np.nan,
+        "canonical_overlap_voxels_json": json.dumps([[label, voxels] for voxels, label in sorted(ordered, key=lambda item: item[1])], separators=(",", ":")),
         "n_canonical_labels_overlap_any": len(ordered),
         "n_canonical_labels_overlap_ge_1pct_candidate": sum(voxels / total >= 0.01 for voxels, _ in ordered) if total else 0,
         "n_canonical_labels_overlap_ge_5pct_candidate": sum(voxels / total >= 0.05 for voxels, _ in ordered) if total else 0,
         "n_canonical_labels_overlap_ge_10pct_candidate": sum(voxels / total >= 0.10 for voxels, _ in ordered) if total else 0,
         "truth_is_top1": truth_is_top1,
+        "truth_overlap_present": truth_overlap_present,
+        "no_truth_overlap": not truth_overlap_present,
         "identity_ranking_category": identity_category,
         "segmentation_contamination_category": contamination_category,
     }
@@ -1200,15 +1210,10 @@ def _run_case(
             selected_truth_fraction = int(np.logical_and(selected_mask, truth_mask).sum()) / truth_volume if truth_volume else 0.0
             selected_is_truth = bool(selected and np.isfinite(_finite(best_overlap_label)) and int(best_overlap_label) == truth_label)
             selected_multiple = len(selected_overlap) > 1
-            overlap = _overlap_decomposition(selected_overlap, selected_voxels, truth_label, int(np.logical_and(selected_mask, truth_mask).sum()))
-            if not selected:
-                identity_category = "no_candidate"
-                identity_ranking_category = "no_candidate"
-                contamination_category = "no_candidate"
-            else:
-                identity_ranking_category = str(overlap["identity_ranking_category"])
-                contamination_category = str(overlap["segmentation_contamination_category"])
-                identity_category = identity_ranking_category
+            overlap = _overlap_decomposition(selected_overlap, selected_voxels, truth_label, int(np.logical_and(selected_mask, truth_mask).sum()), selected=selected is not None)
+            identity_ranking_category = str(overlap["identity_ranking_category"])
+            contamination_category = str(overlap["segmentation_contamination_category"])
+            identity_category = identity_ranking_category
             if not selected:
                 legacy_identity_category = "no_candidate"
             elif not selected_overlap:
@@ -1235,7 +1240,7 @@ def _run_case(
                 selected_bbox_volume = int(np.prod(np.asarray(selected_bbox[3:]) - np.asarray(selected_bbox[:3])))
                 bbox_union = truth_bbox_volume + selected_bbox_volume - intersection_volume
                 bbox_overlap = intersection_volume / bbox_union if bbox_union else 0.0
-            truth_metrics = {"rescue_found": bool(selected), "selected_candidate_exists": bool(selected), "selected_candidate_is_correct": selected_is_truth, "wrong_neighbor": identity_ranking_category == "dominant_wrong_label", "identity_category": identity_category, "legacy_identity_category": legacy_identity_category, "identity_ranking_category": identity_ranking_category, "segmentation_contamination_category": contamination_category, **overlap, "selected_overlap_truth_voxels": int(np.logical_and(selected_mask, truth_mask).sum()) if selected else 0, "selected_overlap_truth_fraction": selected_truth_fraction, "truth_overlap_fraction_of_truth": selected_truth_fraction, "selected_best_overlapping_canonical_label": best_overlap_label, "selected_best_overlapping_canonical_fraction": selected_best_fraction, "selected_best_overlapping_is_truth": selected_is_truth, "selected_overlaps_multiple_canonical_rois": selected_multiple, "prediction_error_um": float(np.linalg.norm((np.asarray(selected["centroid_xyz"]) - np.asarray(prediction["predicted_xyz"])) * spacing_xyz)) if selected else np.nan, "centroid_error_um": float(np.linalg.norm((np.asarray(selected["centroid_xyz"]) - truth_feature_xyz) * spacing_xyz)) if selected else np.nan, "selected_centroid_error_to_truth_um": float(np.linalg.norm((np.asarray(selected["centroid_xyz"]) - truth_feature_xyz) * spacing_xyz)) if selected else np.nan, "dice_3d": selected_dice, "iou_3d": selected_iou, "volume_ratio_rescue_to_truth": selected_volume / truth_volume if truth_volume else np.nan, "absolute_volume_error_voxels": abs(selected_volume - truth_volume), "bbox_overlap": bbox_overlap, "truth_rank_among_candidates": (1 + sorted((item[0] for item in truth_rank), reverse=True).index(selected_dice)) if selected else np.nan, "best_candidate_dice": best_truth[0], "nearest_wrong_candidate_distance_um": nearest_wrong, "number_of_candidates": len(ranked), "edge_limited": bool(bounds.edge_clipped or (selected and selected.get("touches_crop_edge"))), "truth_volume_voxels": truth_volume}
+            truth_metrics = {"rescue_found": bool(selected), "selected_candidate_exists": bool(selected), "selected_candidate_is_correct": selected_is_truth, "not_truth_top1": not selected_is_truth, "wrong_neighbor": identity_ranking_category == "dominant_wrong_label", "identity_category": identity_category, "legacy_identity_category": legacy_identity_category, "identity_ranking_category": identity_ranking_category, "segmentation_contamination_category": contamination_category, **overlap, "selected_overlap_truth_voxels": int(np.logical_and(selected_mask, truth_mask).sum()) if selected else 0, "selected_overlap_truth_fraction": selected_truth_fraction, "truth_overlap_fraction_of_truth": selected_truth_fraction, "selected_best_overlapping_canonical_label": best_overlap_label, "selected_best_overlapping_canonical_fraction": selected_best_fraction, "selected_best_overlapping_is_truth": selected_is_truth, "selected_overlaps_multiple_canonical_rois": selected_multiple, "prediction_error_um": float(np.linalg.norm((np.asarray(selected["centroid_xyz"]) - np.asarray(prediction["predicted_xyz"])) * spacing_xyz)) if selected else np.nan, "centroid_error_um": float(np.linalg.norm((np.asarray(selected["centroid_xyz"]) - truth_feature_xyz) * spacing_xyz)) if selected else np.nan, "selected_centroid_error_to_truth_um": float(np.linalg.norm((np.asarray(selected["centroid_xyz"]) - truth_feature_xyz) * spacing_xyz)) if selected else np.nan, "dice_3d": selected_dice, "iou_3d": selected_iou, "volume_ratio_rescue_to_truth": selected_volume / truth_volume if truth_volume else np.nan, "absolute_volume_error_voxels": abs(selected_volume - truth_volume), "bbox_overlap": bbox_overlap, "truth_rank_among_candidates": (1 + sorted((item[0] for item in truth_rank), reverse=True).index(selected_dice)) if selected else np.nan, "best_candidate_dice": best_truth[0], "nearest_wrong_candidate_distance_um": nearest_wrong, "number_of_candidates": len(ranked), "edge_limited": bool(bounds.edge_clipped or (selected and selected.get("touches_crop_edge"))), "truth_volume_voxels": truth_volume}
             green_path = _path_value(target_row, "green_image_path")
             red_path = _path_value(target_row, "red_image_path")
             if green_path is not None and red_path is not None and selected:
@@ -1329,11 +1334,16 @@ def _select_review_artifacts(artifacts: list[dict[str, Any]], *, synthetic: bool
         return []
     chosen: list[dict[str, Any]] = []
     seen: set[int] = set()
-    categories = ["dominant_truth_overlap", "dominant_wrong_label", "no_truth_overlap", "single_label_like", "minor_neighbor_contamination", "substantial_neighbor_contamination", "correct_identity_good_mask", "correct_identity_poor_mask", "wrong_neighbor_identity", "merged_multiple_cells", "ambiguous_identity", "no_canonical_overlap", "no_candidate"]
-    for category in categories:
-        for index, item in enumerate(artifacts):
-            if index not in seen and (not synthetic or item[0].get("identity_category") == category):
-                chosen.append(item); seen.add(index); break
+    strata = [
+        ("identity_ranking_category", ["dominant_truth_overlap", "dominant_wrong_label", "no_canonical_overlap", "no_candidate"]),
+        ("segmentation_contamination_category", ["single_label_like", "minor_neighbor_contamination", "substantial_neighbor_contamination", "no_canonical_overlap", "no_candidate"]),
+        ("identity_category", ["correct_identity_good_mask", "correct_identity_poor_mask", "wrong_neighbor_identity", "merged_multiple_cells", "ambiguous_identity", "no_truth_overlap"]),
+    ]
+    for field, categories in strata:
+        for category in categories:
+            for index, item in enumerate(artifacts):
+                if index not in seen and (not synthetic or item[0].get(field) == category):
+                    chosen.append(item); seen.add(index); break
     finite = [(index, float(item[0].get("dice_3d", np.nan))) for index, item in enumerate(artifacts) if index not in seen and np.isfinite(_finite(item[0].get("dice_3d")))]
     if finite:
         for index in {min(finite, key=lambda value: value[1])[0], max(finite, key=lambda value: value[1])[0], finite[len(finite) // 2][0]}:
@@ -1360,7 +1370,11 @@ def _summary(records: list[dict[str, Any]], candidates: list[dict[str, Any]], mo
             values = table[column] if column in table else pd.Series(dtype=float)
             numeric = pd.to_numeric(values, errors="coerce")
             if column == "selected_candidate_is_correct":
-                summary["truth_is_top1_rate"] = float(values.fillna(False).mean()) if len(values) else np.nan
+                truth_top1 = values.fillna(False).astype(bool)
+                summary["truth_is_top1_count"] = int(truth_top1.sum())
+                summary["truth_is_top1_rate"] = float(truth_top1.mean()) if len(values) else np.nan
+                summary["not_truth_top1_count"] = int((~truth_top1).sum())
+                summary["not_truth_top1_rate"] = float((~truth_top1).mean()) if len(values) else np.nan
                 summary["correct_cell_rate"] = summary["truth_is_top1_rate"]
                 summary["correct_cell_rate_definition"] = "truth_is_top1"
             elif column == "centroid_error_um": summary["median_centroid_error_um"] = float(numeric.median()) if numeric.notna().any() else np.nan; summary["p90_centroid_error_um"] = float(numeric.quantile(0.9)) if numeric.notna().any() else np.nan
@@ -1372,10 +1386,19 @@ def _summary(records: list[dict[str, Any]], candidates: list[dict[str, Any]], mo
         if identity_column in table:
             categories = table[identity_column]
             summary["identity_ranking_categories"] = categories.value_counts(dropna=False).to_dict()
+            summary["dominant_truth_overlap_count"] = int(categories.eq("dominant_truth_overlap").sum())
             summary["dominant_truth_overlap_rate"] = float(categories.eq("dominant_truth_overlap").mean()) if len(table) else np.nan
+            summary["dominant_wrong_label_count"] = int(categories.eq("dominant_wrong_label").sum())
             summary["dominant_wrong_label_rate"] = float(categories.eq("dominant_wrong_label").mean()) if len(table) else np.nan
+            summary["no_canonical_overlap_count"] = int(categories.eq("no_canonical_overlap").sum())
+            summary["no_canonical_overlap_rate"] = float(categories.eq("no_canonical_overlap").mean()) if len(table) else np.nan
             summary["no_truth_overlap_rate"] = float(categories.eq("no_truth_overlap").mean()) if len(table) else np.nan
             summary["identity_correct_rate"] = summary.get("truth_is_top1_rate", np.nan)
+        if "truth_overlap_present" in table:
+            truth_overlap = pd.to_numeric(table["truth_overlap_present"], errors="coerce").fillna(False).astype(bool)
+            summary["truth_overlap_present_count"] = int(truth_overlap.sum())
+            summary["no_truth_overlap_count"] = int((~truth_overlap).sum())
+            summary["no_truth_overlap_rate"] = float((~truth_overlap).mean()) if len(table) else np.nan
         if "legacy_identity_category" in table:
             legacy = table["legacy_identity_category"]
             summary["legacy_identity_categories"] = legacy.value_counts(dropna=False).to_dict()
@@ -1393,7 +1416,7 @@ def _write_report(output_dir: Path, context: RunContext, mode: str, summary: dic
     report = output_dir / OUTPUT_REPORT
     lines = [f"# Phase D1 Local Segmentation Rescue Report (2026-09-15)", "", "## STARTING/ENDING COMMIT", f"- Canonical run provenance commit: `{context.git_commit}`", f"- Evaluator repository commit: `{_git_commit()}`", f"- Mode: `{mode}`", "", "## IMPLEMENTATION", f"- Module: `postprocessing/local_segmentation_rescue.py`", f"- Segmenter backend: `{summary.get('backend', 'unknown')}`", f"- Spacing (ZYX um): `{context.spacing_zyx}` ({context.spacing_source})", f"- Crop: `{DEFAULT_CROP_SHAPE_ZYX}` voxels, configurable via CLI", "- Transform evidence: direct, composed, fallback, or unavailable; prediction and ranking are state-free.", "- Truth leakage: target label/mask is loaded only after candidate segmentation for synthetic evaluation.", "", "## BENCHMARK/PROPOSALS", f"- Eligible/attempted: `{summary.get('n_eligible', 0)}` / `{summary.get('n_attempted', 0)}`", f"- Candidate generated: `{summary.get('n_with_candidate', 0)}`; multiple: `{summary.get('n_multiple_candidates', 0)}`; no candidate: `{summary.get('n_no_candidate', 0)}`", f"- Status counts: `{summary.get('status_counts', {})}`"]
     if mode == "synthetic_benchmark":
-        lines += [f"- Truth top-1 rate: `{summary.get('truth_is_top1_rate', summary.get('identity_correct_rate', np.nan))}`", f"- Dominant wrong-label rate: `{summary.get('dominant_wrong_label_rate', np.nan)}`", f"- No-truth-overlap rate: `{summary.get('no_truth_overlap_rate', np.nan)}`", f"- Contamination categories (descriptive): `{summary.get('segmentation_contamination_categories', {})}`", f"- Median top-1/top-2 candidate fractions: `{summary.get('median_top1_fraction', np.nan)}` / `{summary.get('median_top2_fraction', np.nan)}`", f"- Median/P90 centroid error (um): `{summary.get('median_centroid_error_um', np.nan)}` / `{summary.get('p90_centroid_error_um', np.nan)}`", f"- Median Dice/IoU: `{summary.get('median_dice', np.nan)}` / `{summary.get('median_iou', np.nan)}`", f"- Median volume ratio: `{summary.get('median_volume_ratio', np.nan)}`"]
+        lines += [f"- Truth top-1: `{summary.get('truth_is_top1_count', np.nan)}` / `{summary.get('truth_is_top1_rate', summary.get('identity_correct_rate', np.nan))}`", f"- Not truth top-1: `{summary.get('not_truth_top1_count', np.nan)}` / `{summary.get('not_truth_top1_rate', np.nan)}`", f"- Dominant wrong-label: `{summary.get('dominant_wrong_label_count', np.nan)}` / `{summary.get('dominant_wrong_label_rate', np.nan)}`", f"- No canonical overlap: `{summary.get('no_canonical_overlap_count', np.nan)}` / `{summary.get('no_canonical_overlap_rate', np.nan)}`", f"- No truth overlap flag: `{summary.get('no_truth_overlap_count', np.nan)}` / `{summary.get('no_truth_overlap_rate', np.nan)}`", f"- Contamination categories (descriptive): `{summary.get('segmentation_contamination_categories', {})}`", f"- Median top-1/top-2 candidate fractions: `{summary.get('median_top1_fraction', np.nan)}` / `{summary.get('median_top2_fraction', np.nan)}`", f"- Median/P90 centroid error (um): `{summary.get('median_centroid_error_um', np.nan)}` / `{summary.get('p90_centroid_error_um', np.nan)}`", f"- Median Dice/IoU: `{summary.get('median_dice', np.nan)}` / `{summary.get('median_iou', np.nan)}`", f"- Median volume ratio: `{summary.get('median_volume_ratio', np.nan)}`"]
     lines += ["", "## MEASUREMENT BIAS", "- Green/Red/ratio are evaluation-only; ECLIPSE fields remain unavailable unless supplied by an existing extraction table.", f"- Measurement-bias table: `{summary.get('output_paths', {}).get('measurement_bias', '')}`", "", "## REVIEW ARTIFACTS", f"- Panels: `{summary.get('review_panel_dir', '')}`", f"- Summary plots: `{summary.get('summary_plot_dir', '')}`", "", "## HARD CONSTRAINTS", "- Canonical masks/tracks/track IDs changed: **NO**", "- Matching thresholds or ECLIPSE calculation changed: **NO**", "- ECLIPSE/Green/Red/state used for identity: **NO**", "- Rescued masks or measurements written to primary extraction: **NO**", "", "## CONCLUSION", "- Production acceptance threshold: **not defined in Phase D1**", "- Scientific promise: **UNCERTAIN pending benchmark distributions and review**", "- Next step: inspect review PNGs and benchmark distributions before any production gate.", "", focused_note]
     report.write_text("\n".join(lines) + "\n", encoding="utf-8")
     fix_lines = [
@@ -1402,7 +1425,7 @@ def _write_report(output_dir: Path, context: RunContext, mode: str, summary: dic
         "## TRUTH LEAKAGE", "- target truth volume used before selection: **NO**", "- target truth mask used before selection: **NO**", "- synthetic and real ranking semantics aligned: **YES**", "",
         "## BENCHMARK CONTEXT", f"- endpoint_one_sided n: `{summary.get('n_eligible', 0) if mode == 'synthetic_benchmark' else 0}`", "- internal_gap_two_sided n: `0`", "- metrics reported separately: **YES**", "- trust criteria: consensus track, no cycle conflict/unchecked edge, reliable transform, non-edge target, stable context, bounded distance/ambiguity", f"- trusted eligible/excluded: `{summary.get('synthetic_trusted_eligible', np.nan)}` / `{summary.get('synthetic_trusted_excluded', np.nan)}`", "",
         "## SEGMENTER", f"- scientific backend: `{summary.get('backend', CELLPOSE_BACKEND)}`", f"- model/version: `{summary.get('cellpose_model') or 'threshold baseline'}` / `{summary.get('backend_runtime', {}).get('cellpose_version', 'n/a')}`", f"- device: `{summary.get('backend_runtime', {}).get('resolved_device', summary.get('cellpose_device') or 'cpu')}`", "- threshold backend retained only as baseline/test: **YES**", "",
-        "## IDENTITY METRICS", f"- truth top-1 rate: `{summary.get('truth_is_top1_rate', summary.get('identity_correct_rate', np.nan))}`", f"- dominant wrong-label rate: `{summary.get('dominant_wrong_label_rate', np.nan)}`", f"- no-truth-overlap rate: `{summary.get('no_truth_overlap_rate', np.nan)}`", f"- contamination categories (descriptive): `{summary.get('segmentation_contamination_categories', {})}`", f"- median top-1/top-2 fractions: `{summary.get('median_top1_fraction', np.nan)}` / `{summary.get('median_top2_fraction', np.nan)}`", "",
+        "## IDENTITY METRICS", f"- truth top-1: `{summary.get('truth_is_top1_count', np.nan)}` / `{summary.get('truth_is_top1_rate', summary.get('identity_correct_rate', np.nan))}`", f"- not truth top-1: `{summary.get('not_truth_top1_count', np.nan)}` / `{summary.get('not_truth_top1_rate', np.nan)}`", f"- dominant wrong-label: `{summary.get('dominant_wrong_label_count', np.nan)}` / `{summary.get('dominant_wrong_label_rate', np.nan)}`", f"- no canonical overlap: `{summary.get('no_canonical_overlap_count', np.nan)}` / `{summary.get('no_canonical_overlap_rate', np.nan)}`", f"- no-truth-overlap flag: `{summary.get('no_truth_overlap_count', np.nan)}` / `{summary.get('no_truth_overlap_rate', np.nan)}`", f"- contamination categories (descriptive): `{summary.get('segmentation_contamination_categories', {})}`", f"- median top-1/top-2 fractions: `{summary.get('median_top1_fraction', np.nan)}` / `{summary.get('median_top2_fraction', np.nan)}`", "",
         "## MASK METRICS", f"- median Dice: `{summary.get('median_dice', np.nan)}`", f"- median IoU: `{summary.get('median_iou', np.nan)}`", f"- median centroid error: `{summary.get('median_centroid_error_um', np.nan)}`", f"- median volume ratio: `{summary.get('median_volume_ratio', np.nan)}`", "",
         "## REAL PROPOSALS", f"- evaluator artifact: `{summary.get('endpoint_classification') or 'unavailable'}`", f"- artifact SHA256: `{summary.get('classification_source_sha256') or 'n/a'}`", f"- evaluator no_mask_near_prediction rows: `{summary.get('evaluator_no_mask_near_prediction_rows', 0)}`", f"- rows parsed successfully: `{summary.get('rows_parsed_successfully', 0)}`", f"- eligible/attempted: `{summary.get('n_eligible', 0) if mode == 'real_proposals' else 0}` / `{summary.get('n_attempted', 0) if mode == 'real_proposals' else 0}`", f"- target derived from end_session_index + 1: **{'YES' if summary.get('target_derived_from_end_session_index_plus_one') else 'NO/UNAVAILABLE'}**", "- generic-gap fallback used: **NO**", "",
         "## MEASUREMENT BIAS", "- production extraction semantics reused: **NO; outputs are explicitly raw_mask_mean diagnostics**", "",

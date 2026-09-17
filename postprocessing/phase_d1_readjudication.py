@@ -70,21 +70,26 @@ def _decompose(cases: pd.DataFrame, candidates: pd.DataFrame) -> pd.DataFrame:
         candidate_rows = _candidate_rows(candidates, case)
         selected = candidate_rows[candidate_rows["candidate_id"].eq(case["selected_candidate_id"])]
         selected_row = selected.iloc[0] if not selected.empty else pd.Series(dtype=object)
+        selected_exists = not selected.empty
         selected_voxels = float(selected_row.get("volume_voxels", np.nan))
         truth_voxels = float(case.get("truth_volume_voxels", np.nan))
         truth_fraction_of_truth = float(case.get("selected_overlap_truth_fraction", np.nan))
         truth_overlap_voxels = round(truth_fraction_of_truth * truth_voxels) if np.isfinite(truth_fraction_of_truth * truth_voxels) else np.nan
         top1_fraction = float(case.get("selected_best_overlapping_canonical_fraction", np.nan))
         top1_voxels = round(top1_fraction * selected_voxels) if np.isfinite(top1_fraction * selected_voxels) else np.nan
-        truth_is_top1 = _truthy(case.get("selected_best_overlapping_is_truth", False))
-        top1_label = case.get("selected_best_overlapping_canonical_label", np.nan)
+        truth_is_top1 = bool(selected_exists and _truthy(case.get("selected_best_overlapping_is_truth", False)))
         has_truth_overlap = bool(np.isfinite(truth_overlap_voxels) and truth_overlap_voxels > 0)
-        if truth_is_top1:
+        top1_overlap_present = bool(np.isfinite(top1_fraction) and top1_fraction > 0)
+        raw_top1_label = case.get("selected_best_overlapping_canonical_label", np.nan)
+        top1_label = raw_top1_label if top1_overlap_present else np.nan
+        if not selected_exists:
+            dominant_class = "no_candidate"
+        elif truth_is_top1:
             dominant_class = "dominant_truth_overlap"
-        elif has_truth_overlap:
+        elif top1_overlap_present:
             dominant_class = "dominant_wrong_label"
         else:
-            dominant_class = "no_truth_overlap"
+            dominant_class = "no_canonical_overlap"
         non_top1 = 1.0 - top1_fraction if np.isfinite(top1_fraction) else np.nan
         if np.isfinite(non_top1):
             contamination_class = (
@@ -118,6 +123,10 @@ def _decompose(cases: pd.DataFrame, candidates: pd.DataFrame) -> pd.DataFrame:
             "n_canonical_labels_overlap_ge_5pct_candidate": np.nan,
             "n_canonical_labels_overlap_ge_10pct_candidate": np.nan,
             "truth_is_top1": truth_is_top1,
+            "not_truth_top1": bool(not truth_is_top1),
+            "truth_overlap_present": has_truth_overlap,
+            "no_truth_overlap": not has_truth_overlap,
+            "top1_overlap_present": top1_overlap_present,
             "dominant_identity_class": dominant_class,
             "non_top1_fraction_upper_bound": non_top1,
             "contamination_class_descriptive": contamination_class,
@@ -167,8 +176,9 @@ def _plot_summary(decomp: pd.DataFrame, output: Path) -> None:
         ax.hist(values, bins=20, color="#6a3d9a"); ax.set_title(label); ax.axvline(0, color="black", lw=0.8)
     fig.tight_layout(); fig.savefig(plot_dir / "measurement_bias_distributions.png", dpi=160); plt.close(fig)
 
-    counts = decomp["dominant_identity_class"].value_counts().reindex(["dominant_truth_overlap", "dominant_wrong_label", "no_truth_overlap"], fill_value=0)
-    fig, ax = plt.subplots(figsize=(6, 3)); ax.bar(counts.index, counts.values, color=["#4c9f70", "#d95f02", "#7570b3"]); ax.tick_params(axis="x", rotation=20); ax.set_ylabel("cases"); ax.set_title("descriptive identity reclassification"); fig.tight_layout(); fig.savefig(plot_dir / "identity_reclassification.png", dpi=160); plt.close(fig)
+    labels = ["dominant_truth_overlap", "dominant_wrong_label", "no_canonical_overlap", "no_candidate"]
+    counts = decomp["dominant_identity_class"].value_counts().reindex(labels, fill_value=0)
+    fig, ax = plt.subplots(figsize=(7, 3)); ax.bar(counts.index, counts.values, color=["#4c9f70", "#d95f02", "#7570b3", "#999999"]); ax.tick_params(axis="x", rotation=20); ax.set_ylabel("cases"); ax.set_title("descriptive identity reclassification"); fig.tight_layout(); fig.savefig(plot_dir / "identity_reclassification.png", dpi=160); plt.close(fig)
 
 
 def _draw_bbox(ax, candidate: pd.Series, start_zyx: tuple[int, int, int], color: str, linestyle: str, label: str) -> None:
@@ -275,6 +285,70 @@ def _write_panels(cases: pd.DataFrame, candidates: pd.DataFrame, ctx, output: Pa
     return {"four_failures": len(list(failure_dir.glob("*.png"))), "truth_top1": len(list(representative_dir.glob("*.png")))}
 
 
+def _failure_details(cases: pd.DataFrame, candidates: pd.DataFrame, decomp: pd.DataFrame) -> list[dict[str, object]]:
+    """Return compact, deterministic ranking details for the four saved failures."""
+
+    details: list[dict[str, object]] = []
+    for track_uid in FAILURE_TRACKS:
+        case = cases[cases["track_uid"].eq(track_uid)].iloc[0]
+        decomposition = decomp[decomp["track_uid"].eq(track_uid)].iloc[0]
+        rows = _candidate_rows(candidates, case)
+        selected_id = case.get("selected_candidate_id", np.nan)
+        selected = rows[rows["candidate_id"].eq(selected_id)]
+        selected_row = selected.iloc[0] if not selected.empty else pd.Series(dtype=object)
+        truth_dice = pd.to_numeric(rows.get("truth_dice", pd.Series(dtype=float)), errors="coerce")
+        truth_rows = rows[truth_dice.gt(0)].copy()
+        if not truth_rows.empty:
+            truth_rows["_truth_dice"] = pd.to_numeric(truth_rows["truth_dice"], errors="coerce")
+            truth_rows = truth_rows.sort_values(["_truth_dice", "geometric_rank_score", "candidate_id"], ascending=[False, True, True], kind="stable")
+            best_truth = truth_rows.iloc[0]
+        else:
+            best_truth = pd.Series(dtype=object)
+
+        def _number(row: pd.Series, column: str):
+            value = row.get(column, np.nan)
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return None
+            return value if np.isfinite(value) else None
+
+        def _integer(value):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return None
+            return int(value) if np.isfinite(value) else None
+
+        ranking_rows = rows.head(5)
+        ranking = []
+        for _, row in ranking_rows.iterrows():
+            ranking.append({
+                "candidate_id": _integer(row.get("candidate_id")),
+                "distance_from_prediction_um": _number(row, "distance_from_prediction_um"),
+                "geometric_rank_score": _number(row, "geometric_rank_score"),
+                "truth_dice": _number(row, "truth_dice"),
+                "best_overlapping_canonical_label": _integer(row.get("best_overlapping_canonical_label")),
+            })
+        details.append({
+            "track_uid": track_uid,
+            "truth_overlap_present": bool(decomposition["truth_overlap_present"]),
+            "no_truth_overlap": bool(decomposition["no_truth_overlap"]),
+            "top1_overlap_present": bool(decomposition["top1_overlap_present"]),
+            "top1_canonical_label": _integer(decomposition["top1_canonical_label"]),
+            "truth_label": _integer(decomposition["target_truth_label"]),
+            "top1_fraction": _number(decomposition, "top1_overlap_fraction_of_candidate"),
+            "selected_candidate_id": _integer(selected_id),
+            "selected_distance_from_prediction_um": _number(selected_row, "distance_from_prediction_um"),
+            "selected_geometric_rank_score": _number(selected_row, "geometric_rank_score"),
+            "best_truth_overlap_candidate_id": _integer(best_truth.get("candidate_id", np.nan)),
+            "best_truth_overlap_candidate_dice": _number(best_truth, "truth_dice"),
+            "best_truth_overlap_candidate_distance_from_prediction_um": _number(best_truth, "distance_from_prediction_um"),
+            "ranking_top5": ranking,
+        })
+    return details
+
+
 def readjudicate(input_dir: str | Path, output_dir: str | Path, run_dir: str | Path) -> dict[str, object]:
     input_dir, output = Path(input_dir), Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -287,13 +361,33 @@ def readjudicate(input_dir: str | Path, output_dir: str | Path, run_dir: str | P
     panel_counts = _write_panels(cases, candidates, ctx, output, decomp)
     truth_top1 = decomp["truth_is_top1"].astype(bool)
     bias = {column: _stats(decomp[column]) for column in ("raw_mask_mean_green_relative_difference", "raw_mask_mean_red_relative_difference", "raw_mask_ratio_relative_difference")}
+    truth_overlap_present = decomp["truth_overlap_present"].astype(bool)
+    not_truth_top1 = decomp["not_truth_top1"].astype(bool)
+    identity_counts = decomp["dominant_identity_class"].value_counts()
+    new_descriptive = {
+        "truth_is_top1_count": int(truth_top1.sum()),
+        "truth_is_top1_rate": float(truth_top1.mean()),
+        "not_truth_top1_count": int(not_truth_top1.sum()),
+        "not_truth_top1_rate": float(not_truth_top1.mean()),
+        "dominant_wrong_label_count": int(identity_counts.get("dominant_wrong_label", 0)),
+        "dominant_wrong_label_rate": float(identity_counts.get("dominant_wrong_label", 0) / len(decomp)) if len(decomp) else None,
+        "no_canonical_overlap_count": int(identity_counts.get("no_canonical_overlap", 0)),
+        "no_canonical_overlap_rate": float(identity_counts.get("no_canonical_overlap", 0) / len(decomp)) if len(decomp) else None,
+        "no_truth_overlap_count": int((~truth_overlap_present).sum()),
+        "no_truth_overlap_rate": float((~truth_overlap_present).mean()),
+        "identity_ranking_categories": identity_counts.to_dict(),
+        "top1_fraction": _stats(decomp["top1_overlap_fraction_of_candidate"]),
+        "truth_fraction_of_candidate": _stats(decomp["truth_overlap_fraction_of_candidate"]),
+        "top2_fraction": None,
+    }
     summary = {
         "input_dir": str(input_dir.resolve()), "n_cases": int(len(decomp)), "old": {"identity_correct_rate": 0.0, "merged_multiple_cells_rate": 0.96},
-        "new_descriptive": {"truth_is_top1_count": int(truth_top1.sum()), "truth_is_top1_rate": float(truth_top1.mean()), "dominant_wrong_label_count": int((~truth_top1).sum()), "dominant_wrong_label_rate": float((~truth_top1).mean()), "no_truth_overlap_count": int((decomp["dominant_identity_class"] == "no_truth_overlap").sum()), "top1_fraction": _stats(decomp["top1_overlap_fraction_of_candidate"]), "truth_fraction_of_candidate": _stats(decomp["truth_overlap_fraction_of_candidate"]), "top2_fraction": None},
+        "new_descriptive": new_descriptive,
         "contamination_proxy_descriptive_only": {"definition": "1 - top1_overlap_fraction_of_candidate; includes background and any non-top1 labels", "counts": decomp["contamination_class_descriptive"].value_counts().to_dict(), "distribution": _stats(decomp["non_top1_fraction_upper_bound"])},
         "mask_quality": {column: _stats(decomp[column]) for column in ("dice_3d", "iou_3d", "centroid_error_um", "volume_ratio_rescue_to_truth")},
         "measurement_bias": bias,
         "four_dominant_label_failures": FAILURE_TRACKS,
+        "failure_details": _failure_details(cases, candidates, decomp),
         "ranker_failure_notes": "The saved artifact contains no candidate masks or per-canonical-label overlap vectors. Failure panels therefore show saved candidate bbox/centroid geometry and rank scores; exact top2 voxel fractions require a future run that persists those vectors.",
         "panel_counts": panel_counts,
         "cellpose_rerun": False, "ranking_changed": False, "production_enabled": False,

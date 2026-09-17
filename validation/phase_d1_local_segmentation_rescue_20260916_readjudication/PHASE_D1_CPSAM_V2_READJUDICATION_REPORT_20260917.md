@@ -2,7 +2,7 @@
 
 This is a pure re-analysis of the saved 100-case pilot. The original pilot tables and PNGs were not overwritten, Cellpose was not rerun, and ranking parameters were not changed.
 
-The evaluator now records identity ranking (`dominant_truth_overlap` / `dominant_wrong_label`) separately from descriptive contamination and persists top-1/top-2 overlap fields for future runs. Those code changes were not used to regenerate this pilot.
+The evaluator now records identity ranking (`dominant_truth_overlap` / `dominant_wrong_label` / `no_canonical_overlap` / `no_candidate`) separately from descriptive contamination and persists top-1/top-2 overlap fields plus the raw canonical-overlap vector for future runs. Those code changes were not used to regenerate this pilot.
 
 ## OLD VERSUS NEW DESCRIPTIVE IDENTITY
 
@@ -12,10 +12,12 @@ The evaluator now records identity ranking (`dominant_truth_overlap` / `dominant
 | `identity_correct_rate` | 0/100 | not used |
 | `merged_multiple_cells` | 96/100 | not used as an identity gate |
 | `truth_is_top1` | not reported | **96/100 (0.96)** |
-| dominant wrong-label selection | not reported | **4/100 (0.04)** |
-| no truth overlap | not reported | **4/100** |
+| `not_truth_top1` | not reported | **4/100 (0.04)** |
+| dominant wrong canonical label (positive top-1 overlap) | not reported | **3/100 (0.03)** |
+| no canonical overlap | not reported | **1/100 (0.01)** |
+| no truth overlap (independent selected-candidate flag) | not reported | **4/100 (0.04)** |
 
-The old classifier treated any second-label voxel as a merge. The new descriptive identity result is therefore 96 dominant-truth selections and 4 dominant-label failures. This does not establish production acceptability.
+The old classifier treated any second-label voxel as a merge. The new descriptive identity result is 96 dominant-truth selections, 3 positive-overlap wrong-label selections, and 1 no-canonical-overlap selection. `not_truth_top1` remains the complete four-case failure count; `no_truth_overlap` is an independent flag and is true for all four selected candidates. This does not establish production acceptability.
 
 ## OVERLAP DECOMPOSITION
 
@@ -43,10 +45,14 @@ These measurements are diagnostic only and were not used for identity selection.
 
 Dedicated panels are in `review_panels_four_failures/`. The saved geometric ranking explains the selections:
 
-- `WT_Fucci-Tri_corFront_20260519:7222`: candidate 85 (distance/score 17.75) was selected over candidate 88 (24.38); selected canonical label 6412, truth label 6988, no truth-overlap candidate.
-- `WT_Fucci-Tri_corFront_20260511:2564`: candidate 26 (11.47) was selected by proximity; the best truth-overlap candidate had only Dice 0.048 at distance 22.25.
-- `WT_Fucci-Tri_corFront_20260528:6586`: tiny candidate 69 (12.94, no canonical overlap) beat candidate 51 (truth Dice 0.413, distance 14.47) after the geometric volume penalty.
-- `WT_Fucci-Tri_corFront_20260708:5047`: candidate 66 (13.67, canonical label 3943) was selected; no candidate overlapped truth label 4825.
+| track | selected truth overlap? | selected top-1 canonical overlap | truth label | selected ID (distance / score) | best truth-overlap candidate |
+|---|---|---|---:|---|---|
+| `...20260519:7222` | no | label 6412, fraction 0.994 | 6988 | 85 (17.75 / 17.75) | none |
+| `...20260511:2564` | no | label 2564, fraction 0.878 | 1941 | 26 (11.47 / 11.47) | ID 10 (Dice 0.048; distance 22.25) |
+| `...20260528:6586` | no | none, fraction 0 | 6691 | 69 (12.94 / 12.94) | ID 51 (Dice 0.413; distance 14.47; score 16.47) |
+| `...20260708:5047` | no | label 3943, fraction 0.937 | 4825 | 66 (13.67 / 13.67) | none |
+
+The complete per-case fields, including top-1 presence, labels, selected rank metadata, and the first five ranked candidates, are in `summary_reclassified.json` under `failure_details`.
 
 No ranking change was attempted.
 

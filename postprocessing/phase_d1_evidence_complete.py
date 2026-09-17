@@ -103,6 +103,60 @@ def _comparison(new_summary: dict[str, object], new_cases: pd.DataFrame) -> dict
     return {"metrics": metrics, "case_ids_identical_in_order": old_ids == new_ids, "original_n_cases": len(old_cases), "repeat_n_cases": len(new_cases)}
 
 
+def _enrich_summary(summary: dict[str, object], cases: pd.DataFrame, decomp: pd.DataFrame, output_dir: Path | None = None) -> dict[str, object]:
+    """Add the evidence-complete derived fields from the saved tables.
+
+    This is deliberately pure table re-analysis.  Keeping it separate lets a
+    completed GPU run be repackaged without running Cellpose again.
+    """
+    identity_counts = decomp["dominant_identity_class"].value_counts()
+    truth_top1 = decomp["truth_is_top1"].astype(bool)
+    truth_overlap = decomp["truth_overlap_present"].astype(bool)
+    n_cases = len(decomp)
+    summary["n_cases"] = int(n_cases)
+    summary["mask_quality"] = {
+        column: _stats(cases[column])
+        for column in ("dice_3d", "iou_3d", "centroid_error_um", "volume_ratio_rescue_to_truth")
+    }
+    summary["measurement_bias"] = {
+        column: _stats(cases[column])
+        for column in (
+            "raw_mask_mean_green_relative_difference",
+            "raw_mask_mean_red_relative_difference",
+            "raw_mask_ratio_relative_difference",
+        )
+    }
+    summary["new_descriptive"] = {
+        "truth_is_top1_count": int(truth_top1.sum()),
+        "truth_is_top1_rate": float(truth_top1.mean()) if n_cases else None,
+        "not_truth_top1_count": int((~truth_top1).sum()),
+        "not_truth_top1_rate": float((~truth_top1).mean()) if n_cases else None,
+        "dominant_wrong_label_count": int(identity_counts.get("dominant_wrong_label", 0)),
+        "dominant_wrong_label_rate": float(identity_counts.get("dominant_wrong_label", 0) / n_cases) if n_cases else None,
+        "no_canonical_overlap_count": int(identity_counts.get("no_canonical_overlap", 0)),
+        "no_canonical_overlap_rate": float(identity_counts.get("no_canonical_overlap", 0) / n_cases) if n_cases else None,
+        "no_truth_overlap_count": int((~truth_overlap).sum()),
+        "no_truth_overlap_rate": float((~truth_overlap).mean()) if n_cases else None,
+        "identity_ranking_categories": identity_counts.to_dict(),
+        "top1_fraction": _stats(decomp["top1_overlap_fraction_of_candidate"]),
+        "truth_fraction_of_candidate": _stats(decomp["truth_overlap_fraction_of_candidate"]),
+        "top2_fraction": _stats(decomp["top2_overlap_fraction_of_candidate"]),
+    }
+    summary["overlap_summary"] = {
+        "truth_fraction": _stats(decomp["truth_overlap_fraction_of_candidate"]),
+        "top1_fraction": _stats(decomp["top1_overlap_fraction_of_candidate"]),
+        "top2_fraction": _stats(decomp["top2_overlap_fraction_of_candidate"]),
+        "top1_minus_top2": _stats(decomp["top1_minus_top2_fraction"]),
+        "top1_to_top2_ratio": _stats(decomp["top1_to_top2_ratio"]),
+    }
+    panel_dir = output_dir or (Path(str(summary["output_dir"])) if summary.get("output_dir") else None)
+    summary["review_panel_count"] = len(list((panel_dir / "review_panels").glob("*.png"))) if panel_dir else 0
+    summary["evidence_complete"] = True
+    summary["canonical_outputs_modified"] = False
+    summary["production_enabled"] = False
+    return summary
+
+
 def _report(output: Path, summary: dict[str, object], environment: dict[str, object], runtime: dict[str, object], comparison: dict[str, object]) -> None:
     desc = summary["new_descriptive"]
     overlap = summary["overlap_summary"]
@@ -235,17 +289,8 @@ def run(run_dir: Path, output_dir: Path, seed: int = 20260916) -> dict[str, obje
     _copy_alias(output_dir / "synthetic_hide_rescue_candidates.csv", output_dir / "candidates.csv")
     _copy_alias(output_dir / "synthetic_hide_rescue_measurement_bias.csv", output_dir / "measurement_bias.csv")
     summary = json.loads((output_dir / "synthetic_hide_rescue_summary.json").read_text(encoding="utf-8"))
-    summary["n_cases"] = int(len(cases))
-    summary["mask_quality"] = {column: _stats(cases[column]) for column in ("dice_3d", "iou_3d", "centroid_error_um", "volume_ratio_rescue_to_truth")}
-    summary["measurement_bias"] = {column: _stats(cases[column]) for column in ("raw_mask_mean_green_relative_difference", "raw_mask_mean_red_relative_difference", "raw_mask_ratio_relative_difference")}
+    summary = _enrich_summary(summary, cases, decomp, output_dir)
     comparison = _comparison(summary, cases)
-    overlap_summary = {
-        "truth_fraction": _stats(decomp["truth_overlap_fraction_of_candidate"]),
-        "top1_fraction": _stats(decomp["top1_overlap_fraction_of_candidate"]),
-        "top2_fraction": _stats(decomp["top2_overlap_fraction_of_candidate"]),
-        "top1_minus_top2": _stats(decomp["top1_minus_top2_fraction"]),
-        "top1_to_top2_ratio": _stats(decomp["top1_to_top2_ratio"]),
-    }
     finished_utc = _utc_now()
     runtime = {
         "started_utc": started_utc,
@@ -261,19 +306,6 @@ def run(run_dir: Path, output_dir: Path, seed: int = 20260916) -> dict[str, obje
         "evidence_complete": True,
         "canonical_outputs_modified": False,
         "production_enabled": False,
-        "new_descriptive": {
-            **summary.get("new_descriptive", {}),
-            "not_truth_top1_count": int(decomp["not_truth_top1"].sum()),
-            "not_truth_top1_rate": float(decomp["not_truth_top1"].mean()),
-            "dominant_wrong_label_count": int(decomp["dominant_identity_class"].eq("dominant_wrong_label").sum()),
-            "dominant_wrong_label_rate": float(decomp["dominant_identity_class"].eq("dominant_wrong_label").mean()),
-            "no_canonical_overlap_count": int(decomp["dominant_identity_class"].eq("no_canonical_overlap").sum()),
-            "no_canonical_overlap_rate": float(decomp["dominant_identity_class"].eq("no_canonical_overlap").mean()),
-            "no_truth_overlap_count": int(decomp["no_truth_overlap"].sum()),
-            "no_truth_overlap_rate": float(decomp["no_truth_overlap"].mean()),
-        },
-        "overlap_summary": overlap_summary,
-        "review_panel_count": len(list((output_dir / "review_panels").glob("*.png"))),
         "original_pilot_comparison": comparison,
         "runtime_path": str(output_dir / "runtime.json"),
         "environment_path": str(output_dir / "environment.json"),
@@ -285,13 +317,52 @@ def run(run_dir: Path, output_dir: Path, seed: int = 20260916) -> dict[str, obje
     return summary
 
 
+def finalize_existing(output_dir: Path) -> dict[str, object]:
+    """Rebuild derived evidence metadata from a completed run's CSV tables.
+
+    No backend, image, or GPU work is performed.  This is useful when a long
+    validation has finished but a packaging-only field needs correction.
+    """
+    output_dir = Path(output_dir)
+    cases = pd.read_csv(output_dir / "synthetic_hide_rescue_cases.csv", low_memory=False)
+    candidates = pd.read_csv(output_dir / "synthetic_hide_rescue_candidates.csv", low_memory=False)
+    decomp = _decompose(cases, candidates)
+    decomp.to_csv(output_dir / "selected_overlap_decomposition.csv", index=False)
+    for source_name, alias_name in (
+        ("synthetic_hide_rescue_cases.csv", "cases.csv"),
+        ("synthetic_hide_rescue_candidates.csv", "candidates.csv"),
+        ("synthetic_hide_rescue_measurement_bias.csv", "measurement_bias.csv"),
+    ):
+        source, alias = output_dir / source_name, output_dir / alias_name
+        if source.exists():
+            _copy_alias(source, alias)
+    summary = json.loads((output_dir / "synthetic_hide_rescue_summary.json").read_text(encoding="utf-8"))
+    summary = _enrich_summary(summary, cases, decomp, output_dir)
+    runtime = json.loads((output_dir / "runtime.json").read_text(encoding="utf-8"))
+    environment = json.loads((output_dir / "environment.json").read_text(encoding="utf-8"))
+    comparison = _comparison(summary, cases)
+    summary["original_pilot_comparison"] = comparison
+    summary["runtime_path"] = str(output_dir / "runtime.json")
+    summary["environment_path"] = str(output_dir / "environment.json")
+    (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str) + "\n", encoding="utf-8")
+    _report(output_dir, summary, environment, runtime, comparison)
+    return summary
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=20260916)
+    parser.add_argument("--finalize-existing", action="store_true", help="repackage completed CSV artifacts without rerunning Cellpose")
     args = parser.parse_args()
-    print(json.dumps(run(args.run_dir, args.output_dir, args.seed), indent=2, default=str))
+    if args.finalize_existing:
+        result = finalize_existing(args.output_dir)
+    else:
+        if args.run_dir is None:
+            parser.error("--run-dir is required unless --finalize-existing is set")
+        result = run(args.run_dir, args.output_dir, args.seed)
+    print(json.dumps(result, indent=2, default=str))
     return 0
 
 

@@ -1,0 +1,10 @@
+{
+  "started_utc": "2026-09-17T17:39:14.788461+00:00",
+  "finished_utc": "2026-09-17T18:22:31.204697+00:00",
+  "elapsed_seconds": 2596.416,
+  "starting_commit": "bbc92d17fe9f80d46de2aede3e8b348e8c28076b",
+  "ending_commit": "6a97a41888ee68e88e99c7ea19d95f6ccf30368b",
+  "git_dirty": true,
+  "command": "postprocessing/phase_d1_evidence_complete.py --run-dir /mnt/d/_data/_newAAV_2026/molecular_tracking_derivatives/Fucci-Tri_1/longitudinal/1050/runs/1050_20260511_to_20260828_33s_graph_affine_balanced --output-dir validation/phase_d1_cpsam_v2_evidence_complete_100_20260917 --seed 20260916",
+  "case_seed": 20260916
+}

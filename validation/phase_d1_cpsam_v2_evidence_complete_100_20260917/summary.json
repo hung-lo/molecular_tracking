@@ -1,0 +1,319 @@
+{
+  "mode": "synthetic_benchmark",
+  "mouse": "Fucci-Tri_1",
+  "run": "1050_20260511_to_20260828_33s_graph_affine_balanced",
+  "n_eligible": 100,
+  "n_attempted": 100,
+  "n_with_candidate": 100,
+  "n_multiple_candidates": 100,
+  "n_no_candidate": 0,
+  "status_counts": {
+    "multiple_candidates": 100
+  },
+  "random_seed": 20260916,
+  "proposal_only": true,
+  "segmentation_model": "backend-selected",
+  "canonical_outputs_modified": false,
+  "state_variables_used_for_identity": false,
+  "truth_is_top1_count": 96,
+  "truth_is_top1_rate": 0.96,
+  "not_truth_top1_count": 4,
+  "not_truth_top1_rate": 0.04,
+  "correct_cell_rate": 0.96,
+  "correct_cell_rate_definition": "truth_is_top1",
+  "median_centroid_error_um": 1.0287877785316804,
+  "p90_centroid_error_um": 3.1570051295057024,
+  "median_dice": 0.8739065500320035,
+  "median_iou": 0.7760519019032492,
+  "median_volume_ratio": 0.9262530893089786,
+  "wrong_neighbor_rate": 0.03,
+  "identity_ranking_categories": {
+    "dominant_truth_overlap": 96,
+    "dominant_wrong_label": 3,
+    "no_canonical_overlap": 1
+  },
+  "dominant_truth_overlap_count": 96,
+  "dominant_truth_overlap_rate": 0.96,
+  "dominant_wrong_label_count": 3,
+  "dominant_wrong_label_rate": 0.03,
+  "no_canonical_overlap_count": 1,
+  "no_canonical_overlap_rate": 0.01,
+  "no_truth_overlap_rate": 0.04,
+  "identity_correct_rate": 0.96,
+  "truth_overlap_present_count": 96,
+  "no_truth_overlap_count": 4,
+  "legacy_identity_categories": {
+    "merged_multiple_cells": 96,
+    "ambiguous_identity": 4
+  },
+  "merged_multiple_cells_rate": 0.96,
+  "ambiguous_identity_rate": 0.04,
+  "segmentation_contamination_categories": {
+    "single_label_like": 71,
+    "minor_neighbor_contamination": 20,
+    "substantial_neighbor_contamination": 8,
+    "no_canonical_overlap": 1
+  },
+  "median_top1_fraction": 0.935957800743793,
+  "median_top2_fraction": 0.0012639640585575696,
+  "median_truth_fraction_of_candidate": 0.9352857193846593,
+  "output_dir": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_cpsam_v2_evidence_complete_100_20260917",
+  "output_paths": {
+    "cases": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_cpsam_v2_evidence_complete_100_20260917/synthetic_hide_rescue_cases.csv",
+    "candidates": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_cpsam_v2_evidence_complete_100_20260917/synthetic_hide_rescue_candidates.csv",
+    "metrics": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_cpsam_v2_evidence_complete_100_20260917/synthetic_hide_rescue_metrics.csv",
+    "measurement_bias": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_cpsam_v2_evidence_complete_100_20260917/synthetic_hide_rescue_measurement_bias.csv",
+    "summary": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_cpsam_v2_evidence_complete_100_20260917/synthetic_hide_rescue_summary.json"
+  },
+  "crop_shape_zyx": [
+    25,
+    96,
+    96
+  ],
+  "threshold_percentile": 85.0,
+  "min_voxels": 20,
+  "backend": "cellpose_sam",
+  "cellpose_model": "cpsam_v2",
+  "cellpose_device": "cuda",
+  "backend_runtime": {
+    "cellpose_version": "4.2.1.1",
+    "torch_version": "2.14.0+cu130",
+    "cuda_available": true,
+    "resolved_device": "cuda",
+    "pretrained_model": "cpsam_v2",
+    "model_cache_key": [
+      "cpsam_v2",
+      "cuda"
+    ],
+    "do_3D": true,
+    "z_axis": 0,
+    "channel_axis": 3,
+    "min_size": 100
+  },
+  "backend_preflight_error": "",
+  "endpoint_classification": null,
+  "classification_source_path": null,
+  "classification_source_sha256": null,
+  "evaluator_artifact_available": null,
+  "evaluator_no_mask_near_prediction_rows": null,
+  "rows_parsed_successfully": null,
+  "target_derived_from_end_session_index_plus_one": null,
+  "real_case_source": null,
+  "generic_gap_fallback_used": false,
+  "synthetic_trusted_eligible": 100,
+  "synthetic_trusted_excluded": 108194,
+  "synthetic_trust_missing_evidence": 0,
+  "review_selection_population": 100,
+  "review_selection_full_population": true,
+  "review_selection_category_counts": {
+    "dominant_truth_overlap": 96,
+    "dominant_wrong_label": 3,
+    "no_canonical_overlap": 1
+  },
+  "review_panel_dir": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_cpsam_v2_evidence_complete_100_20260917/review_panels",
+  "summary_plot_dir": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_cpsam_v2_evidence_complete_100_20260917/summary_plots",
+  "n_cases": 100,
+  "mask_quality": {
+    "dice_3d": {
+      "n": 100,
+      "median": 0.8739065500320035,
+      "q05": 0.5099513669522532,
+      "q95": 0.9429593984590842,
+      "min": 0.0,
+      "max": 0.9624459953472916
+    },
+    "iou_3d": {
+      "n": 100,
+      "median": 0.7760519019032492,
+      "q05": 0.3424110701280027,
+      "q95": 0.8920749654218534,
+      "min": 0.0,
+      "max": 0.9276105060858424
+    },
+    "centroid_error_um": {
+      "n": 100,
+      "median": 1.0287877785316804,
+      "q05": 0.23667766658056796,
+      "q95": 7.388700672009981,
+      "min": 0.062332096667286,
+      "max": 17.42005650194079
+    },
+    "volume_ratio_rescue_to_truth": {
+      "n": 100,
+      "median": 0.9262530893089786,
+      "q05": 0.6457128870765877,
+      "q95": 1.5712169369324454,
+      "min": 0.2262443438914027,
+      "max": 3.603305785123967
+    }
+  },
+  "measurement_bias": {
+    "raw_mask_mean_green_relative_difference": {
+      "n": 100,
+      "median": 0.0035797089379974003,
+      "q05": -0.023673371575750758,
+      "q95": 0.052741001557882305,
+      "min": -0.1068192246663061,
+      "max": 0.2020542088485883
+    },
+    "raw_mask_mean_red_relative_difference": {
+      "n": 100,
+      "median": 0.0102863694856849,
+      "q05": -0.061066297344359394,
+      "q95": 0.10675234819006794,
+      "min": -0.2115703322779924,
+      "max": 0.2333293934586464
+    },
+    "raw_mask_ratio_relative_difference": {
+      "n": 100,
+      "median": -0.00693510590942105,
+      "q05": -0.04319010351293813,
+      "q95": 0.04684211307304826,
+      "min": -0.1054287734357089,
+      "max": 0.132860433720539
+    }
+  },
+  "new_descriptive": {
+    "truth_is_top1_count": 96,
+    "truth_is_top1_rate": 0.96,
+    "not_truth_top1_count": 4,
+    "not_truth_top1_rate": 0.04,
+    "dominant_wrong_label_count": 3,
+    "dominant_wrong_label_rate": 0.03,
+    "no_canonical_overlap_count": 1,
+    "no_canonical_overlap_rate": 0.01,
+    "no_truth_overlap_count": 4,
+    "no_truth_overlap_rate": 0.04,
+    "identity_ranking_categories": {
+      "dominant_truth_overlap": 96,
+      "dominant_wrong_label": 3,
+      "no_canonical_overlap": 1
+    },
+    "top1_fraction": {
+      "n": 100,
+      "median": 0.935957800743793,
+      "q05": 0.5229961184599333,
+      "q95": 0.99710027100271,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "truth_fraction_of_candidate": {
+      "n": 100,
+      "median": 0.9352857193846593,
+      "q05": 0.3768329574202201,
+      "q95": 0.99710027100271,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "top2_fraction": {
+      "n": 54,
+      "median": 0.011889280741803482,
+      "q05": 0.0011805712185382886,
+      "q95": 0.1603797200060863,
+      "min": 0.001081081081081081,
+      "max": 0.45129469790382243
+    }
+  },
+  "overlap_summary": {
+    "truth_fraction": {
+      "n": 100,
+      "median": 0.9352857193846593,
+      "q05": 0.3768329574202201,
+      "q95": 0.99710027100271,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "top1_fraction": {
+      "n": 100,
+      "median": 0.935957800743793,
+      "q05": 0.5229961184599333,
+      "q95": 0.99710027100271,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "top2_fraction": {
+      "n": 54,
+      "median": 0.011889280741803482,
+      "q05": 0.0011805712185382886,
+      "q95": 0.1603797200060863,
+      "min": 0.001081081081081081,
+      "max": 0.45129469790382243
+    },
+    "top1_minus_top2": {
+      "n": 54,
+      "median": 0.9295127092078315,
+      "q05": 0.5687899499196605,
+      "q95": 0.9871060733277358,
+      "min": 0.07213316892725036,
+      "max": 0.9976442873969376
+    },
+    "top1_to_top2_ratio": {
+      "n": 54,
+      "median": 77.30000000000001,
+      "q05": 5.061540239627076,
+      "q95": 833.0500000000001,
+      "min": 1.1598360655737705,
+      "max": 892.0
+    }
+  },
+  "review_panel_count": 12,
+  "evidence_complete": true,
+  "production_enabled": false,
+  "original_pilot_comparison": {
+    "metrics": {
+      "truth_is_top1_rate": [
+        0.96,
+        0.96
+      ],
+      "not_truth_top1_rate": [
+        0.04,
+        0.04
+      ],
+      "dominant_wrong_label_rate": [
+        0.03,
+        0.03
+      ],
+      "no_canonical_overlap_rate": [
+        0.01,
+        0.01
+      ],
+      "no_candidate_rate": [
+        0.0,
+        0.0
+      ],
+      "median_dice": [
+        0.8739065500320035,
+        0.8739065500320035
+      ],
+      "median_iou": [
+        0.7760519019032492,
+        0.7760519019032492
+      ],
+      "median_centroid_error_um": [
+        1.0287877785316804,
+        1.0287877785316804
+      ],
+      "median_volume_ratio": [
+        0.9262530893089786,
+        0.9262530893089786
+      ],
+      "median_green_bias": [
+        0.0035797089379974003,
+        0.0035797089379974003
+      ],
+      "median_red_bias": [
+        0.0102863694856849,
+        0.0102863694856849
+      ],
+      "median_ratio_bias": [
+        -0.00693510590942105,
+        -0.00693510590942105
+      ]
+    },
+    "case_ids_identical_in_order": true,
+    "original_n_cases": 100,
+    "repeat_n_cases": 100
+  },
+  "runtime_path": "validation/phase_d1_cpsam_v2_evidence_complete_100_20260917/runtime.json",
+  "environment_path": "validation/phase_d1_cpsam_v2_evidence_complete_100_20260917/environment.json"
+}

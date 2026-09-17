@@ -19,6 +19,7 @@ from postprocessing.local_segmentation_rescue import (
     _eligible_synthetic_cases_with_audit,
     _sample_cases,
     _select_review_artifacts,
+    _overlap_decomposition,
     compute_crop_bounds,
     dice_iou,
     rank_candidates,
@@ -49,6 +50,16 @@ def test_dice_iou_and_threshold_segmenter_are_deterministic():
     assert first[2] == second[2]
     assert first[1].tolist() == second[1].tolist()
     assert len(first[0]) == 2
+
+
+def test_overlap_decomposition_separates_identity_from_contamination():
+    result = _overlap_decomposition([(90, 7), (5, 9), (5, 11)], 100, 7, 90)
+    assert result["truth_is_top1"] is True
+    assert result["identity_ranking_category"] == "dominant_truth_overlap"
+    assert result["top1_overlap_fraction_of_candidate"] == 0.9
+    assert result["top2_overlap_fraction_of_candidate"] == 0.05
+    assert result["n_canonical_labels_overlap_ge_5pct_candidate"] == 3
+    assert result["segmentation_contamination_category"] == "minor_neighbor_contamination"
 
 
 def test_candidate_ranking_ignores_biological_state_columns():

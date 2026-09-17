@@ -1,0 +1,122 @@
+{
+  "input_dir": "/mnt/d/codex_folder/molecular_tracking/validation/phase_d1_local_segmentation_rescue_20260916",
+  "n_cases": 100,
+  "old": {
+    "identity_correct_rate": 0.0,
+    "merged_multiple_cells_rate": 0.96
+  },
+  "new_descriptive": {
+    "truth_is_top1_count": 96,
+    "truth_is_top1_rate": 0.96,
+    "dominant_wrong_label_count": 4,
+    "dominant_wrong_label_rate": 0.04,
+    "no_truth_overlap_count": 4,
+    "top1_fraction": {
+      "n": 100,
+      "median": 0.935957800743793,
+      "q05": 0.5229961184599333,
+      "q95": 0.9971002710027099,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "truth_fraction_of_candidate": {
+      "n": 100,
+      "median": 0.9352857193846593,
+      "q05": 0.3768329574202201,
+      "q95": 0.99710027100271,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "top2_fraction": null
+  },
+  "contamination_proxy_descriptive_only": {
+    "definition": "1 - top1_overlap_fraction_of_candidate; includes background and any non-top1 labels",
+    "counts": {
+      "substantial_neighbor_contamination_proxy": 58,
+      "minor_neighbor_contamination_proxy": 29,
+      "single_label_like": 13
+    },
+    "distribution": {
+      "n": 100,
+      "median": 0.06404219925620708,
+      "q05": 0.0028997289972900577,
+      "q95": 0.4770038815400666,
+      "min": 0.0,
+      "max": 1.0
+    }
+  },
+  "mask_quality": {
+    "dice_3d": {
+      "n": 100,
+      "median": 0.8739065500320035,
+      "q05": 0.5099513669522532,
+      "q95": 0.9429593984590842,
+      "min": 0.0,
+      "max": 0.9624459953472916
+    },
+    "iou_3d": {
+      "n": 100,
+      "median": 0.7760519019032492,
+      "q05": 0.3424110701280027,
+      "q95": 0.8920749654218534,
+      "min": 0.0,
+      "max": 0.9276105060858424
+    },
+    "centroid_error_um": {
+      "n": 100,
+      "median": 1.0287877785316804,
+      "q05": 0.23667766658056796,
+      "q95": 7.388700672009981,
+      "min": 0.062332096667286,
+      "max": 17.42005650194079
+    },
+    "volume_ratio_rescue_to_truth": {
+      "n": 100,
+      "median": 0.9262530893089786,
+      "q05": 0.6457128870765877,
+      "q95": 1.5712169369324454,
+      "min": 0.2262443438914027,
+      "max": 3.603305785123967
+    }
+  },
+  "measurement_bias": {
+    "raw_mask_mean_green_relative_difference": {
+      "n": 100,
+      "median": 0.0035797089379974003,
+      "q05": -0.023673371575750758,
+      "q95": 0.052741001557882305,
+      "min": -0.1068192246663061,
+      "max": 0.2020542088485883
+    },
+    "raw_mask_mean_red_relative_difference": {
+      "n": 100,
+      "median": 0.0102863694856849,
+      "q05": -0.061066297344359394,
+      "q95": 0.10675234819006794,
+      "min": -0.2115703322779924,
+      "max": 0.2333293934586464
+    },
+    "raw_mask_ratio_relative_difference": {
+      "n": 100,
+      "median": -0.00693510590942105,
+      "q05": -0.04319010351293813,
+      "q95": 0.04684211307304826,
+      "min": -0.1054287734357089,
+      "max": 0.132860433720539
+    }
+  },
+  "four_dominant_label_failures": [
+    "WT_Fucci-Tri_corFront_20260519:7222",
+    "WT_Fucci-Tri_corFront_20260511:2564",
+    "WT_Fucci-Tri_corFront_20260528:6586",
+    "WT_Fucci-Tri_corFront_20260708:5047"
+  ],
+  "ranker_failure_notes": "The saved artifact contains no candidate masks or per-canonical-label overlap vectors. Failure panels therefore show saved candidate bbox/centroid geometry and rank scores; exact top2 voxel fractions require a future run that persists those vectors.",
+  "panel_counts": {
+    "four_failures": 4,
+    "truth_top1": 6
+  },
+  "cellpose_rerun": false,
+  "ranking_changed": false,
+  "production_enabled": false
+}

@@ -1,0 +1,16 @@
+{
+  "runtime_seconds": 2640,
+  "runtime_minutes": 44.0,
+  "runtime_precision": "approximate",
+  "timing_source": "external process monitoring; the pre-existing evaluator did not instrument monotonic timing",
+  "mode": "synthetic_benchmark",
+  "mouse": "Fucci-Tri_1",
+  "trusted_cases": 100,
+  "seed": 20260916,
+  "backend": "cellpose_sam",
+  "model": "cpsam_v2",
+  "device": "cuda",
+  "cellpose_version": "4.2.1.1",
+  "torch_version": "2.14.0+cu130",
+  "gpu": "NVIDIA GeForce RTX 3050"
+}

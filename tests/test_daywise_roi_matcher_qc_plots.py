@@ -9,7 +9,7 @@ import tifffile
 import matplotlib.pyplot as plt
 
 import daywise_roi_matcher_qc_plots as qc
-from affine_overlap_matcher import AffineOverlapParams, VoxelSpacing
+from affine_overlap_matcher import AffineOverlapParams, VoxelSpacing, extract_roi_features
 from daywise_roi_matcher_qc_plots import (
     DaywiseQCPlotConfig,
     add_spatial_and_z_qc_columns,
@@ -19,6 +19,7 @@ from daywise_roi_matcher_qc_plots import (
     source_roi_match_fraction,
 )
 from run_daywise_roi_matching import run_daywise_roi_matching
+from run_matched_roi_quick_view import _batch_feature_geometry
 
 
 def _write_stack(path: Path, data: np.ndarray) -> None:
@@ -191,6 +192,67 @@ def test_large_z_renderer_uses_two_by_seven_centroid_planes(tmp_path: Path, monk
     assert axes.shape == (2, 7)
     assert [axes[0, i].get_title().split("dz ")[-1] for i in range(7)] == ["+3", "+2", "+1", "0", "-1", "-2", "-3"]
     plt.close(fig)
+
+
+def test_qc_pair_renderers_reuse_one_pair_local_volume_load(tmp_path: Path, monkeypatch) -> None:
+    match_dir = tmp_path / "match"
+    output_dir = tmp_path / "qc"
+    match_dir.mkdir()
+    for directory in (output_dir / "pair_examples", output_dir / "axial_shift", output_dir / "tables"):
+        directory.mkdir(parents=True)
+    mask = np.zeros((7, 20, 24), dtype=np.uint16)
+    mask[3, 4:8, 5:9] = 1
+    mask[3, 10:15, 12:18] = 2
+    red = np.arange(mask.size, dtype=np.uint16).reshape(mask.shape)
+    manifest_rows = []
+    feature_rows = []
+    for session_id in ("a", "b"):
+        mask_path = tmp_path / f"{session_id}_mask.tif"
+        red_path = tmp_path / f"{session_id}_red.tif"
+        tifffile.imwrite(mask_path, mask, photometric="minisblack")
+        tifffile.imwrite(red_path, red, photometric="minisblack")
+        manifest_rows.append({"session_index": len(manifest_rows), "session_id": session_id, "acquisition_date": "2026-01-01", "mask_path": str(mask_path), "red_image_path": str(red_path)})
+        feature_rows.extend([
+            {"session_id": session_id, "label": 1, "centroid_z": 3., "centroid_y": 5.5, "centroid_x": 6.5, "bbox_y0": 4, "bbox_y1": 8, "bbox_x0": 5, "bbox_x1": 9},
+            {"session_id": session_id, "label": 2, "centroid_z": 3., "centroid_y": 12., "centroid_x": 14.5, "bbox_y0": 10, "bbox_y1": 15, "bbox_x0": 12, "bbox_x1": 18},
+        ])
+    pd.DataFrame(manifest_rows).to_csv(match_dir / "session_manifest_resolved.csv", index=False)
+    pd.DataFrame(feature_rows).to_csv(match_dir / "roi_features.csv", index=False)
+    (match_dir / "run_log.json").write_text("{}", encoding="utf-8")
+    candidates = pd.DataFrame({
+        "day_a": ["a", "a"], "day_b": ["b", "b"], "label_a": [1, 2], "label_b": [1, 2],
+        "score": [.9, .8], "dice": [.9, .8], "distance_um": [1., 2.], "ambiguity": [.1, .2],
+        "high_rule": [True, True], "pair_gap": [1, 1],
+    })
+    calls = []
+    real_imread = qc.tifffile.imread
+
+    def read(path, *args, **kwargs):
+        calls.append(Path(path).name)
+        return real_imread(path, *args, **kwargs)
+
+    monkeypatch.setattr(qc.tifffile, "imread", read)
+    qc._generate_spatial_pair_qc(
+        match_dir, output_dir, candidates, [candidates, candidates, candidates], dpi=20,
+    )
+    assert calls == ["a_red.tif", "a_mask.tif", "b_red.tif", "b_mask.tif"]
+
+
+def test_feature_geometry_matches_mask_geometry_for_irregular_edge_rois() -> None:
+    mask = np.zeros((5, 9, 11), dtype=np.uint16)
+    mask[0, 0, 0] = 1
+    mask[1:4, 1, 2:6] = 2
+    mask[2, 7:9, 8:11] = 3
+    features = extract_roi_features(mask, "s0", VoxelSpacing())
+    for label in (1, 2, 3):
+        assert qc._raw_geometry(mask, label) == qc._feature_geometry(features, label)
+        batch = _batch_feature_geometry(features.assign(session_id="s0"), "s0", label, 20)
+        coords = np.where(mask == label)
+        assert batch[:3] == tuple(int(round(float(axis.mean()))) for axis in coords)
+        assert batch[3:] == (
+            int(coords[1].max() - coords[1].min() + 1 + 40),
+            int(coords[2].max() - coords[2].min() + 1 + 40),
+        )
 
 
 

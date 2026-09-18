@@ -105,6 +105,99 @@ def test_raw_view_reads_only_requested_z_planes(tmp_path: Path, monkeypatch) -> 
     assert calls == [None, 1, 1, 0, 0]
 
 
+def _build_ranked_fallback_fixture(tmp_path: Path):
+    sessions = []
+    feature_rows = []
+    for index, session_id in enumerate(("s0", "s1")):
+        mask = np.zeros((3, 16, 18), dtype=np.uint16)
+        mask[0, 1 + index:4 + index, 2:5] = 1
+        mask[0, 8:13, 10 + index:14 + index] = 2
+        red = np.arange(mask.size, dtype=np.uint16).reshape(mask.shape) + index
+        green = red + 100
+        paths = {name: tmp_path / f"{session_id}_{name}.tif" for name in ("mask", "red", "green")}
+        for name, data in (("mask", mask), ("red", red), ("green", green)):
+            tifffile.imwrite(paths[name], data, photometric="minisblack")
+        sessions.append({
+            "session_index": index, "session_id": session_id, "acquisition_date": f"2026-01-0{index + 1}",
+            "elapsed_days": index, "mask_path": str(paths["mask"]),
+            "red_image_path": str(paths["red"]), "green_image_path": str(paths["green"]),
+        })
+        for label, y0, y1, x0, x1 in ((1, 1 + index, 4 + index, 2, 5), (2, 8, 13, 10 + index, 14 + index)):
+            feature_rows.append({
+                "session_id": session_id, "label": label, "centroid_z": 0,
+                "centroid_y": (y0 + y1 - 1) / 2, "centroid_x": (x0 + x1 - 1) / 2,
+                "bbox_y0": y0, "bbox_y1": y1, "bbox_x0": x0, "bbox_x1": x1,
+            })
+    tracks = pd.DataFrame({
+        "cluster_id": [1, 2], "roi_id": [1, 2], "track_uid": ["t1", "t2"],
+        "match_policy": ["graph", "graph"], "s0_roi": [1, 2], "s1_roi": [1, 2],
+    })
+    return pd.DataFrame(sessions), tracks, pd.DataFrame(feature_rows)
+
+
+def _assert_bounded_batch_reads(monkeypatch, real_imread):
+    calls = []
+    live_arrays = []
+
+    def read(path, *args, **kwargs):
+        import gc
+        import weakref
+
+        gc.collect()
+        live_arrays[:] = [reference for reference in live_arrays if reference() is not None]
+        assert len(live_arrays) < 3
+        array = real_imread(path, *args, **kwargs)
+        live_arrays.append(weakref.ref(array))
+        calls.append(Path(path).name)
+        return array
+
+    monkeypatch.setattr(raw_view.tifffile, "imread", read)
+    return calls
+
+
+def test_ranked_missing_feature_uses_bounded_fallback_and_exact_outputs(tmp_path: Path, monkeypatch) -> None:
+    sessions, tracks, features = _build_ranked_fallback_fixture(tmp_path)
+    for row in tracks.itertuples():
+        raw_view.plot_matched_roi_raw_slices(
+            cluster_id=row.cluster_id, tracks_table=tracks, session_table=sessions,
+            output_path=tmp_path / f"reference_{row.cluster_id}.png",
+        )
+    partial_features = features.loc[~((features["session_id"] == "s1") & (features["label"] == 2))]
+    calls = _assert_bounded_batch_reads(monkeypatch, raw_view.tifffile.imread)
+    profile = raw_view.render_ranked_roi_batch(
+        specs=[("t1", tmp_path / "optimized_1.png"), ("t2", tmp_path / "optimized_2.png")],
+        tracks_table=tracks, session_table=sessions, feature_table=partial_features,
+    )
+    assert profile["geometry_fallbacks"] == 1
+    assert profile["fallback_mask_reads"] == 1
+    assert profile["reads"] == 7
+    assert len(calls) == 7
+    for label in (1, 2):
+        assert (tmp_path / f"reference_{label}.png").read_bytes() == (tmp_path / f"optimized_{label}.png").read_bytes()
+        assert (tmp_path / f"reference_{label}_metadata.csv").read_bytes() == (tmp_path / f"optimized_{label}_metadata.csv").read_bytes()
+
+
+def test_ranked_legacy_no_feature_table_uses_bounded_fallback_and_exact_outputs(tmp_path: Path, monkeypatch) -> None:
+    sessions, tracks, _features = _build_ranked_fallback_fixture(tmp_path)
+    for row in tracks.itertuples():
+        raw_view.plot_matched_roi_raw_slices(
+            cluster_id=row.cluster_id, tracks_table=tracks, session_table=sessions,
+            output_path=tmp_path / f"reference_{row.cluster_id}.png",
+        )
+    calls = _assert_bounded_batch_reads(monkeypatch, raw_view.tifffile.imread)
+    profile = raw_view.render_ranked_roi_batch(
+        specs=[("t1", tmp_path / "optimized_1.png"), ("t2", tmp_path / "optimized_2.png")],
+        tracks_table=tracks, session_table=sessions, feature_table=None,
+    )
+    assert profile["geometry_fallbacks"] == 4
+    assert profile["fallback_mask_reads"] == 2
+    assert profile["reads"] == 8
+    assert len(calls) == 8
+    for label in (1, 2):
+        assert (tmp_path / f"reference_{label}.png").read_bytes() == (tmp_path / f"optimized_{label}.png").read_bytes()
+        assert (tmp_path / f"reference_{label}_metadata.csv").read_bytes() == (tmp_path / f"optimized_{label}_metadata.csv").read_bytes()
+
+
 def test_ranked_batch_reuses_session_stacks_and_preserves_one_off_output(tmp_path: Path, monkeypatch) -> None:
     mask = np.zeros((3, 5, 5), dtype=np.uint16)
     mask[0, 2, 2] = 1

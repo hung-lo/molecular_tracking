@@ -125,72 +125,117 @@ def _batch_feature_geometry(features: pd.DataFrame | None, session_id: str, labe
     )
 
 
-def _prepare_batch_track(
-    track: pd.Series,
-    sessions: pd.DataFrame,
-    volumes: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
-    features: pd.DataFrame | None,
-    *,
-    crop_padding_px: int,
-    min_crop_size_px: int,
-    z_radius: int,
-    profile: dict[str, object],
-):
-    loaded = []
-    max_h = max_w = 0
+def _mask_geometry(mask: np.ndarray, label: int, padding: int):
+    coords = np.where(mask == label)
+    if len(coords[0]) == 0:
+        return None
+    return (
+        int(round(float(coords[0].mean()))),
+        int(round(float(coords[1].mean()))),
+        int(round(float(coords[2].mean()))),
+        int(coords[1].max() - coords[1].min() + 1 + 2 * padding),
+        int(coords[2].max() - coords[2].min() + 1 + 2 * padding),
+    )
+
+
+def _render_ranked_bounded_fallback_batch(*, specs, tracks_by_uid, sessions, features, z_radius, crop_padding_px, min_crop_size_px, lut_low_percentile, lut_high_percentile):
+    started = time.perf_counter()
+    unique_uids = list(dict.fromkeys(str(track_uid) for track_uid, _ in specs))
+    states = {
+        uid: {"track": tracks_by_uid[uid], "loaded": [], "prepared": [], "reds": [], "greens": [], "height": 0, "width": 0}
+        for uid in unique_uids
+    }
+    fallback_mask_reads = 0
+    fallback_count = 0
+
+    # Pass 1 keeps only scalar geometry; masks are released before the next session.
     for _, session in sessions.iterrows():
         session_id = str(session.session_id)
-        label = track.get(f"{session_id}_roi", np.nan)
-        if pd.isna(label):
-            loaded.append((session, None, None, None, None))
-            continue
-        label = int(label)
-        mask, red, green = volumes[session_id]
-        geometry = _batch_feature_geometry(features, session_id, label, crop_padding_px)
-        if geometry is None:
-            coords = np.where(mask == label)
-            if len(coords[0]) == 0:
-                loaded.append((session, None, None, None, None))
+        requirements = {}
+        missing_geometry = []
+        for uid in unique_uids:
+            label = states[uid]["track"].get(f"{session_id}_roi", np.nan)
+            if pd.isna(label):
+                requirements[uid] = None
                 continue
-            geometry = (
-                int(round(float(coords[0].mean()))),
-                int(round(float(coords[1].mean()))),
-                int(round(float(coords[2].mean()))),
-                int(coords[1].max() - coords[1].min() + 1 + 2 * crop_padding_px),
-                int(coords[2].max() - coords[2].min() + 1 + 2 * crop_padding_px),
-            )
-            profile["geometry_fallbacks"] = int(profile.get("geometry_fallbacks", 0)) + 1
-        z0, yc, xc, height, width = geometry
-        max_h = max(max_h, height)
-        max_w = max(max_w, width)
-        loaded.append((session, mask, red, green, (label, z0, yc, xc)))
+            label = int(label)
+            geometry = _batch_feature_geometry(features, session_id, label, crop_padding_px)
+            if geometry is None:
+                missing_geometry.append((uid, label))
+                fallback_count += 1
+            else:
+                requirements[uid] = (label, geometry)
+        if missing_geometry:
+            mask = tifffile.imread(session.mask_path)
+            fallback_mask_reads += 1
+            for uid, label in missing_geometry:
+                geometry = _mask_geometry(mask, label, crop_padding_px)
+                requirements[uid] = (label, geometry) if geometry is not None else None
+            del mask
+        for uid in unique_uids:
+            requirement = requirements[uid]
+            state = states[uid]
+            if requirement is None:
+                state["loaded"].append((session, None, None, None, None))
+                state["prepared"].append([])
+                continue
+            label, geometry = requirement
+            z0, yc, xc, height, width = geometry
+            state["height"] = max(state["height"], height)
+            state["width"] = max(state["width"], width)
+            state["loaded"].append((session, None, None, None, (label, z0, yc, xc)))
+            state["prepared"].append(None)
+    for state in states.values():
+        state["height"] = max(min_crop_size_px, state["height"])
+        state["width"] = max(min_crop_size_px, state["width"])
 
-    height = max(min_crop_size_px, max_h)
-    width = max(min_crop_size_px, max_w)
     offsets = tuple(range(z_radius, -z_radius - 1, -1))
-    prepared = []
-    reds = []
-    greens = []
-    for session, mask, red, green, info in loaded:
-        day = []
-        if info is not None:
-            label, z0, yc, xc = info
-            valid_z_indices = set(select_render_z_indices(z0, mask.shape[0], z_radius))
-            for offset in offsets:
-                requested_z = z0 + offset
-                if requested_z not in valid_z_indices:
-                    rc = np.zeros((height, width), dtype=float)
-                    gc = np.zeros((height, width), dtype=float)
-                    mc = np.zeros((height, width), dtype=np.uint8)
-                else:
-                    rc = extract_centered_crop_with_padding(red[requested_z], center_y=yc, center_x=xc, height=height, width=width)
-                    gc = extract_centered_crop_with_padding(green[requested_z], center_y=yc, center_x=xc, height=height, width=width)
-                    mc = extract_centered_crop_with_padding((mask[requested_z] == label).astype(np.uint8), center_y=yc, center_x=xc, height=height, width=width)
-                    reds.append(rc.ravel())
-                    greens.append(gc.ravel())
-                day.append((rc, gc, mc, offset, requested_z not in valid_z_indices))
-        prepared.append(day)
-    return loaded, prepared, reds, greens, height, width, offsets
+    prepare_started = time.perf_counter()
+    for session_index, (_, session) in enumerate(sessions.iterrows()):
+        mask = tifffile.imread(session.mask_path)
+        red = tifffile.imread(session.red_image_path)
+        green = tifffile.imread(session.green_image_path)
+        for state in states.values():
+            info = state["loaded"][session_index][4]
+            day = []
+            if info is not None:
+                label, z0, yc, xc = info
+                valid_z_indices = set(select_render_z_indices(z0, mask.shape[0], z_radius))
+                for offset in offsets:
+                    requested_z = z0 + offset
+                    if requested_z not in valid_z_indices:
+                        rc = np.zeros((state["height"], state["width"]), dtype=float)
+                        gc = np.zeros((state["height"], state["width"]), dtype=float)
+                        mc = np.zeros((state["height"], state["width"]), dtype=np.uint8)
+                    else:
+                        rc = extract_centered_crop_with_padding(red[requested_z], center_y=yc, center_x=xc, height=state["height"], width=state["width"])
+                        gc = extract_centered_crop_with_padding(green[requested_z], center_y=yc, center_x=xc, height=state["height"], width=state["width"])
+                        mc = extract_centered_crop_with_padding((mask[requested_z] == label).astype(np.uint8), center_y=yc, center_x=xc, height=state["height"], width=state["width"])
+                        state["reds"].append(rc.ravel())
+                        state["greens"].append(gc.ravel())
+                    day.append((rc, gc, mc, offset, requested_z not in valid_z_indices))
+            state["prepared"][session_index] = day
+        del mask, red, green
+    prepare_seconds = time.perf_counter() - prepare_started
+
+    render_started = time.perf_counter()
+    for track_uid, output_path in specs:
+        state = states[str(track_uid)]
+        _render_prepared_track(state["track"], state["loaded"], state["prepared"], state["reds"], state["greens"], state["height"], state["width"], offsets, output_path, lut_low_percentile=lut_low_percentile, lut_high_percentile=lut_high_percentile)
+    total_reads = int(len(sessions) * 3 + fallback_mask_reads)
+    return {
+        "n_selected_outputs": len(specs),
+        "n_unique_tracks_prepared": len(unique_uids),
+        "n_sessions": len(sessions),
+        "reads": total_reads,
+        "fallbacks": fallback_count,
+        "full_stack_reads": int(len(sessions) * 3),
+        "fallback_mask_reads": fallback_mask_reads,
+        "geometry_fallbacks": fallback_count,
+        "prepare_seconds": prepare_seconds,
+        "render_seconds": time.perf_counter() - render_started,
+        "total_seconds": time.perf_counter() - started,
+    }
 
 
 def _render_prepared_track(track, loaded, prepared, reds, greens, height, width, offsets, output_path, *, lut_low_percentile, lut_high_percentile):
@@ -333,9 +378,7 @@ def render_ranked_roi_batch(*, specs, tracks_table, session_table, feature_table
         raise ValueError("render_z_radius must be >= 0")
     if not specs:
         return {"n_selected_outputs": 0, "n_unique_tracks_prepared": 0, "n_sessions": 0, "reads": 0, "fallbacks": 0, "full_stack_reads": 0, "geometry_fallbacks": 0, "prepare_seconds": 0.0, "render_seconds": 0.0, "total_seconds": 0.0}
-    started = time.perf_counter()
     sessions = resolve_longitudinal_session_metadata(session_table)
-    profile: dict[str, object] = {"n_selected_outputs": len(specs), "n_unique_tracks_prepared": len({str(spec[0]) for spec in specs}), "n_sessions": len(sessions), "reads": 0, "fallbacks": 0, "full_stack_reads": 0, "geometry_fallbacks": 0}
     tracks_by_uid = {str(row.track_uid): row for _, row in tracks_table.iterrows()}
     if _feature_batch_ready(specs, tracks_by_uid, sessions, feature_table, crop_padding_px):
         return _render_ranked_feature_batch(
@@ -349,33 +392,17 @@ def render_ranked_roi_batch(*, specs, tracks_table, session_table, feature_table
             lut_low_percentile=lut_low_percentile,
             lut_high_percentile=lut_high_percentile,
         )
-    volumes = {}
-    load_started = time.perf_counter()
-    for _, session in sessions.iterrows():
-        session_id = str(session.session_id)
-        volumes[session_id] = (
-            tifffile.imread(session.mask_path),
-            tifffile.imread(session.red_image_path),
-            tifffile.imread(session.green_image_path),
-        )
-    profile["full_stack_reads"] = int(len(sessions) * 3)
-    profile["reads"] = int(len(sessions) * 3)
-    profile["prepare_seconds"] = time.perf_counter() - load_started
-    prepared_by_uid = {}
-    for track_uid, _ in specs:
-        key = str(track_uid)
-        if key not in prepared_by_uid:
-            track = tracks_by_uid[key]
-            prepared_by_uid[key] = _prepare_batch_track(track, sessions, volumes, feature_table, crop_padding_px=crop_padding_px, min_crop_size_px=min_crop_size_px, z_radius=z_radius, profile=profile)
-    render_started = time.perf_counter()
-    for track_uid, output_path in specs:
-        track = tracks_by_uid[str(track_uid)]
-        loaded, prepared, reds, greens, height, width, offsets = prepared_by_uid[str(track_uid)]
-        _render_prepared_track(track, loaded, prepared, reds, greens, height, width, offsets, output_path, lut_low_percentile=lut_low_percentile, lut_high_percentile=lut_high_percentile)
-    profile["render_seconds"] = time.perf_counter() - render_started
-    profile["total_seconds"] = time.perf_counter() - started
-    profile["fallbacks"] = int(profile.get("geometry_fallbacks", 0))
-    return profile
+    return _render_ranked_bounded_fallback_batch(
+        specs=specs,
+        tracks_by_uid=tracks_by_uid,
+        sessions=sessions,
+        features=feature_table,
+        z_radius=z_radius,
+        crop_padding_px=crop_padding_px,
+        min_crop_size_px=min_crop_size_px,
+        lut_low_percentile=lut_low_percentile,
+        lut_high_percentile=lut_high_percentile,
+    )
 
 def _tracks_from_raw_table(raw_table, policy):
     selected = raw_table.loc[raw_table["match_policy"].eq(policy)].copy()

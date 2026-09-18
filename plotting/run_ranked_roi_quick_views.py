@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 
@@ -14,7 +15,7 @@ for _directory in (_ROOT / "core", _ROOT / "plotting"):
         sys.path.append(str(_directory))
 
 from roi_log_ratio_analysis import select_top_changing_rois, summarize_roi_metrics
-from run_matched_roi_quick_view import _tracks_from_raw_table, plot_matched_roi_raw_slices
+from run_matched_roi_quick_view import _tracks_from_raw_table, render_ranked_roi_batch
 
 
 METRIC_NAMES = (
@@ -51,6 +52,18 @@ def _resolve_run_inputs(run_dir: Path) -> tuple[Path, Path, Path]:
     )
 
 
+def _resolve_feature_table(run_dir: Path) -> Path | None:
+    extraction = run_dir / "extraction"
+    for candidate in (
+        extraction / "roi_features.csv",
+        run_dir / "matching" / "roi_features.csv",
+        run_dir / "roi_features.csv",
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def _filter_policy(table: pd.DataFrame, policy: str) -> pd.DataFrame:
     if policy == "all" or "match_policy" not in table.columns:
         return table
@@ -82,11 +95,14 @@ def build_ranked_roi_views(
     metrics = _filter_policy(pd.read_csv(metrics_path), policy)
     raw = _filter_policy(pd.read_csv(raw_path), policy)
     manifest = pd.read_csv(manifest_path)
+    feature_path = _resolve_feature_table(root)
+    features = pd.read_csv(feature_path) if feature_path is not None else None
     tracks = _tracks_from_raw_table(raw, policy)
     output_root = Path(output_dir).resolve() if output_dir else root / "plots" / policy / "single_roi_raw_validation"
     output_root.mkdir(parents=True, exist_ok=True)
     summary = summarize_roi_metrics(metrics)
     index_rows = []
+    render_specs = []
     for direction in directions:
         if direction not in {"increasing", "decreasing"}:
             raise ValueError(f"Unsupported direction: {direction!r}")
@@ -99,10 +115,13 @@ def build_ranked_roi_views(
             rank = int(selected["selection_rank"])
             stem = f"{'increase' if direction == 'increasing' else 'decrease'}_rank{rank:02d}_roi_{roi_id}"
             png_path = direction_dir / f"{stem}.png"
-            plot_matched_roi_raw_slices(
-                cluster_id=str(cluster_id), tracks_table=tracks, session_table=manifest,
-                output_path=png_path, z_radius=render_z_radius,
-            )
+            track_uid = selected.get("track_uid", "")
+            if pd.isna(track_uid) or not str(track_uid):
+                matches = tracks.loc[tracks["cluster_id"].astype(str).eq(str(cluster_id))]
+                if len(matches) != 1:
+                    raise ValueError(f"Could not resolve a unique track for ranked ROI {cluster_id!r}")
+                track_uid = matches.iloc[0]["track_uid"]
+            render_specs.append((str(track_uid), png_path))
             metadata_path = png_path.with_name(png_path.stem + "_metadata.csv")
             index_rows.append({
                 "selection_direction": direction, "selection_rank": rank,
@@ -113,7 +132,15 @@ def build_ranked_roi_views(
                 "selection_value": selected[selected["selection_metric_column"]],
                 "png_path": str(png_path), "metadata_csv_path": str(metadata_path),
             })
+    profile = render_ranked_roi_batch(
+        specs=render_specs,
+        tracks_table=tracks,
+        session_table=manifest,
+        feature_table=features,
+        z_radius=render_z_radius,
+    )
     pd.DataFrame(index_rows).to_csv(output_root / "ranked_roi_batch_index.csv", index=False)
+    (output_root / "ranked_roi_render_profile.json").write_text(json.dumps(profile, indent=2, sort_keys=True), encoding="utf-8")
     return output_root
 
 

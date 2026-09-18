@@ -105,6 +105,43 @@ def test_raw_view_reads_only_requested_z_planes(tmp_path: Path, monkeypatch) -> 
     assert calls == [None, 1, 1, 0, 0]
 
 
+def test_ranked_batch_reuses_session_stacks_and_preserves_one_off_output(tmp_path: Path, monkeypatch) -> None:
+    mask = np.zeros((3, 5, 5), dtype=np.uint16)
+    mask[0, 2, 2] = 1
+    red = np.arange(mask.size, dtype=np.uint16).reshape(mask.shape)
+    green = red + 10
+    paths = {name: tmp_path / f"{name}.tif" for name in ("mask", "red", "green")}
+    for name, data in (("mask", mask), ("red", red), ("green", green)):
+        tifffile.imwrite(paths[name], data, photometric="minisblack")
+    tracks = pd.DataFrame({"cluster_id": [1], "roi_id": [1], "track_uid": ["t1"], "match_policy": ["graph"], "s0_roi": [1]})
+    sessions = pd.DataFrame({
+        "session_index": [0], "session_id": ["s0"], "acquisition_date": ["2026-01-01"], "elapsed_days": [0],
+        "mask_path": [str(paths["mask"])], "red_image_path": [str(paths["red"])], "green_image_path": [str(paths["green"])],
+    })
+    features = pd.DataFrame({
+        "session_id": ["s0"], "label": [1], "centroid_z": [0.], "centroid_y": [2.], "centroid_x": [2.],
+        "bbox_y0": [2], "bbox_y1": [3], "bbox_x0": [2], "bbox_x1": [3],
+    })
+    one_off = tmp_path / "one_off.png"
+    batched = tmp_path / "batched.png"
+    raw_view.plot_matched_roi_raw_slices(cluster_id=1, tracks_table=tracks, session_table=sessions, output_path=one_off)
+    real_imread = raw_view.tifffile.imread
+    calls = []
+
+    def read(path, *args, **kwargs):
+        calls.append((Path(path).name, kwargs.get("key")))
+        return real_imread(path, *args, **kwargs)
+
+    monkeypatch.setattr(raw_view.tifffile, "imread", read)
+    profile = raw_view.render_ranked_roi_batch(
+        specs=[("t1", batched)], tracks_table=tracks, session_table=sessions, feature_table=features,
+    )
+    assert calls == [("mask.tif", None), ("red.tif", None), ("green.tif", None)]
+    assert profile["reads"] == 3
+    assert one_off.read_bytes() == batched.read_bytes()
+    assert one_off.with_name("one_off_metadata.csv").read_bytes() == batched.with_name("batched_metadata.csv").read_bytes()
+
+
 def test_final_directional_ranking_is_sign_correct_and_not_random() -> None:
     table = pd.DataFrame({
         "roi_id": [1, 2, 3], "day0_brightness": [10., 10., 10.], "day0_green": [1., 1., 1.],

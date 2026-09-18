@@ -446,11 +446,18 @@ def run_daywise_graph_matching(
     }
     runtime_profile["graph_pair_timings_seconds"] = graph_pair_timings
     runtime_profile["graph_total_wall_seconds"] = graph_total_wall_seconds
+    runtime_profile["graph_compute_wall_seconds"] = graph_total_wall_seconds
+    runtime_profile["matching_qc_wall_seconds"] = 0.0 if skip_qc else None
     runtime_profile["matcher_total_wall_seconds"] = float(time.perf_counter() - workflow_start_seconds)
     _export_json(output_dir / "run_log.json", run_log_payload)
 
+    if stage_callback is not None:
+        stage_callback("graph_roi_matching", graph_total_wall_seconds)
+    print(f"[{format_duration_seconds(graph_total_wall_seconds)}] Graph ROI matching completed", flush=True)
+
     if not skip_qc:
         qc_dir = qc_output_path
+        qc_start_seconds = time.perf_counter()
         try:
             generate_matching_qc(
                 DaywiseQCPlotConfig(
@@ -472,18 +479,20 @@ def run_daywise_graph_matching(
             run_log_payload["qc_error_type"] = type(exc).__name__
             run_log_payload["qc_error"] = str(exc)
             warnings.append("qc_failed")
-            _export_json(output_dir / "run_log.json", run_log_payload)
             if require_qc_success:
                 raise
         else:
             run_log_payload["qc_status"] = "completed"
             run_log_payload["qc_output_dir"] = str(qc_dir)
+        finally:
+            qc_duration_seconds = float(time.perf_counter() - qc_start_seconds)
+            runtime_profile["matching_qc_wall_seconds"] = qc_duration_seconds
+            runtime_profile["matcher_total_wall_seconds"] = float(time.perf_counter() - workflow_start_seconds)
             _export_json(output_dir / "run_log.json", run_log_payload)
-
-    total_duration_seconds = time.perf_counter() - run_start_seconds
-    if stage_callback is not None:
-        stage_callback("graph_roi_matching", total_duration_seconds)
-    print(f"[{format_duration_seconds(total_duration_seconds)}] Graph ROI matching completed", flush=True)
+            if stage_callback is not None:
+                stage_callback("matching_qc", qc_duration_seconds)
+            status = "completed" if run_log_payload["qc_status"] == "completed" else "failed"
+            print(f"[{format_duration_seconds(qc_duration_seconds)}] Matching QC {status}", flush=True)
     return baseline_output_dir
 
 

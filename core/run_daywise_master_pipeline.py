@@ -1212,6 +1212,7 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         labels = {
             "daywise_affine_roi_matching": "Daywise affine ROI matching",
             "graph_roi_matching": "Graph ROI matching",
+            "matching_qc": "Matching QC",
         }
         stage_durations_seconds[stage_key] = float(duration)
         _log(
@@ -1220,6 +1221,8 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         )
         if stage_key == "daywise_affine_roi_matching":
             _log(start_seconds, "Running graph ROI matching")
+        elif stage_key == "graph_roi_matching" and not config.skip_matching_qc:
+            _log(start_seconds, "Running matching QC")
 
     _log(start_seconds, "Running daywise affine ROI matching")
     spacing = VoxelSpacing(

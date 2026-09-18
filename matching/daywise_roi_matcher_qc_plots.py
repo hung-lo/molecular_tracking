@@ -7,6 +7,7 @@ from pathlib import Path
 import argparse
 import json
 import sys
+import time
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -429,7 +430,52 @@ def _accepted_keys(table: pd.DataFrame) -> set[tuple[str, str, str, str]]:
     return {(str(r.day_a), str(r.day_b), str(r.label_a), str(r.label_b)) for r in table.itertuples()}
 
 
-def _render_match_contact_sheet(table: pd.DataFrame, manifest: pd.DataFrame, output_path: Path, *, title: str, dpi: int, z_radius: int = 0) -> None:
+def _tiff_stack_shape(path: str | Path) -> tuple[int, int, int]:
+    with tifffile.TiffFile(path) as tif:
+        shape = tuple(int(value) for value in tif.series[0].shape)
+    if len(shape) == 2:
+        return 1, shape[0], shape[1]
+    if len(shape) != 3:
+        raise ValueError(f"Expected a 2-D or 3-D TIFF stack: {path}")
+    return shape
+
+
+def _feature_geometry(features: pd.DataFrame | None, label: int) -> tuple[int, int, int, int] | None:
+    if features is None or features.empty or "label" not in features.columns:
+        return None
+    rows = features.loc[pd.to_numeric(features["label"], errors="coerce").eq(int(label))]
+    required = {"centroid_z", "centroid_y", "centroid_x", "bbox_y0", "bbox_y1", "bbox_x0", "bbox_x1"}
+    if rows.empty or not required.issubset(rows.columns):
+        return None
+    row = rows.iloc[0]
+    size = max(48, int(max(int(row.bbox_y1 - row.bbox_y0) - 1, int(row.bbox_x1 - row.bbox_x0) - 1) + 24))
+    return int(round(float(row.centroid_z))), int(round(float(row.centroid_y))), int(round(float(row.centroid_x))), size
+
+
+def _raw_geometry(mask: np.ndarray, label: int) -> tuple[int, int, int, int]:
+    coords = np.where(mask == label)
+    if len(coords[0]) == 0:
+        raise ValueError(f"Mask label {label} was not found")
+    return (
+        int(round(float(coords[0].mean()))),
+        int(round(float(coords[1].mean()))),
+        int(round(float(coords[2].mean()))),
+        max(48, int(max(np.ptp(coords[1]), np.ptp(coords[2])) + 24)),
+    )
+
+
+def _render_match_contact_sheet(
+    table: pd.DataFrame,
+    manifest: pd.DataFrame,
+    output_path: Path,
+    *,
+    title: str,
+    dpi: int,
+    z_radius: int = 0,
+    volumes: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+    features_by_session: dict[str, pd.DataFrame] | None = None,
+    profile: dict[str, float] | None = None,
+) -> None:
     """Render native red crops for selected pairwise candidates."""
     if table.empty:
         fig, ax = plt.subplots(figsize=(8, 2.5)); ax.axis("off"); ax.text(.5, .5, "No eligible examples", ha="center", va="center"); _save_figure(output_path, fig, dpi=dpi); return
@@ -437,19 +483,29 @@ def _render_match_contact_sheet(table: pd.DataFrame, manifest: pd.DataFrame, out
     required_sessions = set(table["session_a"].astype(str)) | set(table["session_b"].astype(str))
     if any(session not in sessions.index or not Path(str(sessions.loc[session, "red_image_path"])).is_file() or not Path(str(sessions.loc[session, "mask_path"])).is_file() for session in required_sessions):
         fig, ax = plt.subplots(figsize=(8, 2.5)); ax.axis("off"); ax.text(.5, .5, "Raw image/mask files unavailable; visual example skipped", ha="center", va="center"); _save_figure(output_path, fig, dpi=dpi); return
-    images: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    for session in sorted(set(table["session_a"].astype(str)) | set(table["session_b"].astype(str))):
-        if session not in sessions.index: continue
-        row = sessions.loc[session]
-        images[session] = (tifffile.imread(row["red_image_path"]), tifffile.imread(row["mask_path"]))
+    images = volumes or {}
+    if not images:
+        for session in sorted(set(table["session_a"].astype(str)) | set(table["session_b"].astype(str))):
+            if session not in sessions.index: continue
+            row = sessions.loc[session]
+            started = time.perf_counter()
+            images[session] = (tifffile.imread(row["red_image_path"]), tifffile.imread(row["mask_path"]))
+            if profile is not None:
+                profile["full_stack_reads"] = profile.get("full_stack_reads", 0) + 2
+                profile["raw_load_seconds"] = profile.get("raw_load_seconds", 0.0) + time.perf_counter() - started
     n = len(table); fig, axes = plt.subplots(n, 2, figsize=(8, max(2.4, 2.8 * n)), squeeze=False)
     for i, item in table.iterrows():
         panels = []
         for side, label_col in (("A", "label_a"), ("B", "label_b")):
             session = str(item["session_a"] if side == "A" else item["session_b"]); label = int(item[label_col])
-            image, mask = images[session]; coords = np.where(mask == label); z0 = int(round(float(coords[0].mean())))
-            yc, xc = int(round(float(coords[1].mean()))), int(round(float(coords[2].mean())))
-            h, w = image.shape[1:]; size = max(48, int(max(np.ptp(coords[1]), np.ptp(coords[2])) + 24)); y0=max(0,yc-size//2); x0=max(0,xc-size//2)
+            image, mask = images[session]
+            geometry = _feature_geometry((features_by_session or {}).get(session), label)
+            if geometry is None:
+                geometry = _raw_geometry(mask, label)
+                if profile is not None:
+                    profile["geometry_fallbacks"] = profile.get("geometry_fallbacks", 0) + 1
+            z0, yc, xc, size = geometry
+            h, w = image.shape[1:]; y0=max(0,yc-size//2); x0=max(0,xc-size//2)
             crop=image[z0, y0:min(h,y0+size), x0:min(w,x0+size)]
             panels.append((crop, mask[z0, y0:min(h,y0+size), x0:min(w,x0+size)] == label, z0, session, label))
         for j, (crop, roi, z0, session, label) in enumerate(panels):
@@ -460,7 +516,17 @@ def _render_match_contact_sheet(table: pd.DataFrame, manifest: pd.DataFrame, out
     fig.suptitle(title); _save_figure(output_path, fig, dpi=dpi)
 
 
-def _render_large_z_examples(table: pd.DataFrame, manifest: pd.DataFrame, output_dir: Path, *, pair_name: str, dpi: int) -> list[Path]:
+def _render_large_z_examples(
+    table: pd.DataFrame,
+    manifest: pd.DataFrame,
+    output_dir: Path,
+    *,
+    pair_name: str,
+    dpi: int,
+    volumes: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+    features_by_session: dict[str, pd.DataFrame] | None = None,
+    profile: dict[str, float] | None = None,
+) -> list[Path]:
     """Render up to two accepted and two rejected native z-neighborhood examples."""
     if table.empty:
         return []
@@ -468,13 +534,26 @@ def _render_large_z_examples(table: pd.DataFrame, manifest: pd.DataFrame, output
     required_sessions = set(table["session_a"].astype(str)) | set(table["session_b"].astype(str))
     if any(session not in sessions.index or not Path(str(sessions.loc[session, "red_image_path"])).is_file() or not Path(str(sessions.loc[session, "mask_path"])).is_file() for session in required_sessions):
         return []
+    images = volumes or {}
+    if not images:
+        for session in sorted(required_sessions):
+            row = sessions.loc[session]
+            started = time.perf_counter()
+            images[session] = (tifffile.imread(row["red_image_path"]), tifffile.imread(row["mask_path"]))
+            if profile is not None:
+                profile["full_stack_reads"] = profile.get("full_stack_reads", 0) + 2
+                profile["raw_load_seconds"] = profile.get("raw_load_seconds", 0.0) + time.perf_counter() - started
     for category, subset in (("accepted", table.loc[table.accepted_for_track].sort_values("raw_abs_delta_z_planes", ascending=False).head(2)), ("rejected", table.loc[~table.accepted_for_track].sort_values("raw_abs_delta_z_planes", ascending=False).head(2))):
         for number, (_, item) in enumerate(subset.iterrows(), 1):
             fig, axes = plt.subplots(2, 7, figsize=(14, 5), squeeze=False)
             for side, label_col in enumerate(("label_a", "label_b")):
-                session = str(item["session_a"] if side == 0 else item["session_b"]); label = int(item[label_col]); row = sessions.loc[session]
-                mask, image = tifffile.imread(row["mask_path"]), tifffile.imread(row["red_image_path"]); coords=np.where(mask == label); z0=int(round(float(coords[0].mean()))); yc=int(round(float(coords[1].mean()))); xc=int(round(float(coords[2].mean())))
-                size=max(48, int(max(np.ptp(coords[1]), np.ptp(coords[2]))+24));
+                session = str(item["session_a"] if side == 0 else item["session_b"]); label = int(item[label_col]); image, mask = images[session]
+                geometry = _feature_geometry((features_by_session or {}).get(session), label)
+                if geometry is None:
+                    geometry = _raw_geometry(mask, label)
+                    if profile is not None:
+                        profile["geometry_fallbacks"] = profile.get("geometry_fallbacks", 0) + 1
+                z0, yc, xc, size = geometry
                 for col, offset in enumerate(range(3, -4, -1)):
                     z=z0+offset; ax=axes[side, col]; ax.set_xticks([]); ax.set_yticks([])
                     if 0 <= z < image.shape[0]:
@@ -486,7 +565,16 @@ def _render_large_z_examples(table: pd.DataFrame, manifest: pd.DataFrame, output
     return paths
 
 
-def _generate_spatial_pair_qc(match_dir: Path, output_dir: Path, candidates: pd.DataFrame, accepted_tables: list[pd.DataFrame], *, dpi: int, include_skip_pairs: bool = False) -> list[Path]:
+def _generate_spatial_pair_qc(
+    match_dir: Path,
+    output_dir: Path,
+    candidates: pd.DataFrame,
+    accepted_tables: list[pd.DataFrame],
+    *,
+    dpi: int,
+    include_skip_pairs: bool = False,
+    profile: dict[str, float] | None = None,
+) -> list[Path]:
     manifest = _load_csv(match_dir, "session_manifest_resolved.csv")
     features_by_session = _load_pair_features(match_dir)
     if manifest.empty or not features_by_session:
@@ -504,13 +592,35 @@ def _generate_spatial_pair_qc(match_dir: Path, output_dir: Path, candidates: pd.
     rows["accepted_for_track"] = rows["accepted_graph"]
     rows["rejection_reason"] = rows.apply(lambda r: "" if r.accepted_for_track else _candidate_rejection_reason(r), axis=1)
     paths=[]; summaries=[]; examples_dir=output_dir / "pair_examples"; (examples_dir / "large_z_shift").mkdir(parents=True, exist_ok=True); axial_dir=output_dir / "axial_shift"; tables_dir=output_dir / "tables"
+    run_log = _load_json(match_dir, "run_log.json")
+    z_spacing = run_log.get("spacing", {}).get("z_um") if isinstance(run_log.get("spacing"), dict) else None
+    shape_cache: dict[str, tuple[int, int]] = {}
     for pair, pair_rows in rows.groupby(["session_a", "session_b"], sort=True):
         sa, sb = pair; ma = manifest.loc[manifest.session_id.astype(str).eq(sa)];
         if ma.empty: continue
         if not include_skip_pairs and "pair_gap" in pair_rows and int(pair_rows["pair_gap"].iloc[0]) != 1: continue
-        mask = tifffile.imread(ma.iloc[0]["mask_path"]); shape=(mask.shape[1], mask.shape[2])
-        run_log = _load_json(match_dir, "run_log.json")
-        z_spacing = run_log.get("spacing", {}).get("z_um") if isinstance(run_log.get("spacing"), dict) else None
+        pair_manifest = manifest.loc[manifest.session_id.astype(str).isin([sa, sb])]
+        volumes: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        raw_started = time.perf_counter()
+        for session in (sa, sb):
+            row = manifest.loc[manifest.session_id.astype(str).eq(session)]
+            if row.empty:
+                continue
+            red_path, mask_path = Path(str(row.iloc[0]["red_image_path"])), Path(str(row.iloc[0]["mask_path"]))
+            if red_path.is_file() and mask_path.is_file():
+                volumes[session] = (tifffile.imread(red_path), tifffile.imread(mask_path))
+                if profile is not None:
+                    profile["full_stack_reads"] = profile.get("full_stack_reads", 0) + 2
+        if profile is not None:
+            profile["raw_load_seconds"] = profile.get("raw_load_seconds", 0.0) + time.perf_counter() - raw_started
+        if sa in volumes:
+            shape = (volumes[sa][1].shape[1], volumes[sa][1].shape[2])
+        else:
+            if sa not in shape_cache:
+                shape_cache[sa] = _tiff_stack_shape(ma.iloc[0]["mask_path"])[1:]
+                if profile is not None:
+                    profile["shape_metadata_reads"] = profile.get("shape_metadata_reads", 0) + 1
+            shape = shape_cache[sa]
         enriched=add_spatial_and_z_qc_columns(pair_rows, features_by_session[sa], target_features=features_by_session[sb], image_shape_yx=shape, z_spacing_um=z_spacing)
         dates = manifest.set_index(manifest.session_id.astype(str))["acquisition_date"]
         enriched["acquisition_date_a"] = dates.get(sa, "")
@@ -532,9 +642,12 @@ def _generate_spatial_pair_qc(match_dir: Path, output_dir: Path, candidates: pd.
             if not selected.empty: enriched[column] = enriched.get("_candidate_row_id", enriched.index).isin(selected["_candidate_row_id"])
         large=pd.concat([enriched.loc[enriched.accepted_for_track].sort_values("raw_abs_delta_z_planes", ascending=False).head(2), enriched.loc[~enriched.accepted_for_track].sort_values("raw_abs_delta_z_planes", ascending=False).head(2)])
         enriched["selected_large_z_example"] = enriched.get("_candidate_row_id", enriched.index).isin(large.get("_candidate_row_id", large.index))
+        render_started = time.perf_counter()
         for selected, name, title in ((high, "high_confidence_accepted", "High-confidence accepted"), (rejected, "informative_rejected", "Informative rejected")):
-            path=examples_dir/f"{sa}_{sb}_{name}.png"; _render_match_contact_sheet(selected, manifest, path, title=f"{title}: {sa} -> {sb}", dpi=dpi); paths.append(path)
-        paths.extend(_render_large_z_examples(large, manifest, examples_dir / "large_z_shift", pair_name=f"{sa}_{sb}", dpi=dpi))
+            path=examples_dir/f"{sa}_{sb}_{name}.png"; _render_match_contact_sheet(selected, pair_manifest, path, title=f"{title}: {sa} -> {sb}", dpi=dpi, volumes=volumes, features_by_session=features_by_session, profile=profile); paths.append(path)
+        paths.extend(_render_large_z_examples(large, pair_manifest, examples_dir / "large_z_shift", pair_name=f"{sa}_{sb}", dpi=dpi, volumes=volumes, features_by_session=features_by_session, profile=profile))
+        if profile is not None:
+            profile["pair_render_seconds"] = profile.get("pair_render_seconds", 0.0) + time.perf_counter() - render_started
         enriched.to_csv(tables_dir/f"{sa}_{sb}_matching_qc_examples.csv", index=False)
         accepted_high=enriched.loc[enriched.accepted_for_track & enriched.high_rule.astype(bool)]
         n_source = int(source_base["label_a"].nunique())
@@ -556,12 +669,17 @@ def _generate_spatial_pair_qc(match_dir: Path, output_dir: Path, candidates: pd.
         sa, sb = str(first.session_id), str(second.session_id)
         if (sa, sb) not in seen_pairs:
             n_source = len(features_by_session.get(sa, []))
-            summaries.append({"session_a": sa, "session_b": sb, "n_source_rois": n_source, "n_accepted_source_rois": 0, "accepted_fraction": 0.0 if n_source else np.nan, "n_high_confidence": 0, "median_raw_delta_z_planes": np.nan, "median_abs_raw_delta_z_planes": np.nan, "p90_abs_raw_delta_z_planes": np.nan, "long_axis": detect_long_axis((tifffile.imread(first.mask_path).shape[1], tifffile.imread(first.mask_path).shape[2]))})
+            if sa not in shape_cache:
+                shape_cache[sa] = _tiff_stack_shape(first.mask_path)[1:]
+                if profile is not None:
+                    profile["shape_metadata_reads"] = profile.get("shape_metadata_reads", 0) + 1
+            summaries.append({"session_a": sa, "session_b": sb, "n_source_rois": n_source, "n_accepted_source_rois": 0, "accepted_fraction": 0.0 if n_source else np.nan, "n_high_confidence": 0, "median_raw_delta_z_planes": np.nan, "median_abs_raw_delta_z_planes": np.nan, "p90_abs_raw_delta_z_planes": np.nan, "long_axis": detect_long_axis(shape_cache[sa])})
     pd.DataFrame(summaries).to_csv(tables_dir / "matching_qc_pair_summary.csv", index=False)
     return paths
 
 
 def generate_matching_qc(config: MatchingQCConfig) -> dict[str, Path]:
+    started = time.perf_counter()
     match_dir = Path(config.match_dir).resolve()
     if not match_dir.exists():
         raise FileNotFoundError(f"match_dir was not found: {match_dir}")
@@ -590,6 +708,13 @@ def generate_matching_qc(config: MatchingQCConfig) -> dict[str, Path]:
     ) if any(not table.empty for table in [pairwise_matches_high, pairwise_matches_balanced, pairwise_matches_graph]) else pd.DataFrame()
 
     saved_paths: list[Path] = []
+    qc_profile: dict[str, float] = {
+        "full_stack_reads": 0,
+        "shape_metadata_reads": 0,
+        "geometry_fallbacks": 0,
+        "raw_load_seconds": 0.0,
+        "pair_render_seconds": 0.0,
+    }
     if config.generate_visual_examples:
         for subdir in (output_dir / "pair_examples", output_dir / "axial_shift", output_dir / "tables"):
             subdir.mkdir(parents=True, exist_ok=True)
@@ -602,6 +727,7 @@ def generate_matching_qc(config: MatchingQCConfig) -> dict[str, Path]:
                     [pairwise_matches_high, pairwise_matches_balanced, pairwise_matches_graph],
                     dpi=int(config.dpi),
                     include_skip_pairs=bool(config.include_skip_pairs),
+                    profile=qc_profile,
                 )
             )
         saved_paths.extend(
@@ -703,6 +829,10 @@ def generate_matching_qc(config: MatchingQCConfig) -> dict[str, Path]:
                 "saved_plots": [str(path) for path in saved_paths],
                 "review_sample_rows": int(len(review_sample)),
                 "qc_report": str(report_path),
+                "runtime_profile": {
+                    **qc_profile,
+                    "total_wall_seconds": float(time.perf_counter() - started),
+                },
             },
             indent=2,
             sort_keys=True,

@@ -69,6 +69,30 @@ def test_run_daywise_graph_matching_exports_graph_tables(tmp_path: Path, monkeyp
     assert all(graph_timings[key] >= 0 for key in ("pair_refinement_total", "graph_track_building_total", "graph_cycle_consistency_total", "graph_runner_total"))
 
 
+def test_qc_enabled_stage_callback_is_separate_and_ordered(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(affine_runner, "_git_commit", lambda: "same-stage-commit")
+    monkeypatch.setattr(graph_runner, "_git_commit", lambda: "same-stage-commit")
+    manifest_path = _build_dataset(tmp_path)
+    qc_calls = []
+    monkeypatch.setattr(graph_runner, "generate_matching_qc", lambda config: qc_calls.append(config) or {})
+    stages: list[tuple[str, float]] = []
+    output_dir = run_daywise_graph_matching(
+        manifest_path=manifest_path,
+        output_dir=tmp_path / "graph_out",
+        overwrite=True,
+        skip_qc=False,
+        stage_callback=lambda key, duration: stages.append((key, duration)),
+    )
+    assert len(qc_calls) == 1
+    assert [key for key, _duration in stages] == [
+        "daywise_affine_roi_matching", "graph_roi_matching", "matching_qc",
+    ]
+    assert stages[1][1] >= 0 and stages[2][1] >= 0
+    profile = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))["runtime_profile"]
+    assert profile["graph_compute_wall_seconds"] >= 0
+    assert profile["matching_qc_wall_seconds"] >= 0
+
+
 def test_pair_table_groups_normalize_keys_and_preserve_row_order() -> None:
     table = pd.DataFrame(
         [

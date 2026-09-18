@@ -19,6 +19,7 @@ from acquisition_settings_qc import EXPECTED_ACQUISITION_SETTINGS, validate_acqu
 NULL_COMPAT={"TBD","NA","N/A"}; CATALOG_VERSION="thorimage_catalog_v1"
 _FLAT_SESSION_RE = re.compile(r"^WT_(.+)_(\d{8})$")
 _VOL10_RE = re.compile(r"(?<![A-Za-z0-9])vol10(?![A-Za-z0-9])", re.IGNORECASE)
+_AUXILIARY_TOKEN_RE = re.compile(r"(?:^|_)(?:test\d*|aux|auxiliary|calib|calibration|pilot)(?:_|$)", re.IGNORECASE)
 _ROW_INELIGIBLE_CODES = {"missing_experiment_xml", "malformed_xml", "settings_qc_failed"}
 # Historical acquisition name mapped to the canonical project mouse.
 _FLAT_MOUSE_ALIASES = {"Fucci-Tri_corFront": "Fucci-Tri_1"}
@@ -60,7 +61,8 @@ def load_mice(path: str|Path) -> list[Mouse]:
 def _active(value)->bool: return value is not None and (value.start>0 or value.stop>0)
 
 def _wavelength(name: str,meta: ThorImageMetadata,config: ProjectConfig)->tuple[int|None,list[str]]:
-    expected=config.rig.optional_laser_nm if name.lower().endswith(f"_laser{config.rig.optional_laser_nm}") else config.rig.primary_laser_nm
+    laser_token = re.compile(rf"(?:^|_)laser{config.rig.optional_laser_nm}(?:_|$)", re.IGNORECASE)
+    expected=config.rig.optional_laser_nm if laser_token.search(name) else config.rig.primary_laser_nm
     mapped={config.rig.pockels_1_laser_nm:meta.pockels[0] if len(meta.pockels)>0 else None,config.rig.pockels_2_laser_nm:meta.pockels[1] if len(meta.pockels)>1 else None}
     active=[laser for laser,value in mapped.items() if _active(value)]; warnings=[]
     if len(active)==1:
@@ -73,6 +75,7 @@ def _wavelength(name: str,meta: ThorImageMetadata,config: ProjectConfig)->tuple[
 def _classification(name:str,meta:ThorImageMetadata,config:ProjectConfig)->tuple[str,bool,int|None,list[str]]:
     low=name.lower(); laser,warnings=_wavelength(name,meta,config)
     if _is_vol10_acquisition(name): return "alignment_only",False,laser,warnings
+    if _AUXILIARY_TOKEN_RE.search(low): return "auxiliary_or_test",False,laser,warnings
     auxiliary=re.search(r"(?:^|_)vol5(?:_|$)",low) or any(t in low for t in ("dark","ome","rawformat","raw_format","singlez","singelz")) or meta.z_steps<=1
     if auxiliary: return "auxiliary_or_test",False,laser,warnings
     volume=config.canonical_volume; expected_frames=(volume.imaging_planes+volume.flyback_planes)*volume.volumes

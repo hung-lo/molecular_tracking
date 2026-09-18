@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 
@@ -27,6 +28,8 @@ def main(argv=None):
     if args.dry_run:
         print("dry-run: no files written")
     elif args.strict and report["errors"]:
+        for error in report["errors"]:
+            print(f"error: {json.dumps(error, sort_keys=True)}")
         print(f"strict validation failed: {len(report['errors'])} error(s); no catalog written")
         return 1
     else:

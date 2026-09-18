@@ -33,6 +33,59 @@ def test_discovery_recognizes_field_prefixed_acquisition(tmp_path):
     assert not report["errors"]
 
 
+@pytest.mark.parametrize(
+    ("name", "fixture", "role", "laser", "included"),
+    [
+        ("field150_res1536768_lFoV_zstack100to300_vol50", "square_1050.xml", "canonical", 1050, True),
+        ("field150_res1536768_lFoV_zstack100to300_vol50_laser920", "rectangular_920.xml", "canonical", 920, True),
+        ("field150_res1536768_lFoV_zstack100to300_vol50_test_pockels75", "square_1050.xml", "auxiliary_or_test", 1050, False),
+        ("field150_res1536768_lFoV_zstack100to300_vol50_test_pockels75_laser920", "rectangular_920.xml", "auxiliary_or_test", 920, False),
+        ("field150_res1536768_lFoV_zstack100to300_vol50_laser920_test_pockels75", "rectangular_920.xml", "auxiliary_or_test", 920, False),
+        ("field150_res1536768_lFoV_zstack100to300_vol50_test01_pockels75", "square_1050.xml", "auxiliary_or_test", 1050, False),
+    ],
+)
+def test_acquisition_name_tokens_classify_wavelength_and_analysis_inclusion(
+    tmp_path, name, fixture, role, laser, included
+):
+    config, raw = _project(tmp_path)
+    if not (role == "canonical" and laser == 1050):
+        _acq(raw, "session_20260819", "field150_res1536768_lFoV_zstack100to300_vol50_anchor", "square_1050.xml")
+    _acq(raw, "session_20260819", name, fixture)
+    rows, report = discover_catalog(config)
+    assert not {error["code"] for error in report["errors"]} & {"missing_or_duplicate_primary", "duplicate_optional"}
+    row = next(row for row in rows if row["acquisition_id"] == name)
+    assert row["role"] == role
+    assert row["laser_nm"] == laser
+    assert row["analysis_included"] is included
+    if role == "auxiliary_or_test":
+        assert row["settings_qc_status"] == "not_applicable"
+        assert row["settings_qc_pass"] is None
+
+
+@pytest.mark.parametrize("middle", ["latest", "contest", "testtube"])
+def test_unrelated_test_substrings_do_not_trigger_auxiliary_classification(tmp_path, middle):
+    config, raw = _project(tmp_path)
+    _acq(raw, "session_20260819", f"field150_vol50_{middle}_pockels75", "square_1050.xml")
+    rows, report = discover_catalog(config)
+    assert not report["errors"]
+    assert rows[0]["role"] == "canonical"
+    assert rows[0]["analysis_included"] is True
+
+
+def test_duplicate_canonical_acquisitions_remain_strict_errors(tmp_path):
+    config, raw = _project(tmp_path)
+    for name, fixture in (
+        ("field150_vol50", "square_1050.xml"),
+        ("field150_vol50_repeat", "square_1050.xml"),
+        ("field150_vol50_laser920", "rectangular_920.xml"),
+        ("field150_vol50_laser920_repeat", "rectangular_920.xml"),
+    ):
+        _acq(raw, "session_20260819", name, fixture)
+    _, report = discover_catalog(config)
+    codes = {error["code"] for error in report["errors"]}
+    assert {"missing_or_duplicate_primary", "duplicate_optional"} <= codes
+
+
 def test_discovery_preserves_xml_acquisition_with_nonstandard_name(tmp_path):
     config, raw = _project(tmp_path)
     _acq(raw, "session_20260819", "unexpected_acquisition_name", "square_1050.xml")

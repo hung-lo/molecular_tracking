@@ -24,6 +24,7 @@ _AUXILIARY_TOKEN_RE = re.compile(r"(?:^|_)(?:test\d*|aux|auxiliary|calib|calibra
 _TEST_TOKEN_RE = re.compile(r"(?:^|_)test\d*(?:_|$)", re.IGNORECASE)
 _ROW_INELIGIBLE_CODES = {"missing_experiment_xml", "malformed_xml", "settings_qc_failed"}
 _FUCCI_TRI4_LP75_START = date(2026, 9, 17)
+_POWER_POLICY_MICE = {"Fucci-Tri_4", "Fucci-Tri_5"}
 # Historical acquisition name mapped to the canonical project mouse.
 _FLAT_MOUSE_ALIASES = {"Fucci-Tri_corFront": "Fucci-Tri_1"}
 
@@ -95,6 +96,14 @@ def _expected_selected_power(mouse_id: str, laser_nm: int | None) -> float | Non
     return expected.get(f"laser_{laser_nm}_power") if expected else None
 
 
+def _selected_pockels(meta: ThorImageMetadata, laser_nm: int | None, config: ProjectConfig):
+    pockels_index = {
+        config.rig.pockels_1_laser_nm: 0,
+        config.rig.pockels_2_laser_nm: 1,
+    }.get(laser_nm)
+    return meta.pockels[pockels_index] if pockels_index is not None and len(meta.pockels) > pockels_index else None
+
+
 def _selected_pockels_power_matches(
     mouse_id: str,
     laser_nm: int | None,
@@ -104,13 +113,9 @@ def _selected_pockels_power_matches(
     tolerance: float = 1e-6,
 ) -> bool:
     expected = _expected_selected_power(mouse_id, laser_nm)
-    pockels_index = {
-        config.rig.pockels_1_laser_nm: 0,
-        config.rig.pockels_2_laser_nm: 1,
-    }.get(laser_nm)
-    if expected is None or pockels_index is None or len(meta.pockels) <= pockels_index:
+    selected = _selected_pockels(meta, laser_nm, config)
+    if expected is None or selected is None:
         return False
-    selected = meta.pockels[pockels_index]
     return math.isclose(selected.start, expected, rel_tol=tolerance, abs_tol=tolerance) and math.isclose(
         selected.stop, expected, rel_tol=tolerance, abs_tol=tolerance
     )
@@ -120,9 +125,20 @@ def _fucci_tri4_before_lp75_start(mouse_id: str, session_date: str) -> bool:
     return mouse_id == "Fucci-Tri_4" and date.fromisoformat(session_date) < _FUCCI_TRI4_LP75_START
 
 
-def _policy_exclusion_reason(codes: list[str], laser_nm: int | None) -> str:
+def _policy_exclusion_reason(
+    codes: list[str],
+    laser_nm: int | None,
+    meta: ThorImageMetadata | None = None,
+    config: ProjectConfig | None = None,
+) -> str:
     if "fucci_tri4_lp75_start_policy" in codes:
         return "excluded by Fucci-Tri_4 LP75 longitudinal start policy"
+    if "fucci_tri5_power_policy" in codes:
+        expected = _expected_selected_power("Fucci-Tri_5", laser_nm)
+        selected = _selected_pockels(meta, laser_nm, config) if meta is not None and config is not None else None
+        if expected is not None and laser_nm is not None and selected is not None:
+            return f"excluded by Fucci-Tri_5 power policy: expected {expected:g}% for {laser_nm} nm, found {selected.start:g}/{selected.stop:g}%"
+        return "excluded by Fucci-Tri_5 power policy: selected wavelength power does not match 70%"
     if "excluded_by_power_policy" in codes:
         expected = _expected_selected_power("Fucci-Tri_4", laser_nm)
         if expected is not None and laser_nm is not None:
@@ -142,14 +158,19 @@ def _classification(
     low=name.lower(); laser,warnings=_wavelength(name,meta,config)
     if _is_vol10_acquisition(name): return "alignment_only",False,laser,warnings
     canonical = _canonical_volume_geometry(meta, config)
-    if mouse_id == "Fucci-Tri_4" and session_date is not None:
-        if _fucci_tri4_before_lp75_start(mouse_id, session_date):
+    if mouse_id in _POWER_POLICY_MICE and session_date is not None:
+        if mouse_id == "Fucci-Tri_4" and _fucci_tri4_before_lp75_start(mouse_id, session_date):
             return "policy_excluded",False,laser,warnings+["fucci_tri4_lp75_start_policy"]
         power_matches = _selected_pockels_power_matches(mouse_id, laser, meta, config)
-        if _TEST_TOKEN_RE.search(low) and canonical and not warnings and power_matches:
+        if mouse_id == "Fucci-Tri_4" and _TEST_TOKEN_RE.search(low) and canonical and not warnings and power_matches:
             return "canonical",True,laser,warnings
-        if not _TEST_TOKEN_RE.search(low) and canonical and not warnings and not power_matches:
-            return "policy_excluded",False,laser,warnings+["excluded_by_power_policy"]
+        if canonical and not warnings and not power_matches:
+            code = "excluded_by_power_policy"
+            if mouse_id == "Fucci-Tri_5":
+                code = "fucci_tri5_power_policy"
+            elif _TEST_TOKEN_RE.search(low):
+                return "auxiliary_or_test",False,laser,warnings
+            return "policy_excluded",False,laser,warnings+[code]
     if _AUXILIARY_TOKEN_RE.search(low): return "auxiliary_or_test",False,laser,warnings
     auxiliary=re.search(r"(?:^|_)vol5(?:_|$)",low) or any(t in low for t in ("dark","ome","rawformat","raw_format","singlez","singelz")) or meta.z_steps<=1
     if auxiliary: return "auxiliary_or_test",False,laser,warnings
@@ -316,7 +337,7 @@ def discover_catalog(config:ProjectConfig)->tuple[list[dict[str,Any]],dict[str,A
                 if not mouse.pipeline_enabled:
                     row.update({"analysis_included":False,"is_primary":False,"settings_qc_pass":None,"settings_qc_status":"not_applicable_pipeline_excluded","settings_qc_reason":f"pipeline excluded: {mouse.pipeline_exclusion_reason}","analysis_eligible":False})
                 elif not included:
-                    row.update({"settings_qc_pass": None, "settings_qc_status":"not_applicable", "settings_qc_reason": _policy_exclusion_reason(codes, laser) or f"excluded: {role} acquisition is not used for analysis", "analysis_eligible": False})
+                    row.update({"settings_qc_pass": None, "settings_qc_status":"not_applicable", "settings_qc_reason": _policy_exclusion_reason(codes, laser, meta, config) or f"excluded: {role} acquisition is not used for analysis", "analysis_eligible": False})
                 elif mouse.mouse_id.startswith("Fucci-") and mouse.mouse_id not in EXPECTED_ACQUISITION_SETTINGS:
                     row.update({"settings_qc_pass": None, "settings_qc_status":"not_configured", "settings_qc_reason": "no acquisition QC configuration for Fucci mouse", "analysis_eligible": False})
                 elif not mouse.mouse_id.startswith("Fucci-"):

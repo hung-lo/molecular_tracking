@@ -18,7 +18,7 @@ def _acq(root,session,name,fixture):
     path=root/"folder"/session/name; path.mkdir(parents=True,exist_ok=True); shutil.copy(FIX/fixture,path/"Experiment.xml")
 
 
-def _tri4_acq(root, session, name, power):
+def _acq_with_1050_power(root, session, name, power):
     path = root / "folder" / session / name
     path.mkdir(parents=True, exist_ok=True)
     year, month, day = session.removeprefix("session_")[:4], session[-4:-2], session[-2:]
@@ -26,6 +26,17 @@ def _tri4_acq(root, session, name, power):
     xml = xml.replace('date="08/19/2026', f'date="{month}/{day}/{year}')
     xml = xml.replace('start="50" stop="50"', f'start="{power}" stop="{power}"')
     xml = xml.replace('gainA="120" enableB="1" gainB="130"', 'gainA="10" enableB="1" gainB="10"')
+    (path / "Experiment.xml").write_text(xml)
+
+
+def _acq_with_920_power(root, session, name, power):
+    path = root / "folder" / session / name
+    path.mkdir(parents=True, exist_ok=True)
+    year, month, day = session.removeprefix("session_")[:4], session[-4:-2], session[-2:]
+    xml = (FIX / "rectangular_920.xml").read_text()
+    xml = xml.replace('date="08/20/2026', f'date="{month}/{day}/{year}')
+    xml = xml.replace('start="80" stop="80"', f'start="{power}" stop="{power}"')
+    xml = xml.replace('gainA="100" enableB="1" gainB="100"', 'gainA="10" enableB="1" gainB="10"')
     (path / "Experiment.xml").write_text(xml)
 
 def test_discovery_uses_mouse_mapping_and_optional_920(tmp_path):
@@ -85,7 +96,7 @@ def test_unrelated_test_substrings_do_not_trigger_auxiliary_classification(tmp_p
 
 def test_fucci_tri4_before_lp75_cutoff_is_audit_only(tmp_path):
     config, raw = _project(tmp_path, "Fucci-Tri_4")
-    _tri4_acq(raw, "session_20260916", "field150_vol50", 70)
+    _acq_with_1050_power(raw, "session_20260916", "field150_vol50", 70)
     rows, report = discover_catalog(config)
     row = rows[0]
     assert row["role"] == "policy_excluded"
@@ -98,7 +109,7 @@ def test_fucci_tri4_before_lp75_cutoff_is_audit_only(tmp_path):
 
 def test_fucci_tri4_post_cutoff_lp70_is_policy_excluded(tmp_path):
     config, raw = _project(tmp_path, "Fucci-Tri_4")
-    _tri4_acq(raw, "session_20260921", "field150_vol50", 70)
+    _acq_with_1050_power(raw, "session_20260921", "field150_vol50", 70)
     rows, report = discover_catalog(config)
     row = rows[0]
     assert row["role"] == "policy_excluded"
@@ -111,7 +122,7 @@ def test_fucci_tri4_post_cutoff_lp70_is_policy_excluded(tmp_path):
 
 def test_fucci_tri4_test_lp75_can_become_canonical(tmp_path):
     config, raw = _project(tmp_path, "Fucci-Tri_4")
-    _tri4_acq(raw, "session_20260921", "field150_vol50_test_pockels75", 75)
+    _acq_with_1050_power(raw, "session_20260921", "field150_vol50_test_pockels75", 75)
     rows, _ = discover_catalog(config)
     row = rows[0]
     assert row["role"] == "canonical"
@@ -122,7 +133,7 @@ def test_fucci_tri4_test_lp75_can_become_canonical(tmp_path):
 
 def test_fucci_tri4_ordinary_lp75_is_canonical(tmp_path):
     config, raw = _project(tmp_path, "Fucci-Tri_4")
-    _tri4_acq(raw, "session_20260928", "field150_vol50", 75)
+    _acq_with_1050_power(raw, "session_20260928", "field150_vol50", 75)
     rows, _ = discover_catalog(config)
     row = rows[0]
     assert row["role"] == "canonical"
@@ -133,12 +144,59 @@ def test_fucci_tri4_ordinary_lp75_is_canonical(tmp_path):
 
 def test_test_lp75_remains_auxiliary_for_other_mice(tmp_path):
     config, raw = _project(tmp_path, "Fucci-Tri_3")
-    _tri4_acq(raw, "session_20260921", "field150_vol50_test_pockels75", 75)
+    _acq_with_1050_power(raw, "session_20260921", "field150_vol50_test_pockels75", 75)
     rows, _ = discover_catalog(config)
     row = rows[0]
     assert row["role"] == "auxiliary_or_test"
     assert row["analysis_included"] is False
     assert row["settings_qc_pass"] is None
+
+
+def test_fucci_tri5_includes_xml_confirmed_1050_lp70(tmp_path):
+    config, raw = _project(tmp_path, "Fucci-Tri_5")
+    _acq_with_1050_power(raw, "session_20260929", "field150_vol50", 70)
+    rows, _ = discover_catalog(config)
+    row = rows[0]
+    assert row["role"] == "canonical"
+    assert row["analysis_included"] is True
+    assert row["settings_qc_pass"] is True
+    assert row["analysis_eligible"] is True
+
+
+@pytest.mark.parametrize("name", ["field150_vol50_lp65", "field150_vol50"])
+def test_fucci_tri5_excludes_xml_confirmed_1050_lp65(tmp_path, name):
+    config, raw = _project(tmp_path, "Fucci-Tri_5")
+    _acq_with_1050_power(raw, "session_20260929", name, 65)
+    rows, report = discover_catalog(config)
+    row = rows[0]
+    assert row["role"] == "policy_excluded"
+    assert row["analysis_included"] is False
+    assert row["analysis_eligible"] is False
+    assert row["settings_qc_pass"] is None
+    assert row["settings_qc_status"] == "not_applicable"
+    assert "expected 70% for 1050 nm, found 65/65%" in row["settings_qc_reason"]
+    assert not any(item["code"] == "settings_qc_failed" for item in report["row_ineligible"])
+
+
+def test_fucci_tri5_uses_xml_confirmed_920_power(tmp_path):
+    config, raw = _project(tmp_path, "Fucci-Tri_5")
+    _acq_with_920_power(raw, "session_20260929", "field150_vol50_laser920", 70)
+    rows, _ = discover_catalog(config)
+    row = rows[0]
+    assert row["role"] == "canonical"
+    assert row["laser_nm"] == 920
+    assert row["analysis_included"] is True
+    assert row["settings_qc_pass"] is True
+
+
+def test_fucci_tri5_excludes_xml_confirmed_920_lp65(tmp_path):
+    config, raw = _project(tmp_path, "Fucci-Tri_5")
+    _acq_with_920_power(raw, "session_20260929", "field150_vol50_laser920_lp65", 65)
+    rows, _ = discover_catalog(config)
+    row = rows[0]
+    assert row["role"] == "policy_excluded"
+    assert row["analysis_included"] is False
+    assert row["analysis_eligible"] is False
 
 
 def test_duplicate_canonical_acquisitions_remain_strict_errors(tmp_path):

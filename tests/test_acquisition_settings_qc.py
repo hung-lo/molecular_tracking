@@ -75,12 +75,12 @@ def test_selected_laser_must_have_an_active_expected_power():
     assert result["settings_qc_pass"] is False and "1050=0 expected 60" in result["settings_qc_reason"]
 
 
-def test_tri4_uses_70_percent_powers_and_fails_wrong_selected_laser():
+def test_tri4_uses_75_percent_powers_and_fails_wrong_selected_laser():
     row = {
         "mouse_id": "Fucci-Tri_4", "laser_nm": 1050,
         "pmt_a_gain": 10, "pmt_b_gain": 10,
         "pockels_920_start_pct": 0, "pockels_920_stop_pct": 0,
-        "pockels_1050_start_pct": 70, "pockels_1050_stop_pct": 70,
+        "pockels_1050_start_pct": 75, "pockels_1050_stop_pct": 75,
     }
     assert validate_acquisition_row(row)["settings_qc_pass"] is True
     row["pockels_1050_stop_pct"] = 60

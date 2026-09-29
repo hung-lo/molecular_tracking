@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import date,datetime,timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -20,7 +21,9 @@ NULL_COMPAT={"TBD","NA","N/A"}; CATALOG_VERSION="thorimage_catalog_v1"
 _FLAT_SESSION_RE = re.compile(r"^WT_(.+)_(\d{8})$")
 _VOL10_RE = re.compile(r"(?<![A-Za-z0-9])vol10(?![A-Za-z0-9])", re.IGNORECASE)
 _AUXILIARY_TOKEN_RE = re.compile(r"(?:^|_)(?:test\d*|aux|auxiliary|calib|calibration|pilot)(?:_|$)", re.IGNORECASE)
+_TEST_TOKEN_RE = re.compile(r"(?:^|_)test\d*(?:_|$)", re.IGNORECASE)
 _ROW_INELIGIBLE_CODES = {"missing_experiment_xml", "malformed_xml", "settings_qc_failed"}
+_FUCCI_TRI4_LP75_START = date(2026, 9, 17)
 # Historical acquisition name mapped to the canonical project mouse.
 _FLAT_MOUSE_ALIASES = {"Fucci-Tri_corFront": "Fucci-Tri_1"}
 
@@ -72,14 +75,84 @@ def _wavelength(name: str,meta: ThorImageMetadata,config: ProjectConfig)->tuple[
     warnings.append("both_mapped_lasers_active" if len(active)>1 else "both_mapped_lasers_inactive")
     return expected,warnings
 
-def _classification(name:str,meta:ThorImageMetadata,config:ProjectConfig)->tuple[str,bool,int|None,list[str]]:
+def _canonical_volume_geometry(meta: ThorImageMetadata, config: ProjectConfig) -> bool:
+    volume=config.canonical_volume
+    expected_frames=(volume.imaging_planes+volume.flyback_planes)*volume.volumes
+    return (
+        meta.experiment_status.lower() in {"complete", "completed"}
+        and meta.z_steps == volume.imaging_planes
+        and meta.flyback_frames == volume.flyback_planes
+        and abs(meta.z_step_um-volume.z_step_um) < 1e-6
+        and meta.timepoints == volume.volumes
+        and meta.streaming_frames == expected_frames
+    )
+
+
+def _expected_selected_power(mouse_id: str, laser_nm: int | None) -> float | None:
+    if laser_nm is None:
+        return None
+    expected = EXPECTED_ACQUISITION_SETTINGS.get(mouse_id)
+    return expected.get(f"laser_{laser_nm}_power") if expected else None
+
+
+def _selected_pockels_power_matches(
+    mouse_id: str,
+    laser_nm: int | None,
+    meta: ThorImageMetadata,
+    config: ProjectConfig,
+    *,
+    tolerance: float = 1e-6,
+) -> bool:
+    expected = _expected_selected_power(mouse_id, laser_nm)
+    pockels_index = {
+        config.rig.pockels_1_laser_nm: 0,
+        config.rig.pockels_2_laser_nm: 1,
+    }.get(laser_nm)
+    if expected is None or pockels_index is None or len(meta.pockels) <= pockels_index:
+        return False
+    selected = meta.pockels[pockels_index]
+    return math.isclose(selected.start, expected, rel_tol=tolerance, abs_tol=tolerance) and math.isclose(
+        selected.stop, expected, rel_tol=tolerance, abs_tol=tolerance
+    )
+
+
+def _fucci_tri4_before_lp75_start(mouse_id: str, session_date: str) -> bool:
+    return mouse_id == "Fucci-Tri_4" and date.fromisoformat(session_date) < _FUCCI_TRI4_LP75_START
+
+
+def _policy_exclusion_reason(codes: list[str], laser_nm: int | None) -> str:
+    if "fucci_tri4_lp75_start_policy" in codes:
+        return "excluded by Fucci-Tri_4 LP75 longitudinal start policy"
+    if "excluded_by_power_policy" in codes:
+        expected = _expected_selected_power("Fucci-Tri_4", laser_nm)
+        if expected is not None and laser_nm is not None:
+            return f"excluded_by_power_policy: Fucci-Tri_4 requires {expected:g}% for {laser_nm} nm from {_FUCCI_TRI4_LP75_START.isoformat()}"
+        return "excluded_by_power_policy: Fucci-Tri_4 selected wavelength power does not match the LP75 policy"
+    return ""
+
+
+def _classification(
+    name: str,
+    meta: ThorImageMetadata,
+    config: ProjectConfig,
+    *,
+    mouse_id: str | None = None,
+    session_date: str | None = None,
+) -> tuple[str, bool, int | None, list[str]]:
     low=name.lower(); laser,warnings=_wavelength(name,meta,config)
     if _is_vol10_acquisition(name): return "alignment_only",False,laser,warnings
+    canonical = _canonical_volume_geometry(meta, config)
+    if mouse_id == "Fucci-Tri_4" and session_date is not None:
+        if _fucci_tri4_before_lp75_start(mouse_id, session_date):
+            return "policy_excluded",False,laser,warnings+["fucci_tri4_lp75_start_policy"]
+        power_matches = _selected_pockels_power_matches(mouse_id, laser, meta, config)
+        if _TEST_TOKEN_RE.search(low) and canonical and not warnings and power_matches:
+            return "canonical",True,laser,warnings
+        if not _TEST_TOKEN_RE.search(low) and canonical and not warnings and not power_matches:
+            return "policy_excluded",False,laser,warnings+["excluded_by_power_policy"]
     if _AUXILIARY_TOKEN_RE.search(low): return "auxiliary_or_test",False,laser,warnings
     auxiliary=re.search(r"(?:^|_)vol5(?:_|$)",low) or any(t in low for t in ("dark","ome","rawformat","raw_format","singlez","singelz")) or meta.z_steps<=1
     if auxiliary: return "auxiliary_or_test",False,laser,warnings
-    volume=config.canonical_volume; expected_frames=(volume.imaging_planes+volume.flyback_planes)*volume.volumes
-    canonical=meta.experiment_status.lower() in {"complete","completed"} and meta.z_steps==volume.imaging_planes and meta.flyback_frames==volume.flyback_planes and abs(meta.z_step_um-volume.z_step_um)<1e-6 and meta.timepoints==volume.volumes and meta.streaming_frames==expected_frames
     if not canonical: return "noncanonical",False,laser,warnings
     if warnings: return "ambiguous",False,laser,warnings
     return "canonical",True,laser,warnings
@@ -177,7 +250,8 @@ def _manifest_candidate(row: dict[str, Any], mouse_id: str, laser_nm: int) -> bo
 
 def _unavailable_acquisition_row(mouse: Mouse, found: DiscoveredSession, acq: Path, *, role: str, reason: str) -> dict[str, Any]:
     excluded = not mouse.pipeline_enabled
-    return {"mouse_id":mouse.mouse_id,"pipeline_enabled":mouse.pipeline_enabled,"pipeline_exclusion_reason":mouse.pipeline_exclusion_reason,"experimental_group":mouse.values["experimental_group"],"cohort":mouse.values["cohort"],"session_id":found.path.name,"acquisition_date":found.session_date,"discovery_layout":found.discovery_layout,"acquisition_id":acq.name,"source_path":str(acq.resolve()),"role":role,"analysis_included":False,"laser_nm":None,"is_primary":False,"xml_date":None,"software_version":"","experiment_status":"","pixel_x":None,"pixel_y":None,"width_um":None,"height_um":None,"pixel_size_x_um":None,"pixel_size_y_um":None,"z_imaging_planes":None,"flyback_planes":None,"z_step_um":None,"timepoints":None,"streaming_frames":None,"pockels_920_start_pct":None,"pockels_920_stop_pct":None,"pockels_1050_start_pct":None,"pockels_1050_stop_pct":None,"pockels_node_count":None,"pmt_a_gain":None,"pmt_b_gain":None,"average_num":None,"raw_image_path":"","settings_qc_pass":None if excluded else False,"settings_qc_status":"not_applicable_pipeline_excluded" if excluded else "fail","settings_qc_reason":f"pipeline excluded: {mouse.pipeline_exclusion_reason}" if excluded else reason,"analysis_eligible":False,"is_vol10_control":False,"warnings":role}
+    policy_excluded = role == "policy_excluded"
+    return {"mouse_id":mouse.mouse_id,"pipeline_enabled":mouse.pipeline_enabled,"pipeline_exclusion_reason":mouse.pipeline_exclusion_reason,"experimental_group":mouse.values["experimental_group"],"cohort":mouse.values["cohort"],"session_id":found.path.name,"acquisition_date":found.session_date,"discovery_layout":found.discovery_layout,"acquisition_id":acq.name,"source_path":str(acq.resolve()),"role":role,"analysis_included":False,"laser_nm":None,"is_primary":False,"xml_date":None,"software_version":"","experiment_status":"","pixel_x":None,"pixel_y":None,"width_um":None,"height_um":None,"pixel_size_x_um":None,"pixel_size_y_um":None,"z_imaging_planes":None,"flyback_planes":None,"z_step_um":None,"timepoints":None,"streaming_frames":None,"pockels_920_start_pct":None,"pockels_920_stop_pct":None,"pockels_1050_start_pct":None,"pockels_1050_stop_pct":None,"pockels_node_count":None,"pmt_a_gain":None,"pmt_b_gain":None,"average_num":None,"raw_image_path":"","settings_qc_pass":None if excluded or policy_excluded else False,"settings_qc_status":"not_applicable_pipeline_excluded" if excluded else "not_applicable" if policy_excluded else "fail","settings_qc_reason":f"pipeline excluded: {mouse.pipeline_exclusion_reason}" if excluded else reason,"analysis_eligible":False,"is_vol10_control":False,"warnings":role}
 
 
 def _vol10_acquisition_row(mouse: Mouse, found: DiscoveredSession, acq: Path) -> dict[str, Any]:
@@ -217,25 +291,32 @@ def discover_catalog(config:ProjectConfig)->tuple[list[dict[str,Any]],dict[str,A
                     continue
                 if not (acq / "Experiment.xml").is_file():
                     reason = "missing Experiment.xml"
-                    rows.append(_unavailable_acquisition_row(mouse, found, acq, role="missing_xml", reason=reason))
-                    if mouse.pipeline_enabled: row_ineligible.append({"code":"missing_experiment_xml","severity":"row_ineligible","mouse_id":mouse.mouse_id,"session_id":session.name,"path":str(acq)})
+                    role = "policy_excluded" if _fucci_tri4_before_lp75_start(mouse.mouse_id, session_date) else "missing_xml"
+                    if role == "policy_excluded":
+                        reason = "excluded by Fucci-Tri_4 LP75 longitudinal start policy; Experiment.xml unavailable"
+                    rows.append(_unavailable_acquisition_row(mouse, found, acq, role=role, reason=reason))
+                    if role != "policy_excluded" and mouse.pipeline_enabled: row_ineligible.append({"code":"missing_experiment_xml","severity":"row_ineligible","mouse_id":mouse.mouse_id,"session_id":session.name,"path":str(acq)})
                     continue
                 xml=acq/"Experiment.xml"
                 try: meta=parse_experiment_xml(xml)
                 except ThorImageParseError as exc:
                     # Preserve the acquisition in the catalog so the failed
                     # session remains auditable and downstream-ineligible.
-                    if mouse.pipeline_enabled: row_ineligible.append({"code":"malformed_xml","severity":"row_ineligible","mouse_id":mouse.mouse_id,"session_id":session.name,"path":str(xml),"message":str(exc)})
-                    rows.append(_unavailable_acquisition_row(mouse, found, acq, role="malformed_xml", reason=f"malformed Experiment.xml: {exc}"))
+                    role = "policy_excluded" if _fucci_tri4_before_lp75_start(mouse.mouse_id, session_date) else "malformed_xml"
+                    reason = f"malformed Experiment.xml: {exc}"
+                    if role == "policy_excluded":
+                        reason = f"excluded by Fucci-Tri_4 LP75 longitudinal start policy; {reason}"
+                    if role != "policy_excluded" and mouse.pipeline_enabled: row_ineligible.append({"code":"malformed_xml","severity":"row_ineligible","mouse_id":mouse.mouse_id,"session_id":session.name,"path":str(xml),"message":str(exc)})
+                    rows.append(_unavailable_acquisition_row(mouse, found, acq, role=role, reason=reason))
                     continue
-                role,included,laser,codes=_classification(acq.name,meta,config)
+                role,included,laser,codes=_classification(acq.name,meta,config,mouse_id=mouse.mouse_id,session_date=session_date)
                 if meta.experiment_date!=session_date: codes.append("session_xml_date_mismatch")
                 p=list(meta.pockels)+[None,None]; raw=acq/"Image_001_001.raw"
                 row={"mouse_id":mouse.mouse_id,"pipeline_enabled":mouse.pipeline_enabled,"pipeline_exclusion_reason":mouse.pipeline_exclusion_reason,"experimental_group":mouse.values["experimental_group"],"cohort":mouse.values["cohort"],"session_id":session.name,"acquisition_date":session_date,"discovery_layout":found.discovery_layout,"acquisition_id":acq.name,"source_path":str(acq.resolve()),"role":role,"analysis_included":included,"laser_nm":laser,"is_primary":laser==config.rig.primary_laser_nm and included,"xml_date":meta.experiment_date,"software_version":meta.software_version,"experiment_status":meta.experiment_status,"pixel_x":meta.pixel_x,"pixel_y":meta.pixel_y,"width_um":meta.width_um,"height_um":meta.height_um,"pixel_size_x_um":meta.pixel_width_um,"pixel_size_y_um":meta.pixel_height_um,"z_imaging_planes":meta.z_steps,"flyback_planes":meta.flyback_frames,"z_step_um":meta.z_step_um,"timepoints":meta.timepoints,"streaming_frames":meta.streaming_frames,"pockels_920_start_pct":p[0].start if p[0] else None,"pockels_920_stop_pct":p[0].stop if p[0] else None,"pockels_1050_start_pct":p[1].start if p[1] else None,"pockels_1050_stop_pct":p[1].stop if p[1] else None,"pockels_node_count":len(meta.pockels),"pmt_a_gain":meta.pmt_a_gain,"pmt_b_gain":meta.pmt_b_gain,"average_num":meta.average_num,"raw_image_path":str(raw.resolve()) if raw.exists() else "","is_vol10_control":False,"warnings":";".join(sorted(set(codes)))}
                 if not mouse.pipeline_enabled:
                     row.update({"analysis_included":False,"is_primary":False,"settings_qc_pass":None,"settings_qc_status":"not_applicable_pipeline_excluded","settings_qc_reason":f"pipeline excluded: {mouse.pipeline_exclusion_reason}","analysis_eligible":False})
                 elif not included:
-                    row.update({"settings_qc_pass": None, "settings_qc_status":"not_applicable", "settings_qc_reason": f"excluded: {role} acquisition is not used for analysis", "analysis_eligible": False})
+                    row.update({"settings_qc_pass": None, "settings_qc_status":"not_applicable", "settings_qc_reason": _policy_exclusion_reason(codes, laser) or f"excluded: {role} acquisition is not used for analysis", "analysis_eligible": False})
                 elif mouse.mouse_id.startswith("Fucci-") and mouse.mouse_id not in EXPECTED_ACQUISITION_SETTINGS:
                     row.update({"settings_qc_pass": None, "settings_qc_status":"not_configured", "settings_qc_reason": "no acquisition QC configuration for Fucci mouse", "analysis_eligible": False})
                 elif not mouse.mouse_id.startswith("Fucci-"):

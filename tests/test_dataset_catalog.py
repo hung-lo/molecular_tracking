@@ -8,14 +8,25 @@ from project_config import load_project_config
 
 FIX=Path(__file__).parent/"fixtures"/"thorimage"
 
-def _project(tmp_path):
+def _project(tmp_path, mouse_id="mouse_1"):
     raw=tmp_path/"raw"; derivatives=tmp_path/"derivatives"; raw.mkdir()
-    mice=tmp_path/"mice.csv"; mice.write_text("mouse_id,experimental_group,cohort,raw_mouse_folder,reference_session_or_folder\nmouse_1,group,cohort,folder,\n")
+    mice=tmp_path/"mice.csv"; mice.write_text(f"mouse_id,experimental_group,cohort,raw_mouse_folder,reference_session_or_folder\n{mouse_id},group,cohort,folder,\n")
     cfg=tmp_path/"project.toml"; cfg.write_text(f'''[paths]\nraw_root="{raw}"\nderivatives_root="{derivatives}"\nmice_csv="{mice}"\n[rig]\nprimary_laser_nm=1050\noptional_laser_nm=920\npockels_1_laser_nm=920\npockels_2_laser_nm=1050\nchan_a_signal="green"\nchan_b_signal="red"\n[canonical_volume]\nimaging_planes=41\nflyback_planes=1\nz_step_um=5.0\nvolumes=50\n''')
     return load_project_config(cfg),raw
 
 def _acq(root,session,name,fixture):
     path=root/"folder"/session/name; path.mkdir(parents=True,exist_ok=True); shutil.copy(FIX/fixture,path/"Experiment.xml")
+
+
+def _tri4_acq(root, session, name, power):
+    path = root / "folder" / session / name
+    path.mkdir(parents=True, exist_ok=True)
+    year, month, day = session.removeprefix("session_")[:4], session[-4:-2], session[-2:]
+    xml = (FIX / "square_1050.xml").read_text()
+    xml = xml.replace('date="08/19/2026', f'date="{month}/{day}/{year}')
+    xml = xml.replace('start="50" stop="50"', f'start="{power}" stop="{power}"')
+    xml = xml.replace('gainA="120" enableB="1" gainB="130"', 'gainA="10" enableB="1" gainB="10"')
+    (path / "Experiment.xml").write_text(xml)
 
 def test_discovery_uses_mouse_mapping_and_optional_920(tmp_path):
     config,raw=_project(tmp_path)
@@ -70,6 +81,64 @@ def test_unrelated_test_substrings_do_not_trigger_auxiliary_classification(tmp_p
     assert not report["errors"]
     assert rows[0]["role"] == "canonical"
     assert rows[0]["analysis_included"] is True
+
+
+def test_fucci_tri4_before_lp75_cutoff_is_audit_only(tmp_path):
+    config, raw = _project(tmp_path, "Fucci-Tri_4")
+    _tri4_acq(raw, "session_20260916", "field150_vol50", 70)
+    rows, report = discover_catalog(config)
+    row = rows[0]
+    assert row["role"] == "policy_excluded"
+    assert row["analysis_included"] is False
+    assert row["analysis_eligible"] is False
+    assert row["settings_qc_pass"] is None
+    assert row["settings_qc_status"] == "not_applicable"
+    assert not any(item["code"] == "settings_qc_failed" for item in report["row_ineligible"])
+
+
+def test_fucci_tri4_post_cutoff_lp70_is_policy_excluded(tmp_path):
+    config, raw = _project(tmp_path, "Fucci-Tri_4")
+    _tri4_acq(raw, "session_20260921", "field150_vol50", 70)
+    rows, report = discover_catalog(config)
+    row = rows[0]
+    assert row["role"] == "policy_excluded"
+    assert row["analysis_included"] is False
+    assert row["analysis_eligible"] is False
+    assert row["settings_qc_pass"] is None
+    assert "excluded_by_power_policy" in row["settings_qc_reason"]
+    assert not any(item["code"] == "settings_qc_failed" for item in report["row_ineligible"])
+
+
+def test_fucci_tri4_test_lp75_can_become_canonical(tmp_path):
+    config, raw = _project(tmp_path, "Fucci-Tri_4")
+    _tri4_acq(raw, "session_20260921", "field150_vol50_test_pockels75", 75)
+    rows, _ = discover_catalog(config)
+    row = rows[0]
+    assert row["role"] == "canonical"
+    assert row["analysis_included"] is True
+    assert row["settings_qc_pass"] is True
+    assert row["analysis_eligible"] is True
+
+
+def test_fucci_tri4_ordinary_lp75_is_canonical(tmp_path):
+    config, raw = _project(tmp_path, "Fucci-Tri_4")
+    _tri4_acq(raw, "session_20260928", "field150_vol50", 75)
+    rows, _ = discover_catalog(config)
+    row = rows[0]
+    assert row["role"] == "canonical"
+    assert row["analysis_included"] is True
+    assert row["settings_qc_pass"] is True
+    assert row["analysis_eligible"] is True
+
+
+def test_test_lp75_remains_auxiliary_for_other_mice(tmp_path):
+    config, raw = _project(tmp_path, "Fucci-Tri_3")
+    _tri4_acq(raw, "session_20260921", "field150_vol50_test_pockels75", 75)
+    rows, _ = discover_catalog(config)
+    row = rows[0]
+    assert row["role"] == "auxiliary_or_test"
+    assert row["analysis_included"] is False
+    assert row["settings_qc_pass"] is None
 
 
 def test_duplicate_canonical_acquisitions_remain_strict_errors(tmp_path):

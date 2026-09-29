@@ -21,7 +21,7 @@ REPORT_COLUMNS = [
 EXPECTED_ACQUISITION_SETTINGS: dict[str, dict[str, float]] = {
     "Fucci-Tri_1": {"pmt_gain_a": 10, "pmt_gain_b": 10, "laser_920_power": 50, "laser_1050_power": 50},
     "Fucci-Tri_3": {"pmt_gain_a": 10, "pmt_gain_b": 10, "laser_920_power": 60, "laser_1050_power": 60},
-    "Fucci-Tri_4": {"pmt_gain_a": 10, "pmt_gain_b": 10, "laser_920_power": 70, "laser_1050_power": 70},
+    "Fucci-Tri_4": {"pmt_gain_a": 10, "pmt_gain_b": 10, "laser_920_power": 75, "laser_1050_power": 75},
     "Fucci-Dead_1": {"pmt_gain_a": 10, "pmt_gain_b": 10, "laser_920_power": 70, "laser_1050_power": 70},
     "Fucci-Dead_2": {"pmt_gain_a": 10, "pmt_gain_b": 10, "laser_920_power": 70, "laser_1050_power": 70},
 }

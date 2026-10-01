@@ -511,6 +511,7 @@ molecular_tracking/
 | Run primary daywise workflow | `core/run_daywise_master_pipeline.py` |
 | Run graph matching directly | `matching/run_daywise_graph_matching.py` |
 | Evaluate canonical endpoints | `matching/evaluate_daywise_tracking.py` |
+| Evaluate opt-in image registration | `tools/evaluate_image_registration.py` |
 | Run conservative endpoint stitching | `matching/run_endpoint_stitching.py` |
 | Fucci/ECLIPSE postprocessing | `postprocessing/` |
 
@@ -526,6 +527,7 @@ Start with:
 - `docs/qc_interpretation.md` — matching QC interpretation
 - `docs/daywise_pipeline.md` — extraction, completeness, and trajectory rules
 - `docs/daywise_matcher_evaluator.md` — endpoint evaluator
+- `docs/image_registration_pilot.md` — experimental image affine/local registration and fallback checks
 - `docs/daywise_endpoint_stitching.md` — conservative stitcher and benchmark guardrail
 - `docs/output_schema.md` — CSV/output schemas
 - `docs/fucci_color_state_postprocessing.md` — Fucci/ECLIPSE postprocessing

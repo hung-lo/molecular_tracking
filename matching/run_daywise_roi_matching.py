@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import hashlib
 import importlib.metadata as metadata
@@ -32,7 +32,22 @@ from affine_overlap_matcher import (
     PairMatchResult,
     VoxelSpacing,
     extract_roi_features,
+    greedy_one_to_one,
     match_pair,
+)
+from image_registration import (
+    ImageTransform,
+    classify_identity_conflicts,
+    correspondence_changes,
+    fit_image_affine,
+    fit_smooth_field,
+    guard_reasons,
+    identity_conflicts,
+    identity_guard_reasons,
+    image_quality,
+    match_transformed_masks,
+    prepare_images,
+    restricted_transform,
 )
 from daywise_roi_matcher_qc_plots import DaywiseQCPlotConfig, generate_matching_qc
 from roi_track_graph import (
@@ -41,6 +56,8 @@ from roi_track_graph import (
     build_tracks_from_pair_tables,
     summarize_track_cycle_metadata,
 )
+
+REGISTRATION_MODES = ("legacy", "image_affine", "image_affine_local")
 
 PAIRWISE_SUMMARY_COLUMNS = [
     "day_a",
@@ -192,17 +209,79 @@ def _load_mask_stack(mask_path: Path) -> np.ndarray:
         return tifffile.imread(mask_path)
 
 
-def _match_pair_task(
-    task: tuple[str, str, int, str, str, AffineOverlapParams, VoxelSpacing, pd.DataFrame, pd.DataFrame],
-) -> tuple[str, str, PairMatchResult, float]:
+def _registered_pair_result(legacy, candidates, transform, features_a, features_b):
+    high = greedy_one_to_one(candidates, "high_rule")
+    balanced = greedy_one_to_one(candidates, "balanced_rule")
+    summary = dict(legacy.summary)
+    summary.update(
+        n_high=len(high), n_balanced=len(balanced),
+        high_frac_smaller=len(high)/min(len(features_a),len(features_b)),
+        balanced_frac_smaller=len(balanced)/min(len(features_a),len(features_b)),
+        refinement_method=transform.method, transform_method=transform.method,
+        transform_fallback_reason=transform.fallback_reason,
+    )
+    return PairMatchResult(candidates, high, balanced, summary, transform)
+
+
+def _pair_transform_row(transform, *, day_a, day_b, pair_gap):
+    """Project any selected transform into the stable legacy CSV schema."""
+
+    if isinstance(transform, ImageTransform):
+        matrix = np.asarray(transform.matrix, dtype=float)
+        offset = np.asarray(transform.offset, dtype=float)
+        values = {
+            "z_intercept": offset[0], "z_scale": matrix[0, 0],
+            "y_intercept": offset[1], "y_from_y": matrix[1, 1], "y_from_x": matrix[1, 2],
+            "x_intercept": offset[2], "x_from_y": matrix[2, 1], "x_from_x": matrix[2, 2],
+        }
+    else:
+        values = {
+            "z_intercept": transform.z_intercept, "z_scale": transform.z_scale,
+            "y_intercept": transform.y_intercept, "y_from_y": transform.y_from_y,
+            "y_from_x": transform.y_from_x, "x_intercept": transform.x_intercept,
+            "x_from_y": transform.x_from_y, "x_from_x": transform.x_from_x,
+        }
+    return {
+        "day_a": day_a, "day_b": day_b, "pair_gap": int(pair_gap),
+        **{key: float(value) for key, value in values.items()},
+        "method": str(transform.method), "fallback_reason": transform.fallback_reason,
+        "n_seed": int(transform.n_seed), "n_inlier": int(transform.n_inlier),
+        "residual_median_um": transform.residual_median_um,
+        "residual_p95_um": transform.residual_p95_um,
+    }
+
+
+def _save_image_transform(path: Path, transform: ImageTransform) -> None:
+    """Save a selected image transform without pickle/object-array state."""
+
+    flow = transform.flow if transform.flow is not None else np.empty((0,), dtype=np.float32)
+    flow_step = transform.flow_step if transform.flow_step is not None else np.empty((0,), dtype=float)
+    np.savez_compressed(
+        path,
+        matrix=np.asarray(transform.matrix, dtype=float),
+        offset=np.asarray(transform.offset, dtype=float),
+        flow=flow,
+        flow_step=flow_step,
+        has_flow=np.asarray(transform.flow is not None),
+        method=np.asarray(str(transform.method)),
+        fallback_reason=np.asarray(transform.fallback_reason or ""),
+        n_seed=np.asarray(int(transform.n_seed)),
+        n_inlier=np.asarray(int(transform.n_inlier)),
+        residual_median_um=np.asarray(transform.residual_median_um if transform.residual_median_um is not None else np.nan),
+        residual_p95_um=np.asarray(transform.residual_p95_um if transform.residual_p95_um is not None else np.nan),
+    )
+
+
+def _match_pair_task(task):
     """Run one independent pair calculation; return identifiers in task order."""
 
-    session_a, session_b, pair_gap, mask_path_a, mask_path_b, params, spacing, features_a, features_b = task
+    (session_a, session_b, pair_gap, mask_path_a, mask_path_b, red_path_a, red_path_b,
+     params, spacing, features_a, features_b, registration_mode, smoothing_um) = task
     pair_start_seconds = time.perf_counter()
     mask_a = _load_mask_stack(Path(mask_path_a))
     mask_b = _load_mask_stack(Path(mask_path_b))
     try:
-        result = match_pair(
+        legacy = match_pair(
             session_a=session_a,
             session_b=session_b,
             mask_a=mask_a,
@@ -213,10 +292,136 @@ def _match_pair_task(
             features_b=features_b,
             pair_gap=pair_gap,
         )
+        bundle = {"results":{"legacy":legacy}, "qc":{}, "conflicts":{}, "baseline_qc":None}
+        if registration_mode != "legacy":
+            if not red_path_a or not red_path_b:
+                raise ValueError(f"Image registration requires red images for {session_a} / {session_b}.")
+            red_a = tifffile.imread(red_path_a)
+            red_b = tifffile.imread(red_path_b)
+            if red_a.shape != mask_a.shape or red_b.shape != mask_b.shape:
+                raise ValueError("Red images and masks must share the same grid.")
+            image_a, image_b, step = prepare_images(red_a, red_b, spacing)
+            initial = restricted_transform(legacy.transform)
+            baseline = {"stage":"legacy", "n_matches":len(legacy.balanced_matches),
+                        "inverse_error_max_um":0., **image_quality(image_a,image_b,initial,step,spacing),
+                        **correspondence_changes(legacy.balanced_matches,legacy.balanced_matches)}
+            bundle["baseline_qc"] = baseline
+            affine, fit_info = fit_image_affine(image_a,image_b,initial,step)
+            candidates, _matches, inverse_error = match_transformed_masks(
+                mask_a,mask_b,features_a,features_b,affine,spacing, params=params)
+            affine_result = _registered_pair_result(legacy,candidates,affine,features_a,features_b)
+            affine_qc = {"stage":"image_affine", "n_matches":len(affine_result.balanced_matches),
+                         "inverse_error_max_um":inverse_error,
+                         **image_quality(image_a,image_b,affine,step,spacing),
+                         **correspondence_changes(legacy.balanced_matches,affine_result.balanced_matches)}
+            affine_reasons = guard_reasons(affine_qc,baseline)
+            if not fit_info["optimizer_success"]:
+                affine_reasons.append("affine_optimizer_not_converged")
+            affine_qc.update(transform_reasons=affine_reasons, optimizer_success=fit_info["optimizer_success"])
+            bundle["results"]["image_affine"] = affine_result
+            bundle["qc"]["image_affine"] = affine_qc
+            bundle["conflicts"]["image_affine"] = identity_conflicts(
+                legacy.balanced_matches,affine_result.balanced_matches)
+            if registration_mode == "image_affine_local" and not affine_reasons:
+                local = fit_smooth_field(image_a,image_b,affine,step,spacing,smoothing_um=smoothing_um)
+                candidates, _matches, inverse_error = match_transformed_masks(
+                    mask_a,mask_b,features_a,features_b,local,spacing, params=params)
+                local_result = _registered_pair_result(legacy,candidates,local,features_a,features_b)
+                local_qc = {"stage":"image_affine_local", "n_matches":len(local_result.balanced_matches),
+                            "inverse_error_max_um":inverse_error,
+                            **image_quality(image_a,image_b,local,step,spacing),
+                            **correspondence_changes(legacy.balanced_matches,local_result.balanced_matches)}
+                local_reasons = guard_reasons(local_qc,baseline)
+                if local_qc["heldout_ncc"] < affine_qc["heldout_ncc"]+.005:
+                    local_reasons.append("local_field_has_no_meaningful_image_gain")
+                local_qc.update(transform_reasons=local_reasons, optimizer_success=True)
+                bundle["results"]["image_affine_local"] = local_result
+                bundle["qc"]["image_affine_local"] = local_qc
+                bundle["conflicts"]["image_affine_local"] = identity_conflicts(
+                    legacy.balanced_matches,local_result.balanced_matches)
     finally:
         del mask_a
         del mask_b
-    return session_a, session_b, result, float(time.perf_counter() - pair_start_seconds)
+    return session_a, session_b, bundle, float(time.perf_counter() - pair_start_seconds)
+
+
+def _cycle_classified_conflicts(pair, stage, bundles, ordered_sessions):
+    conflicts = bundles[pair]["conflicts"][stage]
+    a, b = pair
+    index = {session:index for index,session in enumerate(ordered_sessions)}
+    if index[b] - index[a] != 1:
+        return conflicts
+    if index[b] + 1 < len(ordered_sessions):
+        c = ordered_sessions[index[b]+1]
+        if ((b,c) in bundles and (a,c) in bundles
+                and stage in bundles[(b,c)]["results"] and stage in bundles[(a,c)]["results"]):
+            bridge = bundles[(b,c)]["results"][stage].balanced_matches
+            direct = bundles[(a,c)]["results"][stage].balanced_matches
+            return classify_identity_conflicts(conflicts,bridge,direct,pair_role="ab")
+    if index[a] > 0:
+        previous = ordered_sessions[index[a]-1]
+        if ((previous,a) in bundles and (previous,b) in bundles
+                and stage in bundles[(previous,a)]["results"] and stage in bundles[(previous,b)]["results"]):
+            bridge = bundles[(previous,a)]["results"][stage].balanced_matches
+            direct = bundles[(previous,b)]["results"][stage].balanced_matches
+            return classify_identity_conflicts(conflicts,bridge,direct,pair_role="bc")
+    return conflicts
+
+
+def _select_registration_results(bundles, ordered_sessions, registration_mode, smoothing_um):
+    selected_results = {}; qc_rows = []; conflict_rows = []
+    order = [registration_mode, "image_affine", "legacy"]
+    order = list(dict.fromkeys(order))
+    for pair,bundle in bundles.items():
+        stage_reasons = {}
+        for stage,qc in bundle["qc"].items():
+            conflicts = _cycle_classified_conflicts(pair,stage,bundles,ordered_sessions)
+            bundle["conflicts"][stage] = conflicts
+            identity_reasons = identity_guard_reasons(qc,conflicts)
+            stage_reasons[stage] = list(dict.fromkeys(qc["transform_reasons"]+identity_reasons))
+            if not conflicts.empty:
+                changed = conflicts.copy()
+                changed.insert(0,"day_a",pair[0]); changed.insert(1,"day_b",pair[1])
+                changed.insert(2,"registration_stage",stage)
+                conflict_rows.append(changed)
+        selected = next(stage for stage in order
+                        if stage in bundle["results"] and not stage_reasons.get(stage,[]))
+        result = bundle["results"][selected]
+        failed = [reason for stage in order[:order.index(selected)] for reason in stage_reasons.get(stage,[f"{stage}_unavailable"])]
+        fallback_reason = ";".join(dict.fromkeys(failed))
+        if fallback_reason:
+            result.transform = replace(result.transform,fallback_reason=fallback_reason)
+        result.summary.update(transform_method=result.transform.method,
+                              transform_fallback_reason=result.transform.fallback_reason)
+        selected_results[pair] = result
+        baseline = bundle.get("baseline_qc") or {}
+        affine = bundle["qc"].get("image_affine",{})
+        local = bundle["qc"].get("image_affine_local",{})
+        selected_qc = bundle["qc"].get(selected,{})
+        qc_rows.append({
+            "day_a":pair[0], "day_b":pair[1],
+            "requested_registration_mode":registration_mode,
+            "selected_registration_stage":selected,
+            "smoothing_um":float(smoothing_um),
+            "affine_qc_pass":not stage_reasons.get("image_affine",["not_requested"]),
+            "local_qc_pass":not stage_reasons.get("image_affine_local",["not_requested"]),
+            "fallback_used":selected != registration_mode,
+            "fallback_reason":fallback_reason,
+            "image_correlation_before":baseline.get("heldout_ncc",np.nan),
+            "image_correlation_affine":affine.get("heldout_ncc",np.nan),
+            "image_correlation_local":local.get("heldout_ncc",np.nan),
+            "jacobian_p01":selected_qc.get("jacobian_p01",1.),
+            "jacobian_p99":selected_qc.get("jacobian_p99",1.),
+            "local_displacement_p99_um":selected_qc.get("displacement_p99_um",0.),
+            "round_trip_error_max_um":selected_qc.get("inverse_error_max_um",0.),
+            "direct_matches":len(result.balanced_matches),
+            "strong_existing_count":selected_qc.get("strong_existing_count",0),
+            "strong_retained_count":selected_qc.get("strong_retained_count",0),
+            "strong_reassigned_count":selected_qc.get("strong_reassigned_count",0),
+            "strong_lost_count":selected_qc.get("strong_lost_count",0),
+        })
+    conflicts = pd.concat(conflict_rows,ignore_index=True) if conflict_rows else pd.DataFrame()
+    return selected_results,pd.DataFrame(qc_rows),conflicts
 
 
 def _resolved_manifest_dataframe(records: list[SessionRecord]) -> pd.DataFrame:
@@ -267,10 +472,13 @@ def _fingerprint_run(
     params: AffineOverlapParams,
     spacing: VoxelSpacing,
     max_pair_gap: int,
+    registration_mode: str = "legacy",
+    registration_smoothing_um: float = 15.,
+    red_hashes: dict[str,str] | None = None,
 ) -> dict[str, object]:
     """Build a compact fingerprint for resume comparisons."""
 
-    return {
+    fingerprint = {
         "algorithm_version": MATCHER_ALGORITHM_VERSION,
         "manifest_hash": manifest_hash,
         "session_ids": [record.session_id for record in records],
@@ -279,6 +487,11 @@ def _fingerprint_run(
         "params": asdict(params),
         "max_pair_gap": int(max_pair_gap),
     }
+    if registration_mode != "legacy":
+        fingerprint.update(registration_mode=registration_mode,
+                           registration_smoothing_um=float(registration_smoothing_um),
+                           red_hashes=red_hashes or {})
+    return fingerprint
 
 
 def _normalize_pair_table(
@@ -335,6 +548,8 @@ def run_daywise_roi_matching(
     *,
     spacing: VoxelSpacing | None = None,
     params: AffineOverlapParams | None = None,
+    registration_mode: str = "legacy",
+    registration_smoothing_um: float = 15.,
     max_pair_gap: int = 2,
     pair_workers: int = 1,
     save_candidates: bool = False,
@@ -368,12 +583,24 @@ def run_daywise_roi_matching(
     pair_workers = int(pair_workers)
     spacing = spacing or VoxelSpacing()
     params = params or AffineOverlapParams()
+    registration_mode = str(registration_mode)
+    if registration_mode not in REGISTRATION_MODES:
+        raise ValueError(f"registration_mode must be one of {REGISTRATION_MODES}.")
+    if not np.isfinite(registration_smoothing_um) or float(registration_smoothing_um) < 5:
+        raise ValueError("registration_smoothing_um must be finite and >=5.")
+    registration_smoothing_um = float(registration_smoothing_um)
 
     stage_start_seconds = time.perf_counter()
     records = load_session_manifest(manifest_path)
     validate_manifest_for_matching(records)
     manifest_hash = _sha256_file(manifest_path)
     mask_hashes = {record.session_id: _sha256_file(record.mask_path) for record in records}
+    red_hashes = {}
+    if registration_mode != "legacy":
+        missing_red = [record.session_id for record in records if record.red_image_path is None]
+        if missing_red:
+            raise ValueError(f"Image registration requires red images: {', '.join(missing_red)}")
+        red_hashes = {record.session_id:_sha256_file(record.red_image_path) for record in records}
     fingerprint = _fingerprint_run(
         manifest_hash=manifest_hash,
         records=records,
@@ -381,6 +608,9 @@ def run_daywise_roi_matching(
         params=params,
         spacing=spacing,
         max_pair_gap=max_pair_gap,
+        registration_mode=registration_mode,
+        registration_smoothing_um=registration_smoothing_um,
+        red_hashes=red_hashes,
     )
     input_discovery_seconds = time.perf_counter() - stage_start_seconds
 
@@ -436,6 +666,8 @@ def run_daywise_roi_matching(
     feature_loading_seconds = time.perf_counter() - stage_start_seconds
 
     pair_results: dict[tuple[str, str], PairMatchResult] = {}
+    pair_bundles: dict[tuple[str, str], dict[str, object]] = {}
+    pair_elapsed: dict[tuple[str, str], float] = {}
     pair_summaries: list[dict[str, object]] = []
     pair_transforms: list[dict[str, object]] = []
     candidate_rows: list[pd.DataFrame] = []
@@ -455,10 +687,14 @@ def run_daywise_roi_matching(
                 pair_gap,
                 str(session_by_id[session_a].mask_path),
                 str(session_by_id[session_b].mask_path),
+                str(session_by_id[session_a].red_image_path) if session_by_id[session_a].red_image_path else "",
+                str(session_by_id[session_b].red_image_path) if session_by_id[session_b].red_image_path else "",
                 params,
                 spacing,
                 features_by_session[session_a],
                 features_by_session[session_b],
+                registration_mode,
+                registration_smoothing_um,
             ))
 
     stage_start_seconds = time.perf_counter()
@@ -469,41 +705,44 @@ def run_daywise_roi_matching(
         executor = ProcessPoolExecutor(max_workers=pair_workers)
         completed_pairs = executor.map(_match_pair_task, pair_tasks)
     try:
-        for session_a, session_b, result, pair_elapsed_seconds in completed_pairs:
-            pair_gap = int(session_by_id[session_b].session_index - session_by_id[session_a].session_index)
-            pair_results[(session_a, session_b)] = result
-            pair_summaries.append(result.summary | {"elapsed_sec": float(pair_elapsed_seconds)})
-            transform = result.transform
-            pair_transforms.append(
-                {
-                    "day_a": session_a,
-                    "day_b": session_b,
-                    "pair_gap": int(pair_gap),
-                    "z_intercept": float(transform.z_intercept),
-                    "z_scale": float(transform.z_scale),
-                    "y_intercept": float(transform.y_intercept),
-                    "y_from_y": float(transform.y_from_y),
-                    "y_from_x": float(transform.y_from_x),
-                    "x_intercept": float(transform.x_intercept),
-                    "x_from_y": float(transform.x_from_y),
-                    "x_from_x": float(transform.x_from_x),
-                    "method": str(transform.method),
-                    "fallback_reason": transform.fallback_reason,
-                    "n_seed": int(transform.n_seed),
-                    "n_inlier": int(transform.n_inlier),
-                    "residual_median_um": transform.residual_median_um,
-                    "residual_p95_um": transform.residual_p95_um,
-                }
-            )
-            if save_candidates:
-                candidate_df = result.candidates.copy()
-                candidate_df.insert(0, "day_a", session_a)
-                candidate_df.insert(1, "day_b", session_b)
-                candidate_df.insert(2, "pair_gap", int(pair_gap))
-                candidate_rows.append(candidate_df)
+        for session_a, session_b, bundle, pair_elapsed_seconds in completed_pairs:
+            key = (session_a, session_b)
+            pair_bundles[key] = bundle
+            pair_elapsed[key] = float(pair_elapsed_seconds)
     finally:
         if executor is not None:
             executor.shutdown()
+
+    pair_results, registration_qc, registration_conflicts = _select_registration_results(
+        pair_bundles, ordered_sessions, registration_mode, registration_smoothing_um,
+    )
+    transform_dir = output_dir / "registration_transforms"
+    qc_paths = []
+    if registration_mode != "legacy":
+        transform_dir.mkdir(parents=True, exist_ok=True)
+    for transform_index, (session_a, session_b) in enumerate(pair_results):
+        result = pair_results[(session_a, session_b)]
+        pair_gap = int(session_by_id[session_b].session_index - session_by_id[session_a].session_index)
+        pair_summaries.append(result.summary | {"elapsed_sec": pair_elapsed[(session_a, session_b)]})
+        pair_transforms.append(_pair_transform_row(result.transform, day_a=session_a, day_b=session_b, pair_gap=pair_gap))
+        if save_candidates:
+            candidate_df = result.candidates.copy()
+            candidate_df.insert(0, "day_a", session_a)
+            candidate_df.insert(1, "day_b", session_b)
+            candidate_df.insert(2, "pair_gap", int(pair_gap))
+            candidate_rows.append(candidate_df)
+        if registration_mode != "legacy" and isinstance(result.transform, ImageTransform):
+            transform_path = transform_dir / f"pair_{transform_index:04d}.npz"
+            _save_image_transform(transform_path, result.transform)
+            qc_paths.append((session_a, session_b, str(transform_path)))
+    if registration_mode != "legacy":
+        if not registration_qc.empty:
+            registration_qc["transform_path"] = ""
+            for session_a, session_b, transform_path in qc_paths:
+                selection = (registration_qc["day_a"].astype(str) == session_a) & (registration_qc["day_b"].astype(str) == session_b)
+                registration_qc.loc[selection, "transform_path"] = transform_path
+        registration_qc.to_csv(output_dir / "pairwise_registration_qc.csv", index=False)
+        registration_conflicts.to_csv(output_dir / "pairwise_registration_identity_conflicts.csv", index=False)
     pairwise_processing_seconds = time.perf_counter() - stage_start_seconds
 
     stage_start_seconds = time.perf_counter()
@@ -653,6 +892,8 @@ def run_daywise_roi_matching(
         "spacing": asdict(spacing),
         "params": asdict(params),
         "max_pair_gap": int(max_pair_gap),
+        "registration_mode": registration_mode,
+        "registration_smoothing_um": float(registration_smoothing_um),
         "pair_workers": pair_workers,
         "python_version": sys.version,
         "platform": platform.platform(),
@@ -710,6 +951,18 @@ def run_daywise_roi_matching(
             "pair_timings_seconds": pair_timings,
         },
     }
+    if registration_mode != "legacy":
+        run_log_payload.update(
+            {
+                "registration_qc_path": str(output_dir / "pairwise_registration_qc.csv"),
+                "registration_identity_conflicts_path": str(output_dir / "pairwise_registration_identity_conflicts.csv"),
+                "registration_transform_dir": str(transform_dir),
+                "registration_row_counts": {
+                    "pairwise_registration_qc": int(len(registration_qc)),
+                    "pairwise_registration_identity_conflicts": int(len(registration_conflicts)),
+                },
+            }
+        )
     _export_json(output_dir / "run_log.json", run_log_payload)
 
     if not skip_qc:
@@ -757,6 +1010,8 @@ def run_daywise_roi_matching(
         f"- Sessions: `{len(records)}`",
         f"- Pair gap limit: `{max_pair_gap}`",
         f"- Pair workers: `{pair_workers}`",
+        f"- Registration mode: `{registration_mode}`",
+        f"- Registration smoothing (um): `{registration_smoothing_um:g}`",
         "",
         "Output counts:",
         f"- High pairwise matches: `{len(pairwise_matches_high)}`",
@@ -781,6 +1036,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--z-um-per-plane", type=float, default=5.0, help="Z spacing in micrometers.")
     parser.add_argument("--max-pair-gap", type=int, default=2, help="Maximum allowed session gap for pairwise matching.")
     parser.add_argument("--pair-workers", type=int, default=1, help="Independent session-pair worker processes (default: 1).")
+    parser.add_argument("--registration-mode", choices=REGISTRATION_MODES, default="legacy", help="Pair registration method (default: legacy).")
+    parser.add_argument("--registration-smoothing-um", type=float, default=15.0, help="Local registration smoothing scale in micrometers.")
     parser.add_argument("--save-candidates", action="store_true", help="Write the full candidate table.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing output directory.")
     parser.add_argument("--resume", action="store_true", help="Reuse a prior exact-matching output directory when possible.")
@@ -805,6 +1062,8 @@ def main(argv: list[str] | None = None) -> Path:
         output_dir=args.output_dir,
         spacing=spacing,
         params=AffineOverlapParams(),
+        registration_mode=str(args.registration_mode),
+        registration_smoothing_um=float(args.registration_smoothing_um),
         max_pair_gap=args.max_pair_gap,
         pair_workers=args.pair_workers,
         save_candidates=bool(args.save_candidates),

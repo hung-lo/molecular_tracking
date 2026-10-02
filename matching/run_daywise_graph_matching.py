@@ -24,6 +24,7 @@ for _import_dir in (_REPO_ROOT / "core", _REPO_ROOT / "matching"):
         sys.path.append(_import_dir_str)
 
 from affine_overlap_matcher import AffineOverlapParams, PairMatchResult, RestrictedTransform, VoxelSpacing
+from image_registration import ImageTransform
 from daywise_roi_matcher_qc_plots import DaywiseQCPlotConfig, generate_matching_qc
 from match_policy_registry import DEFAULT_ANALYSIS_POLICIES, SUPPORTED_MATCH_POLICIES, resolve_requested_policies
 from roi_track_graph import (
@@ -37,6 +38,7 @@ from run_daywise_roi_matching import (
     PAIRWISE_MATCH_COLUMNS,
     PAIRWISE_SUMMARY_COLUMNS,
     PAIRWISE_TRANSFORM_COLUMNS,
+    REGISTRATION_MODES,
     run_daywise_roi_matching,
 )
 from spatial_graph_matcher import (
@@ -139,6 +141,30 @@ def _restricted_transform_from_row(row: pd.Series) -> RestrictedTransform:
     )
 
 
+def _image_transform_from_path(path: Path) -> ImageTransform:
+    """Load a selected production image transform without object deserialization."""
+
+    with np.load(path, allow_pickle=False) as payload:
+        flow = payload["flow"] if bool(payload["has_flow"].item()) else None
+        flow_step = payload["flow_step"] if flow is not None else None
+        method = str(payload["method"].item())
+        fallback = str(payload["fallback_reason"].item()) or None
+        residual_median = float(payload["residual_median_um"].item())
+        residual_p95 = float(payload["residual_p95_um"].item())
+        return ImageTransform(
+            matrix=payload["matrix"],
+            offset=payload["offset"],
+            flow=flow,
+            flow_step=flow_step,
+            method=method,
+            fallback_reason=fallback,
+            n_seed=int(payload["n_seed"].item()),
+            n_inlier=int(payload["n_inlier"].item()),
+            residual_median_um=None if not np.isfinite(residual_median) else residual_median,
+            residual_p95_um=None if not np.isfinite(residual_p95) else residual_p95,
+        )
+
+
 def _pair_result_from_outputs(
     *,
     day_a: str,
@@ -148,13 +174,19 @@ def _pair_result_from_outputs(
     pair_balanced: pd.DataFrame,
     pair_summary: pd.Series,
     pair_transform: pd.Series,
+    registration_qc: pd.Series | None = None,
 ) -> PairMatchResult:
     candidates = pair_candidates.copy().reset_index(drop=True)
     high_matches = pair_high.copy().reset_index(drop=True)
     balanced_matches = pair_balanced.copy().reset_index(drop=True)
     summary = pair_summary.to_dict()
     summary.update({"day_a": day_a, "day_b": day_b})
-    transform = _restricted_transform_from_row(pair_transform)
+    transform_path = "" if registration_qc is None else str(registration_qc.get("transform_path", ""))
+    selected_stage = "legacy" if registration_qc is None else str(registration_qc.get("selected_registration_stage", "legacy"))
+    if selected_stage != "legacy" and transform_path:
+        transform = _image_transform_from_path(Path(transform_path))
+    else:
+        transform = _restricted_transform_from_row(pair_transform)
     return PairMatchResult(candidates=candidates, high_matches=high_matches, balanced_matches=balanced_matches, summary=summary, transform=transform)
 
 
@@ -213,6 +245,8 @@ def run_daywise_graph_matching(
     spacing: VoxelSpacing | None = None,
     params: AffineOverlapParams | None = None,
     graph_params: SpatialGraphParams | None = None,
+    registration_mode: str = "legacy",
+    registration_smoothing_um: float = 15.0,
     max_pair_gap: int = 2,
     pair_workers: int = 1,
     overwrite: bool = False,
@@ -243,6 +277,8 @@ def run_daywise_graph_matching(
         output_dir=output_dir,
         spacing=spacing,
         params=params,
+        registration_mode=registration_mode,
+        registration_smoothing_um=registration_smoothing_um,
         max_pair_gap=max_pair_gap,
         pair_workers=pair_workers,
         save_candidates=True,
@@ -277,6 +313,7 @@ def run_daywise_graph_matching(
     pairwise_candidates = _load_csv(output_dir / "pairwise_candidates.csv")
     pairwise_high = _load_csv(output_dir / "pairwise_matches_high.csv")
     pairwise_balanced = _load_csv(output_dir / "pairwise_matches_balanced.csv")
+    pairwise_registration_qc = _load_csv(output_dir / "pairwise_registration_qc.csv")
 
     if pairwise_candidates.empty:
         raise FileNotFoundError("Graph runner requires pairwise_candidates.csv from the baseline run.")
@@ -288,6 +325,7 @@ def run_daywise_graph_matching(
     pairwise_high_by_pair = _pair_table_groups(pairwise_high)
     pairwise_balanced_by_pair = _pair_table_groups(pairwise_balanced)
     pairwise_summary_by_pair = _pair_table_groups(pairwise_summary)
+    pairwise_registration_qc_by_pair = _pair_table_groups(pairwise_registration_qc)
     graph_input_loading_seconds = time.perf_counter() - stage_start_seconds
 
     graph_tasks = []
@@ -300,6 +338,7 @@ def run_daywise_graph_matching(
         pair_summary_rows = pairwise_summary_by_pair.get((day_a, day_b))
         if pair_summary_rows is None or pair_summary_rows.empty:
             raise ValueError(f"Missing pairwise summary row for {day_a} -> {day_b}.")
+        pair_qc_rows = pairwise_registration_qc_by_pair.get((day_a, day_b), pairwise_registration_qc.iloc[0:0])
         baseline_result = _pair_result_from_outputs(
             day_a=day_a,
             day_b=day_b,
@@ -308,6 +347,7 @@ def run_daywise_graph_matching(
             pair_balanced=pair_balanced_table,
             pair_summary=pair_summary_rows.iloc[0],
             pair_transform=pd.Series(row._asdict()),
+            registration_qc=pair_qc_rows.iloc[0] if not pair_qc_rows.empty else None,
         )
         graph_tasks.append((
             day_a,
@@ -504,6 +544,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--z-um-per-plane", type=float, default=5.0, help="Z spacing in micrometers.")
     parser.add_argument("--max-pair-gap", type=int, default=2, help="Maximum allowed session gap for pairwise matching.")
     parser.add_argument("--pair-workers", type=int, default=1, help="Independent session-pair worker processes (default: 1).")
+    parser.add_argument("--registration-mode", choices=REGISTRATION_MODES, default="legacy", help="Pair registration method (default: legacy).")
+    parser.add_argument("--registration-smoothing-um", type=float, default=15.0, help="Local registration smoothing scale in micrometers.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing output directory.")
     parser.add_argument("--resume", action="store_true", help="Reuse a prior exact-matching output directory when possible.")
     parser.add_argument("--skip-qc", action="store_true", help="Skip automatic QC generation after graph matching.")
@@ -526,6 +568,8 @@ def main(argv: list[str] | None = None) -> Path:
         spacing=spacing,
         params=AffineOverlapParams(),
         graph_params=SpatialGraphParams(),
+        registration_mode=str(args.registration_mode),
+        registration_smoothing_um=float(args.registration_smoothing_um),
         max_pair_gap=args.max_pair_gap,
         pair_workers=args.pair_workers,
         overwrite=bool(args.overwrite),

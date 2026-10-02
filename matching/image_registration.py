@@ -26,6 +26,12 @@ class ImageTransform:
     offset: np.ndarray
     flow: np.ndarray | None = None
     flow_step: np.ndarray | None = None
+    method: str = "image_affine"
+    fallback_reason: str | None = None
+    n_seed: int = 0
+    n_inlier: int = 0
+    residual_median_um: float | None = None
+    residual_p95_um: float | None = None
 
     def __post_init__(self):
         self.matrix = np.asarray(self.matrix, dtype=float)
@@ -76,6 +82,7 @@ def restricted_transform(row):
         [[row.z_scale, 0, 0], [0, row.y_from_y, row.y_from_x],
          [0, row.x_from_y, row.x_from_x]],
         [row.z_intercept, row.y_intercept, row.x_intercept],
+        method=str(getattr(row, "method", "legacy")),
     )
 
 
@@ -163,7 +170,8 @@ def fit_image_affine(a, b, initial, step):
     offset = -correction @ (p[:, 0] - p[:, 1:] @ np.ones(3))
     correction = correction * step[:, None] / step[None, :]
     transform = ImageTransform(correction @ initial.matrix,
-                               correction @ initial.offset + offset * step)
+                               correction @ initial.offset + offset * step,
+                               method="image_affine")
     return transform, {"optimizer_success": bool(result.success), "optimizer_message": str(result.message),
                        "training_ncc": -float(result.fun), "evaluations": int(result.nfev)}
 
@@ -182,7 +190,7 @@ def fit_smooth_field(a, b, affine, step, spacing, *, smoothing_um=15.0):
     flow_step = step * extra
     sigma = smoothing_um / (flow_step * spacing.as_zyx_array())
     flow = np.array([ndi.gaussian_filter(v, sigma) for v in flow])
-    return replace(affine, flow=flow, flow_step=flow_step)
+    return replace(affine, flow=flow, flow_step=flow_step, method="image_affine_local")
 
 
 def image_quality(a, b, transform, step, spacing):
@@ -198,7 +206,8 @@ def image_quality(a, b, transform, step, spacing):
     quality = {"heldout_ncc": correlation(reference, moving), "sample_overlap": float(inside.mean()),
                "affine_det": float(np.linalg.det(transform.matrix)),
                "affine_singular_min": float(singular.min()), "affine_singular_max": float(singular.max()),
-               "jacobian_min": 1., "jacobian_p01": 1., "jacobian_p99": 1., "displacement_p99_um": 0.}
+               "jacobian_min": 1., "jacobian_p01": 1., "jacobian_p99": 1.,
+               "displacement_p50_um": 0., "displacement_p95_um": 0., "displacement_p99_um": 0.}
     if transform.flow is not None:
         # det(I + grad(u)) is the inverse local warp determinant, excluding affine.
         jac = np.empty((*transform.flow.shape[1:], 3, 3), dtype=np.float32)
@@ -208,23 +217,62 @@ def image_quality(a, b, transform, step, spacing):
         determinants = np.linalg.det(jac)
         lengths = np.linalg.norm(transform.flow * (transform.flow_step * spacing.as_zyx_array())[:,None,None,None], axis=0)
         quality.update(jacobian_min=float(determinants.min()), jacobian_p01=float(np.quantile(determinants,.01)),
-                       jacobian_p99=float(np.quantile(determinants,.99)), displacement_p99_um=float(np.quantile(lengths,.99)))
+                       jacobian_p99=float(np.quantile(determinants,.99)),
+                       displacement_p50_um=float(np.quantile(lengths,.50)),
+                       displacement_p95_um=float(np.quantile(lengths,.95)),
+                       displacement_p99_um=float(np.quantile(lengths,.99)))
     return quality
 
 
-def match_transformed_masks(mask_a, mask_b, features_a, features_b, transform, spacing):
+def match_transformed_masks(mask_a, mask_b, features_a, features_b, transform, spacing, *, params=None):
     """Reuse exact production gates and assignment; recompute overlap on A grid."""
+    params = params or AffineOverlapParams()
     warped = warp_volume(mask_b, transform, mask_a.shape, order=0)
     labels, counts = np.unique(warped, return_counts=True)
     warped_areas = pd.Series(counts, index=labels)
     overlap = build_sparse_overlap_table(mask_a, warped, np.zeros(3),
                                          features_a.area_voxels, warped_areas)
     candidates = generate_candidate_pairs(features_a, features_b, transform, np.zeros(3),
-                                         overlap, AffineOverlapParams(), spacing)
+                                         overlap, params, spacing)
     matches = greedy_one_to_one(candidates, "balanced_rule")
     points = features_b[["centroid_z", "centroid_y", "centroid_x"]].to_numpy()
     error = np.linalg.norm((transform.inverse(transform.apply(points))-points)*spacing.as_zyx_array(), axis=1)
     return candidates, matches, float(error.max(initial=0))
+
+
+def identity_conflicts(baseline, candidate):
+    """Return changed old strong assignments with old/new evidence side by side."""
+    anchors = baseline[(baseline.dice >= .65) & (baseline.distance_um <= 3)
+                       & (baseline.area_ratio >= .55) & (baseline.ambiguity <= .7)]
+    by_a = {int(row.label_a): row for row in candidate.itertuples(index=False)}
+    by_b = {int(row.label_b): row for row in candidate.itertuples(index=False)}
+    rows = []
+    for old in anchors.itertuples(index=False):
+        new = by_a.get(int(old.label_a))
+        new_roi_b = int(new.label_b) if new is not None else pd.NA
+        new_for_old_b = by_b.get(int(old.label_b))
+        if new is not None and int(new.label_b) == int(old.label_b):
+            continue
+        change_type = "reassigned" if new is not None or new_for_old_b is not None else "lost"
+        rows.append({
+            "roi_a": int(old.label_a), "old_roi_b": int(old.label_b), "new_roi_b": new_roi_b,
+            "new_roi_a_for_old_b": int(new_for_old_b.label_a) if new_for_old_b is not None else pd.NA,
+            "change_type": change_type,
+            "old_distance_um": float(old.distance_um), "new_distance_um": getattr(new, "distance_um", np.nan),
+            "old_dice": float(old.dice), "new_dice": getattr(new, "dice", np.nan),
+            "old_ambiguity": float(old.ambiguity), "new_ambiguity": getattr(new, "ambiguity", np.nan),
+            "old_local_image_support": getattr(old, "local_image_support", np.nan),
+            "new_local_image_support": getattr(new, "local_image_support", np.nan),
+            "cycle_support_old": pd.NA, "cycle_support_new": pd.NA,
+            "cycle_category": "cycle_not_available",
+        })
+    return pd.DataFrame(rows, columns=[
+        "roi_a", "old_roi_b", "new_roi_b", "new_roi_a_for_old_b", "change_type",
+        "old_distance_um", "new_distance_um", "old_dice", "new_dice",
+        "old_ambiguity", "new_ambiguity", "old_local_image_support",
+        "new_local_image_support", "cycle_support_old", "cycle_support_new",
+        "cycle_category",
+    ])
 
 
 def correspondence_changes(baseline, candidate):
@@ -232,14 +280,82 @@ def correspondence_changes(baseline, candidate):
     new = set(zip(candidate.label_a, candidate.label_b))
     # Strong existing matches are evidence, not ground truth. Audit conflicts;
     # never silently lock/union old and new assignments to inflate retention.
-    anchors = baseline[(baseline.dice >= .65) & (baseline.distance_um <= 3)
-                       & (baseline.area_ratio >= .55) & (baseline.ambiguity <= .7)]
-    anchor_pairs = set(zip(anchors.label_a, anchors.label_b))
-    ca = dict(new); cb = {b:a for a,b in new}
-    conflicts = sum((a in ca and ca[a] != b) or (b in cb and cb[b] != a) for a,b in anchor_pairs)
+    conflicts = identity_conflicts(baseline, candidate)
+    n_anchors = int(len(baseline[(baseline.dice >= .65) & (baseline.distance_um <= 3)
+                                  & (baseline.area_ratio >= .55) & (baseline.ambiguity <= .7)]))
+    reassigned = int((conflicts.change_type == "reassigned").sum()) if not conflicts.empty else 0
+    lost = int((conflicts.change_type == "lost").sum()) if not conflicts.empty else 0
+    retained = n_anchors - reassigned - lost
     return {"retained":len(original & new), "added":len(new-original), "lost":len(original-new),
-            "n_anchors":len(anchor_pairs), "anchors_retained":len(anchor_pairs & new),
-            "anchor_conflicts":conflicts}
+            "n_anchors":n_anchors, "anchors_retained":retained,
+            "anchor_conflicts":reassigned, "strong_existing_count":n_anchors,
+            "strong_retained_count":retained, "strong_reassigned_count":reassigned,
+            "strong_lost_count":lost, "strong_retention_pct":100*retained/max(n_anchors, 1),
+            "strong_reassignment_pct":100*reassigned/max(n_anchors, 1)}
+
+
+def classify_identity_conflicts(conflicts, bridge=None, direct=None, *, pair_role="ab"):
+    """Attach transparent A-B-C support labels without resolving conflicts."""
+    result = conflicts.copy()
+    if result.empty or bridge is None or direct is None or bridge.empty or direct.empty:
+        return result
+    direct_map = {int(row.label_a): int(row.label_b) for row in direct.itertuples(index=False)}
+    bridge_map = {int(row.label_a): int(row.label_b) for row in bridge.itertuples(index=False)}
+    if pair_role == "bc":
+        bridge_map = {b: a for a, b in bridge_map.items()}
+    categories = []
+    old_support = []
+    new_support = []
+    old_cycle = []
+    new_cycle = []
+    for row in result.itertuples(index=False):
+        if pair_role == "ab":
+            old_c = bridge_map.get(int(row.old_roi_b))
+            new_c = bridge_map.get(int(row.new_roi_b)) if pd.notna(row.new_roi_b) else None
+            direct_c = direct_map.get(int(row.roi_a))
+        else:
+            old_a = bridge_map.get(int(row.old_roi_b))
+            new_a = bridge_map.get(int(row.new_roi_b)) if pd.notna(row.new_roi_b) else None
+            old_c = direct_map.get(old_a) if old_a is not None else None
+            new_c = direct_map.get(new_a) if new_a is not None else None
+            direct_c = old_c if old_c is not None else new_c
+        old_ok = old_c is not None and direct_c is not None and old_c == direct_c
+        new_ok = new_c is not None and direct_c is not None and new_c == direct_c
+        if direct_c is None:
+            category = "ambiguous"
+        elif old_ok and new_ok:
+            category = "both_cycle_consistent"
+        elif new_ok:
+            category = "new_supported_by_cycle"
+        elif old_ok:
+            category = "old_supported_by_cycle"
+        else:
+            category = "neither_cycle_consistent"
+        categories.append(category); old_support.append(old_ok); new_support.append(new_ok)
+        old_cycle.append(old_c); new_cycle.append(new_c)
+    result["cycle_support_old"] = old_support
+    result["cycle_support_new"] = new_support
+    result["cycle_old_roi_c"] = old_cycle
+    result["cycle_new_roi_c"] = new_cycle
+    result["cycle_category"] = categories
+    return result
+
+
+def identity_guard_reasons(row, conflicts):
+    """Conservatively reject widespread or independently contradicted changes."""
+    if not row.get("n_anchors", 0):
+        return []
+    changed = int(row.get("strong_reassigned_count", 0)) + int(row.get("strong_lost_count", 0))
+    reasons = []
+    if changed > max(1., .02 * row["n_anchors"]):
+        reasons.append("strong_identity_disruption_widespread")
+    categories = set(conflicts.get("cycle_category", [])) if not conflicts.empty else set()
+    if categories & {"old_supported_by_cycle", "neither_cycle_consistent", "ambiguous"}:
+        reasons.append("cycle_contradicts_changed_identity")
+    if row.get("strong_retention_pct", 100.) < 99. and not categories.issubset(
+            {"new_supported_by_cycle", "both_cycle_consistent"}):
+        reasons.append("strong_match_retention_below_99pct")
+    return reasons
 
 
 def guard_reasons(row, baseline):
@@ -257,6 +373,4 @@ def guard_reasons(row, baseline):
         reasons.append("displacement_or_inverse_error")
     if row["n_matches"] < baseline["n_matches"]:
         reasons.append("match_count_decreased")
-    if row["anchor_conflicts"] or row["anchors_retained"] < .99*row["n_anchors"]:
-        reasons.append("confident_identity_changed_or_lost")
     return reasons

@@ -60,7 +60,7 @@ from affine_overlap_matcher import AffineOverlapParams, VoxelSpacing
 from analysis_paths import get_dataset_analysis_dir, resolve_dataset_dir
 from acquisition_settings_qc import acquisition_settings_qc, acquisition_settings_qc_table, write_acquisition_settings_qc_artifacts
 from project_cli import catalog_path, catalog_spacing, file_sha256, manifest_plan_path, ready_manifest_path, resolve_selection, selected_catalog_rows, selected_mouse_metadata
-from run_daywise_graph_matching import run_daywise_graph_matching
+from run_daywise_graph_matching import REGISTRATION_MODES, run_daywise_graph_matching
 from run_daywise_matched_roi_pipeline import (
     DaywiseMatchedPipelineConfig,
     run_daywise_matched_roi_pipeline,
@@ -95,6 +95,8 @@ class MasterPipelineConfig:
     z_um_per_plane: float = 5.0
     max_pair_gap: int = 2
     pair_workers: int = 1
+    registration_mode: str = "legacy"
+    registration_smoothing_um: float = 15.0
     green_dark: float = 319.0
     red_dark: float = 534.0
     epsilon: float = 1.0
@@ -319,6 +321,7 @@ def _default_run_name(
     dataset_dir: Path,
     manifest_meta: dict[str, Any],
     selection: SessionSelection | None = None,
+    registration_mode: str = "legacy",
 ) -> str:
     first_date = manifest_meta["first_date"].strftime("%Y%m%d")
     last_date = manifest_meta["last_date"].strftime("%Y%m%d")
@@ -326,9 +329,10 @@ def _default_run_name(
     selector_suffix = ""
     if selection is not None and selection.mode != "all":
         selector_suffix = f"_{selection.mode}{n_sessions}"
+    registration_suffix = "" if registration_mode == "legacy" else f"_{registration_mode}"
     return _safe_name(
         f"{dataset_dir.name}_{first_date}_to_{last_date}_{n_sessions}s"
-        f"{selector_suffix}_graph_affine_balanced"
+        f"{selector_suffix}_graph_affine_balanced{registration_suffix}"
     )
 
 
@@ -350,7 +354,7 @@ def _prepare_run_directory(
     if selection is None:
         selection = _parse_session_selection(config.sessions)
     run_name = _safe_name(
-        config.run_name or _default_run_name(dataset_dir, manifest_meta, selection)
+        config.run_name or _default_run_name(dataset_dir, manifest_meta, selection, config.registration_mode)
     )
     run_dir = output_root / run_name
 
@@ -1040,6 +1044,8 @@ def _write_master_summary(
         f"- Sessions used: `{selected_meta['n_sessions']} / {source_meta['n_sessions']}`",
         f"- Selected session IDs: `{selected_ids}`",
         f"- Final assignment policy: `graph`",
+        f"- Registration mode: `{config.registration_mode}`",
+        f"- Registration smoothing (um): `{float(config.registration_smoothing_um):g}`",
         f"- Agreement comparison policy: `balanced` affine-overlap",
         f"- Acquisition settings QC: `{acquisition_status}`",
         "",
@@ -1235,6 +1241,8 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         output_dir=match_dir,
         spacing=spacing,
         params=AffineOverlapParams(),
+        registration_mode=str(config.registration_mode),
+        registration_smoothing_um=float(config.registration_smoothing_um),
         max_pair_gap=int(config.max_pair_gap),
         pair_workers=int(config.pair_workers),
         overwrite=bool(config.overwrite),
@@ -1489,6 +1497,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--z-um-per-plane", type=float, default=None)
     parser.add_argument("--max-pair-gap", type=int, default=2)
     parser.add_argument("--pair-workers", type=int, default=1)
+    parser.add_argument("--registration-mode", choices=REGISTRATION_MODES, default="legacy")
+    parser.add_argument("--registration-smoothing-um", type=float, default=15.0)
     parser.add_argument("--green-dark", type=float, default=319.0)
     parser.add_argument("--red-dark", type=float, default=534.0)
     parser.add_argument("--epsilon", type=float, default=1.0)
@@ -1582,6 +1592,8 @@ def main(argv: list[str] | None = None) -> Path:
         z_um_per_plane=args.z_um_per_plane,
         max_pair_gap=args.max_pair_gap,
         pair_workers=args.pair_workers,
+        registration_mode=str(args.registration_mode),
+        registration_smoothing_um=float(args.registration_smoothing_um),
         green_dark=args.green_dark,
         red_dark=args.red_dark,
         epsilon=args.epsilon,

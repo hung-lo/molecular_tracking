@@ -26,6 +26,17 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 .venv/bin/python \
   --workers 3
 ```
 
+Run a smoothing-scale robustness sweep with the same pair list:
+
+```bash
+.venv/bin/python tools/evaluate_image_registration.py \
+  --pairs pairs.csv --output analysis/image_registration_robustness \
+  --smoothing-grid 10 15 20 25 --workers 3
+```
+
+This writes one result folder per scale and combines the requested fields in
+`robustness_summary.csv`.
+
 The matching directory must contain `session_manifest_resolved.csv`,
 `roi_features.csv`, `pairwise_transforms.csv`, and saved graph or balanced pairwise
 matches. Native masks must still agree with the saved features. Voxel spacing is
@@ -59,12 +70,11 @@ inverting the inverse displacement field, with round-trip error checked.
 Each `pair_NNN` directory records input provenance, stage-specific candidate and
 match CSVs, transform NPZs, QC metrics, optimization status, and a separate
 `guarded_matches.csv`. The root `summary.csv` collects completed pairs.
-When the requested pairs include A-B and B-C, `cycle_audit_summary.csv` and
-`cycle_audit_details.csv` compare their compositions against saved high-confidence
-A-C matches. That reference still uses production registration and is not ground
-truth; evaluate A-C with the same experimental method for an independent
-three-pair consistency test. Cycle results are reported, not silently used to
-alter the pairwise fallback selection.
+Each non-baseline stage also writes `*_identity_conflicts.csv`, including old/new
+ROI evidence and any available cycle classification. When independently evaluated
+A-B, B-C, and A-C pairs are present, `cycle_audit_summary.csv` and
+`cycle_audit_details.csv` use that three-pair result; otherwise the saved A-C
+comparison is audit-only and is not treated as identity ground truth.
 
 The experimental guard requires:
 
@@ -76,16 +86,17 @@ The experimental guard requires:
   0.5–2.0;
 - 99th-percentile local displacement at most 25 um and maximum centroid
   round-trip error at most 0.25 um;
-- no reassignment of a strong existing correspondence and at least 99% retention
-  of strong existing correspondences;
 - optimizer convergence; and for the local field, at least 0.005 additional
   image correlation over image-affine registration.
 
 Strong correspondences have baseline Dice >=0.65, distance <=3 um, native size
-ratio >=0.55, and ambiguity <=0.7. Their number is reported: very few anchors
-provide weak assurance even if all survive. The guard does not union or forcibly
-lock old identities into new assignments. It selects the most refined eligible
-stage, falling back to the original matches if necessary.
+ratio >=0.55, and ambiguity <=0.7. Registration/deformation QC is kept separate
+from identity auditing. Old strong matches are not ground truth: a changed old
+assignment is recorded, not forcibly restored. The guard rejects widespread
+identity disruption; it also rejects a sub-99% strong-match retention or a changed
+identity contradicted by an available independent cycle, unless the changed
+assignment is explicitly supported by that cycle. It selects the most refined
+eligible stage, falling back to the original matches if necessary.
 
 These are engineering QC bounds, not validated biological accuracy thresholds.
 Correlation is measured on 30,000 fixed evaluation pixels distinct from the

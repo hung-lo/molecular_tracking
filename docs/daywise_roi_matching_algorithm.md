@@ -31,3 +31,29 @@ one-to-one assignments.
 - `track_length_summary.csv`
 
 See `README.md` for the CLI commands.
+
+## Optional image registration
+
+The production runners keep the mask-only path as the default and expose the validated
+red-anatomy registration as an opt-in mode:
+
+```bash
+.venv/bin/python matching/run_daywise_graph_matching.py \
+  --manifest path/to/session_manifest.csv \
+  --output-dir path/to/output \
+  --registration-mode image_affine_local \
+  --registration-smoothing-um 15
+```
+
+`legacy`, `image_affine`, and `image_affine_local` are supported. The image modes fit
+geometry from the red volume, resample masks with nearest-neighbor interpolation, and
+reuse the existing candidate and graph thresholds. Affine/local QC can fall back to the
+next safe stage; the selected stage and reason are recorded in
+`pairwise_registration_qc.csv` and `pairwise_registration_identity_conflicts.csv`.
+Selected image transforms are stored under `registration_transforms/`. Registration
+mode, smoothing, and red-image hashes participate in the run fingerprint, so a legacy
+output cannot be resumed as an image-registration run.
+
+The master runner accepts the same `--registration-mode` and
+`--registration-smoothing-um` options. Its default run naming preserves existing legacy
+names and adds the selected non-legacy mode to new run names.

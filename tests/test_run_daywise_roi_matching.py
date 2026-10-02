@@ -8,7 +8,9 @@ import numpy as np
 import pandas as pd
 import tifffile
 
+import run_daywise_roi_matching as runner
 from affine_overlap_matcher import AffineOverlapParams, VoxelSpacing
+from image_registration import ImageTransform
 from run_daywise_roi_matching import run_daywise_roi_matching
 
 
@@ -136,3 +138,85 @@ def test_pair_workers_preserve_exact_scientific_outputs(tmp_path: Path) -> None:
     run_log = json.loads((outputs[1] / "run_log.json").read_text(encoding="utf-8"))
     assert run_log["pair_workers"] == 2
     assert len(run_log["runtime_profile"]["pair_timings_seconds"]) == 3
+
+
+def test_image_registration_mode_exports_qc_and_preserves_native_inputs(tmp_path: Path, monkeypatch) -> None:
+    shape = (9, 36, 36)
+    mask = np.zeros(shape, dtype=np.uint16)
+    mask[1:3, 4:7, 4:7] = 1
+    mask[4:6, 16:19, 16:19] = 2
+    mask[6:8, 28:31, 28:31] = 3
+    red = np.random.default_rng(7).normal(size=shape).astype(np.float32)
+    manifest_rows = []
+    for index, day in enumerate(("20260511", "20260512")):
+        mask_path = tmp_path / f"{day}_mask.tif"
+        red_path = tmp_path / f"{day}_red.tif"
+        _write_stack(mask_path, mask)
+        tifffile.imwrite(red_path, red)
+        manifest_rows.append({
+            "session_index": index,
+            "session_id": day,
+            "acquisition_date": f"2026-05-{11 + index:02d}",
+            "mask_path": str(mask_path),
+            "red_image_path": str(red_path),
+            "green_image_path": "",
+            "required": True,
+        })
+    manifest_path = tmp_path / "image_manifest.csv"
+    pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False)
+    before_mask = {path.name: path.read_bytes() for path in tmp_path.glob("*_mask.tif")}
+    before_red = {path.name: path.read_bytes() for path in tmp_path.glob("*_red.tif")}
+
+    def fake_fit(_a, _b, initial, _step):
+        return ImageTransform(np.eye(3), np.zeros(3), method="image_affine"), {"optimizer_success": True}
+
+    def fake_local(_a, _b, affine, _step, _spacing, *, smoothing_um):
+        assert smoothing_um == 15.0
+        return ImageTransform(affine.matrix, affine.offset, method="image_affine_local")
+
+    def fake_quality(_a, _b, transform, _step, _spacing):
+        return {
+                "heldout_ncc": 1.01 if transform.method == "image_affine_local" else 1.0,
+            "sample_overlap": 1.0,
+            "affine_det": 1.0,
+            "affine_singular_min": 1.0,
+            "affine_singular_max": 1.0,
+            "jacobian_min": 1.0,
+            "jacobian_p01": 1.0,
+            "jacobian_p99": 1.0,
+            "displacement_p50_um": 0.0,
+            "displacement_p95_um": 0.0,
+            "displacement_p99_um": 0.0,
+        }
+
+    monkeypatch.setattr(runner, "fit_image_affine", fake_fit)
+    monkeypatch.setattr(runner, "fit_smooth_field", fake_local)
+    monkeypatch.setattr(runner, "image_quality", fake_quality)
+    output_dir = run_daywise_roi_matching(
+        manifest_path=manifest_path,
+        output_dir=tmp_path / "image_out",
+        registration_mode="image_affine_local",
+        registration_smoothing_um=15.0,
+        save_candidates=True,
+        overwrite=True,
+        skip_qc=True,
+    )
+
+    qc = pd.read_csv(output_dir / "pairwise_registration_qc.csv")
+    assert qc.loc[0, "selected_registration_stage"] == "image_affine_local"
+    assert qc.loc[0, "fallback_used"] is False or not bool(qc.loc[0, "fallback_used"])
+    assert Path(qc.loc[0, "transform_path"]).exists()
+    run_log = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
+    assert run_log["registration_mode"] == "image_affine_local"
+    assert run_log["registration_smoothing_um"] == 15.0
+    assert before_mask == {path.name: path.read_bytes() for path in tmp_path.glob("*_mask.tif")}
+    assert before_red == {path.name: path.read_bytes() for path in tmp_path.glob("*_red.tif")}
+
+    with pytest.raises(FileExistsError):
+        run_daywise_roi_matching(
+            manifest_path=manifest_path,
+            output_dir=output_dir,
+            registration_mode="legacy",
+            resume=True,
+            skip_qc=True,
+        )

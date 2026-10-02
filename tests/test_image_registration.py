@@ -6,6 +6,7 @@ from scipy import ndimage as ndi
 from affine_overlap_matcher import VoxelSpacing, extract_roi_features
 from image_registration import (
     ImageTransform, warp_volume, match_transformed_masks, correspondence_changes,
+    identity_conflicts, classify_identity_conflicts, identity_guard_reasons,
     guard_reasons, prepare_images, fit_image_affine, fit_smooth_field, image_quality,
 )
 
@@ -51,11 +52,25 @@ def test_guard_detects_identity_swap_even_when_match_count_increases():
     row=dict(heldout_ncc=.9,sample_overlap=.99,n_matches=3,affine_singular_min=1.,affine_singular_max=1.,
              jacobian_min=1.,jacobian_p01=1.,jacobian_p99=1.,displacement_p99_um=2.,inverse_error_max_um=0.,**changes)
     assert changes['anchor_conflicts']==2
-    assert 'confident_identity_changed_or_lost' in guard_reasons(row,baseline)
+    assert guard_reasons(row,baseline)==[]
+    assert 'strong_identity_disruption_widespread' in identity_guard_reasons(
+        row, identity_conflicts(base, candidate))
     row.update(**correspondence_changes(base,base),n_matches=2)
     assert guard_reasons(row,baseline)==[]
+    assert identity_guard_reasons(row, identity_conflicts(base,base))==[]
     row['jacobian_min']=-.1
     assert 'local_distortion' in guard_reasons(row,baseline)
+
+
+def test_cycle_supported_identity_change_is_audit_only():
+    base=pd.DataFrame(dict(label_a=[1],label_b=[11],dice=[.9],distance_um=[1.],area_ratio=[1.],ambiguity=[.1]))
+    candidate=pd.DataFrame(dict(label_a=[1],label_b=[12]))
+    bridge=pd.DataFrame(dict(label_a=[11,12],label_b=[101,102]))
+    direct=pd.DataFrame(dict(label_a=[1],label_b=[102]))
+    conflicts=classify_identity_conflicts(identity_conflicts(base,candidate),bridge,direct)
+    assert conflicts.iloc[0].cycle_category == 'new_supported_by_cycle'
+    row=correspondence_changes(base,candidate)
+    assert identity_guard_reasons(row, conflicts)==[]
 
 
 def test_image_affine_uses_structure_and_corrects_known_residual():

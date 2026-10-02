@@ -44,6 +44,8 @@ def test_run_daywise_master_pipeline_parse_args_and_defaults() -> None:
     assert args.resume is False
     assert args.sessions is None
     assert args.pair_workers == 1
+    assert args.registration_mode == "image_affine_local"
+    assert args.registration_smoothing_um == 15.0
     assert args.skip_ranked_roi_views is False
     assert args.ranked_roi_z_radius == 3
     assert args.render_z_radius == 0
@@ -77,6 +79,8 @@ def test_run_daywise_master_pipeline_config_defaults() -> None:
     assert config.ranked_roi_z_radius == 3
     assert config.render_z_radius == 0
     assert config.pair_workers == 1
+    assert config.registration_mode == "image_affine_local"
+    assert config.registration_smoothing_um == 15.0
 
 
 def _build_records(tmp_path: Path, count: int = 6) -> list[SessionRecord]:
@@ -226,7 +230,7 @@ def test_subset_default_run_names_reflect_selected_scope(tmp_path: Path) -> None
     assert "20260511_to_20260513_3s_first3" in first_name
     assert "20260514_to_20260516_3s_last3" in last_name
     assert first_name != last_name
-    assert all_name == "dataset_20260511_to_20260516_6s_graph_affine_balanced"
+    assert all_name == "dataset_20260511_to_20260516_6s_graph_affine_balanced_image_affine_local"
 
 
 def test_selected_manifest_reindexes_and_preserves_resolved_paths(tmp_path: Path) -> None:

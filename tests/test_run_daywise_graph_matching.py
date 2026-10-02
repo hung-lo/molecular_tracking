@@ -11,7 +11,7 @@ import tifffile
 
 import run_daywise_graph_matching as graph_runner
 import run_daywise_roi_matching as affine_runner
-from run_daywise_graph_matching import _affine_git_commit_from_log, _pair_table_groups, run_daywise_graph_matching
+from run_daywise_graph_matching import _affine_git_commit_from_log, _pair_table_groups, parse_args, run_daywise_graph_matching
 from tools.compare_matcher_outputs import compare_matcher_outputs
 
 
@@ -32,6 +32,12 @@ def _build_dataset(tmp_path: Path) -> Path:
         writer.writerow({"session_index": 1, "session_id": "20260512", "acquisition_date": "2026-05-12", "mask_path": str(tmp_path / "20260512_mask.tif"), "red_image_path": "", "green_image_path": "", "required": "true"})
         writer.writerow({"session_index": 2, "session_id": "20260513", "acquisition_date": "2026-05-13", "mask_path": str(tmp_path / "20260513_mask.tif"), "red_image_path": "", "green_image_path": "", "required": "true"})
     return manifest_path
+
+
+def test_graph_registration_defaults_to_local_image_mode() -> None:
+    args = parse_args(["--manifest", "manifest.csv", "--output-dir", "out"])
+    assert args.registration_mode == "image_affine_local"
+    assert args.registration_smoothing_um == 15.0
 
 
 def test_run_daywise_graph_matching_exports_graph_tables(tmp_path: Path, monkeypatch) -> None:

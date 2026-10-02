@@ -73,6 +73,23 @@ def test_cycle_supported_identity_change_is_audit_only():
     assert identity_guard_reasons(row, conflicts)==[]
 
 
+@pytest.mark.parametrize(
+    ("direct_label", "expected"),
+    [(20, "new_supported_by_cycle"), (101, "old_supported_by_cycle"), (30, "ambiguous")],
+)
+def test_bc_cycle_identity_conflict_uses_b_label_for_bridge(direct_label, expected):
+    baseline = pd.DataFrame(dict(label_a=[10], label_b=[101], dice=[.9], distance_um=[1.], area_ratio=[1.], ambiguity=[.1]))
+    candidate = pd.DataFrame(dict(label_a=[10], label_b=[20]))
+    bridge_ab = pd.DataFrame(dict(label_a=[1], label_b=[10]))
+    direct_ac = pd.DataFrame(dict(label_a=[1 if direct_label != 30 else 2], label_b=[direct_label]))
+
+    conflicts = classify_identity_conflicts(
+        identity_conflicts(baseline, candidate), bridge_ab, direct_ac, pair_role="bc"
+    )
+
+    assert conflicts.iloc[0].cycle_category == expected
+
+
 def test_image_affine_uses_structure_and_corrects_known_residual():
     rng=np.random.default_rng(4)
     a=ndi.gaussian_filter(rng.normal(size=(17,40,48)).astype(np.float32),1)

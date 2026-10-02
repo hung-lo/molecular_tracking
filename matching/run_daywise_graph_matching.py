@@ -24,7 +24,12 @@ for _import_dir in (_REPO_ROOT / "core", _REPO_ROOT / "matching"):
         sys.path.append(_import_dir_str)
 
 from affine_overlap_matcher import AffineOverlapParams, PairMatchResult, RestrictedTransform, VoxelSpacing
-from image_registration import ImageTransform
+from image_registration import (
+    DEFAULT_LOCAL_SMOOTHING_UM,
+    DEFAULT_REGISTRATION_MODE,
+    REGISTRATION_MODES,
+    ImageTransform,
+)
 from daywise_roi_matcher_qc_plots import DaywiseQCPlotConfig, generate_matching_qc
 from match_policy_registry import DEFAULT_ANALYSIS_POLICIES, SUPPORTED_MATCH_POLICIES, resolve_requested_policies
 from roi_track_graph import (
@@ -38,7 +43,6 @@ from run_daywise_roi_matching import (
     PAIRWISE_MATCH_COLUMNS,
     PAIRWISE_SUMMARY_COLUMNS,
     PAIRWISE_TRANSFORM_COLUMNS,
-    REGISTRATION_MODES,
     run_daywise_roi_matching,
 )
 from spatial_graph_matcher import (
@@ -245,8 +249,8 @@ def run_daywise_graph_matching(
     spacing: VoxelSpacing | None = None,
     params: AffineOverlapParams | None = None,
     graph_params: SpatialGraphParams | None = None,
-    registration_mode: str = "legacy",
-    registration_smoothing_um: float = 15.0,
+    registration_mode: str = DEFAULT_REGISTRATION_MODE,
+    registration_smoothing_um: float = DEFAULT_LOCAL_SMOOTHING_UM,
     max_pair_gap: int = 2,
     pair_workers: int = 1,
     overwrite: bool = False,
@@ -544,8 +548,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--z-um-per-plane", type=float, default=5.0, help="Z spacing in micrometers.")
     parser.add_argument("--max-pair-gap", type=int, default=2, help="Maximum allowed session gap for pairwise matching.")
     parser.add_argument("--pair-workers", type=int, default=1, help="Independent session-pair worker processes (default: 1).")
-    parser.add_argument("--registration-mode", choices=REGISTRATION_MODES, default="legacy", help="Pair registration method (default: legacy).")
-    parser.add_argument("--registration-smoothing-um", type=float, default=15.0, help="Local registration smoothing scale in micrometers.")
+    parser.add_argument("--registration-mode", choices=REGISTRATION_MODES, default=DEFAULT_REGISTRATION_MODE, help=f"Pair registration method (default: {DEFAULT_REGISTRATION_MODE}).")
+    parser.add_argument("--registration-smoothing-um", type=float, default=DEFAULT_LOCAL_SMOOTHING_UM, help="Local registration smoothing scale in micrometers.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing output directory.")
     parser.add_argument("--resume", action="store_true", help="Reuse a prior exact-matching output directory when possible.")
     parser.add_argument("--skip-qc", action="store_true", help="Skip automatic QC generation after graph matching.")

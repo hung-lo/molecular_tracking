@@ -1,10 +1,10 @@
-# Opt-in image registration pilot
+# Image registration pilot and production comparison
 
 `tools/evaluate_image_registration.py` evaluates a full 3D affine and a smooth
-local displacement field against existing saved pairwise matches. It does not
-change the primary pipeline, segmentation, fluorescence measurements, graph
-tracks, or production defaults. Results are experimental **pairwise** assignments,
-not a replacement longitudinal identity product.
+local displacement field against existing saved pairwise matches. Production
+runners use `image_affine_local` by default with guarded fallback to affine and
+then legacy; this evaluator remains a separate **pairwise** comparison tool, not
+a replacement for longitudinal graph validation.
 
 ## Run
 
@@ -96,7 +96,12 @@ assignment is recorded, not forcibly restored. The guard rejects widespread
 identity disruption; it also rejects a sub-99% strong-match retention or a changed
 identity contradicted by an available independent cycle, unless the changed
 assignment is explicitly supported by that cycle. It selects the most refined
-eligible stage, falling back to the original matches if necessary.
+eligible stage, falling back to the original matches if necessary. Production
+matching records the selected stage, fallback reason, red-image hashes, and an
+explicit image-registration algorithm version in its run log and resume fingerprint.
+Missing or unreadable red images and expected registration failures preserve the
+legacy mask match for that pair instead of aborting the complete run. Use
+`--registration-mode legacy` for the explicit mask-only escape hatch.
 
 These are engineering QC bounds, not validated biological accuracy thresholds.
 Correlation is measured on 30,000 fixed evaluation pixels distinct from the

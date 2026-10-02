@@ -36,7 +36,11 @@ from affine_overlap_matcher import (
     match_pair,
 )
 from image_registration import (
+    DEFAULT_LOCAL_SMOOTHING_UM,
+    DEFAULT_REGISTRATION_MODE,
+    IMAGE_REGISTRATION_ALGORITHM_VERSION,
     ImageTransform,
+    REGISTRATION_MODES,
     classify_identity_conflicts,
     correspondence_changes,
     fit_image_affine,
@@ -56,8 +60,6 @@ from roi_track_graph import (
     build_tracks_from_pair_tables,
     summarize_track_cycle_metadata,
 )
-
-REGISTRATION_MODES = ("legacy", "image_affine", "image_affine_local")
 
 PAIRWISE_SUMMARY_COLUMNS = [
     "day_a",
@@ -175,6 +177,15 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _optional_sha256_file(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        return _sha256_file(path)
+    except OSError:
+        return None
+
+
 def _safe_package_version(package_name: str) -> str | None:
     """Return a package version or ``None`` when unavailable."""
 
@@ -272,6 +283,38 @@ def _save_image_transform(path: Path, transform: ImageTransform) -> None:
     )
 
 
+def _registration_failure_qc(stage: str, reason: str) -> dict[str, object]:
+    """Represent an expected registration failure without hiding its reason."""
+
+    return {
+        "stage": stage,
+        "n_matches": 0,
+        "inverse_error_max_um": np.nan,
+        "heldout_ncc": np.nan,
+        "sample_overlap": 0.0,
+        "affine_det": np.nan,
+        "affine_singular_min": np.nan,
+        "affine_singular_max": np.nan,
+        "jacobian_min": np.nan,
+        "jacobian_p01": np.nan,
+        "jacobian_p99": np.nan,
+        "displacement_p50_um": np.nan,
+        "displacement_p95_um": np.nan,
+        "displacement_p99_um": np.nan,
+        "transform_reasons": [reason],
+        "optimizer_success": False,
+    }
+
+
+def _record_registration_failure(bundle: dict[str, object], registration_mode: str, reason: str) -> None:
+    stages = ["image_affine"]
+    if registration_mode == "image_affine_local":
+        stages.append("image_affine_local")
+    for stage in stages:
+        bundle["qc"][stage] = _registration_failure_qc(stage, reason)
+        bundle["conflicts"][stage] = pd.DataFrame()
+
+
 def _match_pair_task(task):
     """Run one independent pair calculation; return identifiers in task order."""
 
@@ -294,55 +337,102 @@ def _match_pair_task(task):
         )
         bundle = {"results":{"legacy":legacy}, "qc":{}, "conflicts":{}, "baseline_qc":None}
         if registration_mode != "legacy":
+            expected_registration_errors = (OSError, tifffile.TiffFileError, ValueError, RuntimeError, FloatingPointError)
             if not red_path_a or not red_path_b:
-                raise ValueError(f"Image registration requires red images for {session_a} / {session_b}.")
-            red_a = tifffile.imread(red_path_a)
-            red_b = tifffile.imread(red_path_b)
-            if red_a.shape != mask_a.shape or red_b.shape != mask_b.shape:
-                raise ValueError("Red images and masks must share the same grid.")
-            image_a, image_b, step = prepare_images(red_a, red_b, spacing)
-            initial = restricted_transform(legacy.transform)
-            baseline = {"stage":"legacy", "n_matches":len(legacy.balanced_matches),
-                        "inverse_error_max_um":0., **image_quality(image_a,image_b,initial,step,spacing),
-                        **correspondence_changes(legacy.balanced_matches,legacy.balanced_matches)}
-            bundle["baseline_qc"] = baseline
-            affine, fit_info = fit_image_affine(image_a,image_b,initial,step)
-            candidates, _matches, inverse_error = match_transformed_masks(
-                mask_a,mask_b,features_a,features_b,affine,spacing, params=params)
-            affine_result = _registered_pair_result(legacy,candidates,affine,features_a,features_b)
-            affine_qc = {"stage":"image_affine", "n_matches":len(affine_result.balanced_matches),
-                         "inverse_error_max_um":inverse_error,
-                         **image_quality(image_a,image_b,affine,step,spacing),
-                         **correspondence_changes(legacy.balanced_matches,affine_result.balanced_matches)}
-            affine_reasons = guard_reasons(affine_qc,baseline)
-            if not fit_info["optimizer_success"]:
-                affine_reasons.append("affine_optimizer_not_converged")
-            affine_qc.update(transform_reasons=affine_reasons, optimizer_success=fit_info["optimizer_success"])
-            bundle["results"]["image_affine"] = affine_result
-            bundle["qc"]["image_affine"] = affine_qc
-            bundle["conflicts"]["image_affine"] = identity_conflicts(
-                legacy.balanced_matches,affine_result.balanced_matches)
-            if registration_mode == "image_affine_local" and not affine_reasons:
-                local = fit_smooth_field(image_a,image_b,affine,step,spacing,smoothing_um=smoothing_um)
-                candidates, _matches, inverse_error = match_transformed_masks(
-                    mask_a,mask_b,features_a,features_b,local,spacing, params=params)
-                local_result = _registered_pair_result(legacy,candidates,local,features_a,features_b)
-                local_qc = {"stage":"image_affine_local", "n_matches":len(local_result.balanced_matches),
-                            "inverse_error_max_um":inverse_error,
-                            **image_quality(image_a,image_b,local,step,spacing),
-                            **correspondence_changes(legacy.balanced_matches,local_result.balanced_matches)}
-                local_reasons = guard_reasons(local_qc,baseline)
-                if local_qc["heldout_ncc"] < affine_qc["heldout_ncc"]+.005:
-                    local_reasons.append("local_field_has_no_meaningful_image_gain")
-                local_qc.update(transform_reasons=local_reasons, optimizer_success=True)
-                bundle["results"]["image_affine_local"] = local_result
-                bundle["qc"]["image_affine_local"] = local_qc
-                bundle["conflicts"]["image_affine_local"] = identity_conflicts(
-                    legacy.balanced_matches,local_result.balanced_matches)
+                _record_registration_failure(bundle, registration_mode, "red_image_missing")
+            else:
+                try:
+                    red_a = tifffile.imread(red_path_a)
+                    red_b = tifffile.imread(red_path_b)
+                except expected_registration_errors:
+                    _record_registration_failure(bundle, registration_mode, "red_image_load_error")
+                else:
+                    if red_a.shape != mask_a.shape or red_b.shape != mask_b.shape:
+                        _record_registration_failure(bundle, registration_mode, "red_grid_incompatible")
+                    else:
+                        try:
+                            image_a, image_b, step = prepare_images(red_a, red_b, spacing)
+                        except expected_registration_errors:
+                            _record_registration_failure(bundle, registration_mode, "image_prepare_error")
+                        else:
+                            try:
+                                initial = restricted_transform(legacy.transform)
+                                baseline = {"stage":"legacy", "n_matches":len(legacy.balanced_matches),
+                                            "inverse_error_max_um":0., **image_quality(image_a,image_b,initial,step,spacing),
+                                            **correspondence_changes(legacy.balanced_matches,legacy.balanced_matches)}
+                            except expected_registration_errors:
+                                _record_registration_failure(bundle, registration_mode, "affine_baseline_qc_error")
+                            else:
+                                bundle["baseline_qc"] = baseline
+                                try:
+                                    affine, fit_info = fit_image_affine(image_a,image_b,initial,step)
+                                except expected_registration_errors:
+                                    _record_registration_failure(bundle, registration_mode, "affine_registration_error")
+                                else:
+                                    try:
+                                        candidates, _matches, inverse_error = match_transformed_masks(
+                                            mask_a,mask_b,features_a,features_b,affine,spacing, params=params)
+                                        affine_result = _registered_pair_result(legacy,candidates,affine,features_a,features_b)
+                                        affine_qc = {"stage":"image_affine", "n_matches":len(affine_result.balanced_matches),
+                                                     "inverse_error_max_um":inverse_error,
+                                                     **image_quality(image_a,image_b,affine,step,spacing),
+                                                     **correspondence_changes(legacy.balanced_matches,affine_result.balanced_matches)}
+                                        affine_reasons = guard_reasons(affine_qc,baseline)
+                                    except expected_registration_errors:
+                                        _record_registration_failure(bundle, registration_mode, "affine_qc_error")
+                                    else:
+                                        if not fit_info["optimizer_success"]:
+                                            affine_reasons.append("affine_optimizer_not_converged")
+                                        affine_qc.update(transform_reasons=affine_reasons, optimizer_success=fit_info["optimizer_success"])
+                                        bundle["results"]["image_affine"] = affine_result
+                                        bundle["qc"]["image_affine"] = affine_qc
+                                        bundle["conflicts"]["image_affine"] = identity_conflicts(
+                                            legacy.balanced_matches,affine_result.balanced_matches)
+                                        if registration_mode == "image_affine_local":
+                                            if affine_reasons:
+                                                bundle["qc"]["image_affine_local"] = _registration_failure_qc(
+                                                    "image_affine_local", "local_unavailable_affine_qc_failed")
+                                                bundle["conflicts"]["image_affine_local"] = pd.DataFrame()
+                                            else:
+                                                try:
+                                                    local = fit_smooth_field(image_a,image_b,affine,step,spacing,smoothing_um=smoothing_um)
+                                                except expected_registration_errors:
+                                                    bundle["qc"]["image_affine_local"] = _registration_failure_qc(
+                                                        "image_affine_local", "local_registration_error")
+                                                    bundle["conflicts"]["image_affine_local"] = pd.DataFrame()
+                                                else:
+                                                    try:
+                                                        candidates, _matches, inverse_error = match_transformed_masks(
+                                                            mask_a,mask_b,features_a,features_b,local,spacing, params=params)
+                                                        local_result = _registered_pair_result(legacy,candidates,local,features_a,features_b)
+                                                        local_qc = {"stage":"image_affine_local", "n_matches":len(local_result.balanced_matches),
+                                                                    "inverse_error_max_um":inverse_error,
+                                                                    **image_quality(image_a,image_b,local,step,spacing),
+                                                                    **correspondence_changes(legacy.balanced_matches,local_result.balanced_matches)}
+                                                        local_reasons = guard_reasons(local_qc,baseline)
+                                                        if local_qc["heldout_ncc"] < affine_qc["heldout_ncc"]+.005:
+                                                            local_reasons.append("local_field_has_no_meaningful_image_gain")
+                                                    except expected_registration_errors:
+                                                        bundle["qc"]["image_affine_local"] = _registration_failure_qc(
+                                                            "image_affine_local", "local_qc_error")
+                                                        bundle["conflicts"]["image_affine_local"] = pd.DataFrame()
+                                                    else:
+                                                        local_qc.update(transform_reasons=local_reasons, optimizer_success=True)
+                                                        bundle["results"]["image_affine_local"] = local_result
+                                                        bundle["qc"]["image_affine_local"] = local_qc
+                                                        bundle["conflicts"]["image_affine_local"] = identity_conflicts(
+                                                            legacy.balanced_matches,local_result.balanced_matches)
     finally:
         del mask_a
         del mask_b
     return session_a, session_b, bundle, float(time.perf_counter() - pair_start_seconds)
+
+
+def _stage_transform_qc_valid(bundle, stage):
+    if stage == "legacy":
+        return stage in bundle["results"]
+    return (stage in bundle["results"]
+            and not bundle["qc"].get(stage, {}).get("transform_reasons", []))
 
 
 def _cycle_classified_conflicts(pair, stage, bundles, ordered_sessions):
@@ -350,22 +440,31 @@ def _cycle_classified_conflicts(pair, stage, bundles, ordered_sessions):
     a, b = pair
     index = {session:index for index,session in enumerate(ordered_sessions)}
     if index[b] - index[a] != 1:
-        return conflicts
+        return conflicts, None
+    support_stages = {
+        "image_affine_local": ("image_affine_local", "image_affine", "legacy"),
+        "image_affine": ("image_affine", "legacy"),
+        "legacy": ("legacy",),
+    }[stage]
     if index[b] + 1 < len(ordered_sessions):
         c = ordered_sessions[index[b]+1]
-        if ((b,c) in bundles and (a,c) in bundles
-                and stage in bundles[(b,c)]["results"] and stage in bundles[(a,c)]["results"]):
-            bridge = bundles[(b,c)]["results"][stage].balanced_matches
-            direct = bundles[(a,c)]["results"][stage].balanced_matches
-            return classify_identity_conflicts(conflicts,bridge,direct,pair_role="ab")
+        if (b,c) in bundles and (a,c) in bundles:
+            for evidence_stage in support_stages:
+                if (_stage_transform_qc_valid(bundles[(b,c)], evidence_stage)
+                        and _stage_transform_qc_valid(bundles[(a,c)], evidence_stage)):
+                    bridge = bundles[(b,c)]["results"][evidence_stage].balanced_matches
+                    direct = bundles[(a,c)]["results"][evidence_stage].balanced_matches
+                    return classify_identity_conflicts(conflicts,bridge,direct,pair_role="ab"), evidence_stage
     if index[a] > 0:
         previous = ordered_sessions[index[a]-1]
-        if ((previous,a) in bundles and (previous,b) in bundles
-                and stage in bundles[(previous,a)]["results"] and stage in bundles[(previous,b)]["results"]):
-            bridge = bundles[(previous,a)]["results"][stage].balanced_matches
-            direct = bundles[(previous,b)]["results"][stage].balanced_matches
-            return classify_identity_conflicts(conflicts,bridge,direct,pair_role="bc")
-    return conflicts
+        if (previous,a) in bundles and (previous,b) in bundles:
+            for evidence_stage in support_stages:
+                if (_stage_transform_qc_valid(bundles[(previous,a)], evidence_stage)
+                        and _stage_transform_qc_valid(bundles[(previous,b)], evidence_stage)):
+                    bridge = bundles[(previous,a)]["results"][evidence_stage].balanced_matches
+                    direct = bundles[(previous,b)]["results"][evidence_stage].balanced_matches
+                    return classify_identity_conflicts(conflicts,bridge,direct,pair_role="bc"), evidence_stage
+    return conflicts, None
 
 
 def _select_registration_results(bundles, ordered_sessions, registration_mode, smoothing_um):
@@ -374,15 +473,18 @@ def _select_registration_results(bundles, ordered_sessions, registration_mode, s
     order = list(dict.fromkeys(order))
     for pair,bundle in bundles.items():
         stage_reasons = {}
+        evidence_stages = {}
         for stage,qc in bundle["qc"].items():
-            conflicts = _cycle_classified_conflicts(pair,stage,bundles,ordered_sessions)
+            conflicts, evidence_stage = _cycle_classified_conflicts(pair,stage,bundles,ordered_sessions)
             bundle["conflicts"][stage] = conflicts
+            evidence_stages[stage] = evidence_stage
             identity_reasons = identity_guard_reasons(qc,conflicts)
             stage_reasons[stage] = list(dict.fromkeys(qc["transform_reasons"]+identity_reasons))
             if not conflicts.empty:
                 changed = conflicts.copy()
                 changed.insert(0,"day_a",pair[0]); changed.insert(1,"day_b",pair[1])
                 changed.insert(2,"registration_stage",stage)
+                changed["cycle_evidence_stage"] = evidence_stage
                 conflict_rows.append(changed)
         selected = next(stage for stage in order
                         if stage in bundle["results"] and not stage_reasons.get(stage,[]))
@@ -402,6 +504,7 @@ def _select_registration_results(bundles, ordered_sessions, registration_mode, s
             "day_a":pair[0], "day_b":pair[1],
             "requested_registration_mode":registration_mode,
             "selected_registration_stage":selected,
+            "cycle_evidence_stage":evidence_stages.get(selected),
             "smoothing_um":float(smoothing_um),
             "affine_qc_pass":not stage_reasons.get("image_affine",["not_requested"]),
             "local_qc_pass":not stage_reasons.get("image_affine_local",["not_requested"]),
@@ -472,8 +575,8 @@ def _fingerprint_run(
     params: AffineOverlapParams,
     spacing: VoxelSpacing,
     max_pair_gap: int,
-    registration_mode: str = "legacy",
-    registration_smoothing_um: float = 15.,
+    registration_mode: str = DEFAULT_REGISTRATION_MODE,
+    registration_smoothing_um: float = DEFAULT_LOCAL_SMOOTHING_UM,
     red_hashes: dict[str,str] | None = None,
 ) -> dict[str, object]:
     """Build a compact fingerprint for resume comparisons."""
@@ -490,6 +593,7 @@ def _fingerprint_run(
     if registration_mode != "legacy":
         fingerprint.update(registration_mode=registration_mode,
                            registration_smoothing_um=float(registration_smoothing_um),
+                           image_registration_algorithm_version=IMAGE_REGISTRATION_ALGORITHM_VERSION,
                            red_hashes=red_hashes or {})
     return fingerprint
 
@@ -548,8 +652,8 @@ def run_daywise_roi_matching(
     *,
     spacing: VoxelSpacing | None = None,
     params: AffineOverlapParams | None = None,
-    registration_mode: str = "legacy",
-    registration_smoothing_um: float = 15.,
+    registration_mode: str = DEFAULT_REGISTRATION_MODE,
+    registration_smoothing_um: float = DEFAULT_LOCAL_SMOOTHING_UM,
     max_pair_gap: int = 2,
     pair_workers: int = 1,
     save_candidates: bool = False,
@@ -597,10 +701,14 @@ def run_daywise_roi_matching(
     mask_hashes = {record.session_id: _sha256_file(record.mask_path) for record in records}
     red_hashes = {}
     if registration_mode != "legacy":
-        missing_red = [record.session_id for record in records if record.red_image_path is None]
-        if missing_red:
-            raise ValueError(f"Image registration requires red images: {', '.join(missing_red)}")
-        red_hashes = {record.session_id:_sha256_file(record.red_image_path) for record in records}
+        for record in records:
+            if record.red_image_path is None:
+                red_hashes[record.session_id] = "missing"
+                continue
+            try:
+                red_hashes[record.session_id] = _sha256_file(record.red_image_path)
+            except OSError:
+                red_hashes[record.session_id] = "unreadable"
     fingerprint = _fingerprint_run(
         manifest_hash=manifest_hash,
         records=records,
@@ -855,7 +963,7 @@ def run_daywise_roi_matching(
                 "mask_sha256": mask_hashes[record.session_id],
                 "red_image_path": str(record.red_image_path) if record.red_image_path is not None else "",
                 "green_image_path": str(record.green_image_path) if record.green_image_path is not None else "",
-                "red_sha256": _sha256_file(record.red_image_path) if record.red_image_path is not None else None,
+                "red_sha256": _optional_sha256_file(record.red_image_path),
                 "green_sha256": _sha256_file(record.green_image_path) if record.green_image_path is not None else None,
             }
         )
@@ -894,6 +1002,7 @@ def run_daywise_roi_matching(
         "max_pair_gap": int(max_pair_gap),
         "registration_mode": registration_mode,
         "registration_smoothing_um": float(registration_smoothing_um),
+        "image_registration_algorithm_version": IMAGE_REGISTRATION_ALGORITHM_VERSION,
         "pair_workers": pair_workers,
         "python_version": sys.version,
         "platform": platform.platform(),
@@ -1036,8 +1145,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--z-um-per-plane", type=float, default=5.0, help="Z spacing in micrometers.")
     parser.add_argument("--max-pair-gap", type=int, default=2, help="Maximum allowed session gap for pairwise matching.")
     parser.add_argument("--pair-workers", type=int, default=1, help="Independent session-pair worker processes (default: 1).")
-    parser.add_argument("--registration-mode", choices=REGISTRATION_MODES, default="legacy", help="Pair registration method (default: legacy).")
-    parser.add_argument("--registration-smoothing-um", type=float, default=15.0, help="Local registration smoothing scale in micrometers.")
+    parser.add_argument("--registration-mode", choices=REGISTRATION_MODES, default=DEFAULT_REGISTRATION_MODE, help=f"Pair registration method (default: {DEFAULT_REGISTRATION_MODE}).")
+    parser.add_argument("--registration-smoothing-um", type=float, default=DEFAULT_LOCAL_SMOOTHING_UM, help="Local registration smoothing scale in micrometers.")
     parser.add_argument("--save-candidates", action="store_true", help="Write the full candidate table.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing output directory.")
     parser.add_argument("--resume", action="store_true", help="Reuse a prior exact-matching output directory when possible.")

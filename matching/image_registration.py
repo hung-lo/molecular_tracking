@@ -1,4 +1,4 @@
-"""Opt-in image registration experiments; production mask-only matching is unchanged.
+"""Image registration for production matching.
 
 Transforms map native B coordinates into A. The smooth field is an inverse
 displacement in the A frame, sampled on ``flow_step`` voxel spacing. Intensities
@@ -18,6 +18,12 @@ from affine_overlap_matcher import (
     AffineOverlapParams, VoxelSpacing, build_sparse_overlap_table,
     generate_candidate_pairs, greedy_one_to_one,
 )
+
+
+REGISTRATION_MODES = ("legacy", "image_affine", "image_affine_local")
+DEFAULT_REGISTRATION_MODE = "image_affine_local"
+DEFAULT_LOCAL_SMOOTHING_UM = 15.0
+IMAGE_REGISTRATION_ALGORITHM_VERSION = "image_registration_v2"
 
 
 @dataclass
@@ -301,8 +307,7 @@ def classify_identity_conflicts(conflicts, bridge=None, direct=None, *, pair_rol
         return result
     direct_map = {int(row.label_a): int(row.label_b) for row in direct.itertuples(index=False)}
     bridge_map = {int(row.label_a): int(row.label_b) for row in bridge.itertuples(index=False)}
-    if pair_role == "bc":
-        bridge_map = {b: a for a, b in bridge_map.items()}
+    bridge_b_to_a = {b: a for a, b in bridge_map.items()}
     categories = []
     old_support = []
     new_support = []
@@ -314,11 +319,13 @@ def classify_identity_conflicts(conflicts, bridge=None, direct=None, *, pair_rol
             new_c = bridge_map.get(int(row.new_roi_b)) if pd.notna(row.new_roi_b) else None
             direct_c = direct_map.get(int(row.roi_a))
         else:
-            old_a = bridge_map.get(int(row.old_roi_b))
-            new_a = bridge_map.get(int(row.new_roi_b)) if pd.notna(row.new_roi_b) else None
-            old_c = direct_map.get(old_a) if old_a is not None else None
-            new_c = direct_map.get(new_a) if new_a is not None else None
-            direct_c = old_c if old_c is not None else new_c
+            # For a B-C conflict, ``row.roi_a`` is the B label.  Map that B
+            # label through B-A, then use the A-C direct map; the old/new C
+            # labels are already stored in old_roi_b/new_roi_b.
+            a_label = bridge_b_to_a.get(int(row.roi_a))
+            old_c = int(row.old_roi_b)
+            new_c = int(row.new_roi_b) if pd.notna(row.new_roi_b) else None
+            direct_c = direct_map.get(a_label) if a_label is not None else None
         old_ok = old_c is not None and direct_c is not None and old_c == direct_c
         new_ok = new_c is not None and direct_c is not None and new_c == direct_c
         if direct_c is None:

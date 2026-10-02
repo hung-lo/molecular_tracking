@@ -60,7 +60,8 @@ from affine_overlap_matcher import AffineOverlapParams, VoxelSpacing
 from analysis_paths import get_dataset_analysis_dir, resolve_dataset_dir
 from acquisition_settings_qc import acquisition_settings_qc, acquisition_settings_qc_table, write_acquisition_settings_qc_artifacts
 from project_cli import catalog_path, catalog_spacing, file_sha256, manifest_plan_path, ready_manifest_path, resolve_selection, selected_catalog_rows, selected_mouse_metadata
-from run_daywise_graph_matching import REGISTRATION_MODES, run_daywise_graph_matching
+from image_registration import DEFAULT_LOCAL_SMOOTHING_UM, DEFAULT_REGISTRATION_MODE, REGISTRATION_MODES
+from run_daywise_graph_matching import run_daywise_graph_matching
 from run_daywise_matched_roi_pipeline import (
     DaywiseMatchedPipelineConfig,
     run_daywise_matched_roi_pipeline,
@@ -95,8 +96,8 @@ class MasterPipelineConfig:
     z_um_per_plane: float = 5.0
     max_pair_gap: int = 2
     pair_workers: int = 1
-    registration_mode: str = "legacy"
-    registration_smoothing_um: float = 15.0
+    registration_mode: str = DEFAULT_REGISTRATION_MODE
+    registration_smoothing_um: float = DEFAULT_LOCAL_SMOOTHING_UM
     green_dark: float = 319.0
     red_dark: float = 534.0
     epsilon: float = 1.0
@@ -321,7 +322,7 @@ def _default_run_name(
     dataset_dir: Path,
     manifest_meta: dict[str, Any],
     selection: SessionSelection | None = None,
-    registration_mode: str = "legacy",
+    registration_mode: str = DEFAULT_REGISTRATION_MODE,
 ) -> str:
     first_date = manifest_meta["first_date"].strftime("%Y%m%d")
     last_date = manifest_meta["last_date"].strftime("%Y%m%d")
@@ -1497,8 +1498,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--z-um-per-plane", type=float, default=None)
     parser.add_argument("--max-pair-gap", type=int, default=2)
     parser.add_argument("--pair-workers", type=int, default=1)
-    parser.add_argument("--registration-mode", choices=REGISTRATION_MODES, default="legacy")
-    parser.add_argument("--registration-smoothing-um", type=float, default=15.0)
+    parser.add_argument("--registration-mode", choices=REGISTRATION_MODES, default=DEFAULT_REGISTRATION_MODE)
+    parser.add_argument("--registration-smoothing-um", type=float, default=DEFAULT_LOCAL_SMOOTHING_UM)
     parser.add_argument("--green-dark", type=float, default=319.0)
     parser.add_argument("--red-dark", type=float, default=534.0)
     parser.add_argument("--epsilon", type=float, default=1.0)

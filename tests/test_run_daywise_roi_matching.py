@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+from types import SimpleNamespace
 
 import pytest
 import numpy as np
@@ -11,7 +12,8 @@ import tifffile
 import run_daywise_roi_matching as runner
 from affine_overlap_matcher import AffineOverlapParams, VoxelSpacing
 from image_registration import ImageTransform
-from run_daywise_roi_matching import run_daywise_roi_matching
+from image_registration import identity_conflicts
+from run_daywise_roi_matching import _cycle_classified_conflicts, run_daywise_roi_matching
 
 
 def _write_stack(path: Path, data: np.ndarray) -> None:
@@ -91,6 +93,11 @@ def test_run_daywise_roi_matching_exports_required_tables(tmp_path: Path) -> Non
     assert run_log["row_counts"]["tracks_balanced"] > 0
     assert run_log["output_paths"]["tracks_high"].endswith("tracks_high.csv")
     assert run_log["qc_output_dir"].endswith("qc")
+    assert run_log["registration_mode"] == "image_affine_local"
+    assert run_log["image_registration_algorithm_version"] == runner.IMAGE_REGISTRATION_ALGORITHM_VERSION
+    registration_qc = pd.read_csv(output_dir / "pairwise_registration_qc.csv")
+    assert set(registration_qc["selected_registration_stage"]) == {"legacy"}
+    assert registration_qc["fallback_reason"].str.contains("red_image_missing").all()
 
 @pytest.mark.parametrize("max_pair_gap", [0, -1, 3, 1.5])
 def test_run_daywise_roi_matching_rejects_invalid_pair_gap_values(tmp_path: Path, max_pair_gap: float) -> None:
@@ -209,6 +216,7 @@ def test_image_registration_mode_exports_qc_and_preserves_native_inputs(tmp_path
     run_log = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
     assert run_log["registration_mode"] == "image_affine_local"
     assert run_log["registration_smoothing_um"] == 15.0
+    assert run_log["run_fingerprint"]["image_registration_algorithm_version"] == runner.IMAGE_REGISTRATION_ALGORITHM_VERSION
     assert before_mask == {path.name: path.read_bytes() for path in tmp_path.glob("*_mask.tif")}
     assert before_red == {path.name: path.read_bytes() for path in tmp_path.glob("*_red.tif")}
 
@@ -220,3 +228,83 @@ def test_image_registration_mode_exports_qc_and_preserves_native_inputs(tmp_path
             resume=True,
             skip_qc=True,
         )
+
+    def failed_local(*_args, **_kwargs):
+        raise RuntimeError("optimizer failed")
+
+    monkeypatch.setattr(runner, "fit_smooth_field", failed_local)
+    affine_fallback = run_daywise_roi_matching(
+        manifest_path=manifest_path,
+        output_dir=tmp_path / "affine_fallback_out",
+        registration_mode="image_affine_local",
+        overwrite=True,
+        skip_qc=True,
+    )
+    affine_fallback_qc = pd.read_csv(affine_fallback / "pairwise_registration_qc.csv")
+    assert set(affine_fallback_qc["selected_registration_stage"]) == {"image_affine"}
+    assert affine_fallback_qc["fallback_reason"].str.contains("local_registration_error").all()
+
+    def failed_affine(*_args, **_kwargs):
+        raise RuntimeError("optimizer failed")
+
+    monkeypatch.setattr(runner, "fit_image_affine", failed_affine)
+    legacy_fallback = run_daywise_roi_matching(
+        manifest_path=manifest_path,
+        output_dir=tmp_path / "legacy_fallback_out",
+        registration_mode="image_affine_local",
+        overwrite=True,
+        skip_qc=True,
+    )
+    legacy_fallback_qc = pd.read_csv(legacy_fallback / "pairwise_registration_qc.csv")
+    assert set(legacy_fallback_qc["selected_registration_stage"]) == {"legacy"}
+    assert legacy_fallback_qc["fallback_reason"].str.contains("affine_registration_error").all()
+
+    monkeypatch.setattr(runner, "IMAGE_REGISTRATION_ALGORITHM_VERSION", "changed-for-test")
+    with pytest.raises(FileExistsError):
+        run_daywise_roi_matching(
+            manifest_path=manifest_path,
+            output_dir=output_dir,
+            registration_mode="image_affine_local",
+            resume=True,
+            skip_qc=True,
+        )
+
+
+def test_cycle_evidence_falls_back_to_qc_valid_support_stage() -> None:
+    baseline = pd.DataFrame(dict(label_a=[10], label_b=[101], dice=[.9], distance_um=[1.], area_ratio=[1.], ambiguity=[.1]))
+    candidate = pd.DataFrame(dict(label_a=[10], label_b=[20]))
+    conflicts = identity_conflicts(baseline, candidate)
+    bridge = pd.DataFrame(dict(label_a=[1], label_b=[10]))
+    direct = pd.DataFrame(dict(label_a=[1], label_b=[20]))
+    empty = pd.DataFrame()
+    result = lambda matches: SimpleNamespace(balanced_matches=matches)
+    bundles = {
+        ("A", "B"): {
+            "results": {"image_affine": result(bridge)},
+            "qc": {
+                "image_affine": {"transform_reasons": []},
+                "image_affine_local": {"transform_reasons": ["local_distortion"]},
+            },
+            "conflicts": {"image_affine": empty, "image_affine_local": empty},
+        },
+        ("A", "C"): {
+            "results": {"image_affine": result(direct)},
+            "qc": {
+                "image_affine": {"transform_reasons": []},
+                "image_affine_local": {"transform_reasons": ["local_distortion"]},
+            },
+            "conflicts": {"image_affine": empty, "image_affine_local": empty},
+        },
+        ("B", "C"): {
+            "results": {"image_affine_local": result(candidate)},
+            "qc": {"image_affine_local": {"transform_reasons": []}},
+            "conflicts": {"image_affine_local": conflicts},
+        },
+    }
+
+    classified, evidence_stage = _cycle_classified_conflicts(
+        ("B", "C"), "image_affine_local", bundles, ["A", "B", "C"]
+    )
+
+    assert evidence_stage == "image_affine"
+    assert classified.iloc[0].cycle_category == "new_supported_by_cycle"

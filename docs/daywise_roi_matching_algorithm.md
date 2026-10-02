@@ -32,10 +32,11 @@ one-to-one assignments.
 
 See `README.md` for the CLI commands.
 
-## Optional image registration
+## Image registration and fallback
 
-The production runners keep the mask-only path as the default and expose the validated
-red-anatomy registration as an opt-in mode:
+Production runners default to `image_affine_local`, using red-channel anatomy for
+geometry while leaving native masks, fluorescence measurements, thresholds, and
+nearest-neighbor mask resampling unchanged:
 
 ```bash
 .venv/bin/python matching/run_daywise_graph_matching.py \
@@ -45,15 +46,18 @@ red-anatomy registration as an opt-in mode:
   --registration-smoothing-um 15
 ```
 
-`legacy`, `image_affine`, and `image_affine_local` are supported. The image modes fit
-geometry from the red volume, resample masks with nearest-neighbor interpolation, and
-reuse the existing candidate and graph thresholds. Affine/local QC can fall back to the
-next safe stage; the selected stage and reason are recorded in
+`legacy`, `image_affine`, and `image_affine_local` are supported. Expected missing,
+unreadable, incompatible, or failed red-image/registration/QC inputs fall back in
+order from local to affine to legacy; unexpected programming errors still surface.
+The selected stage and machine-readable reason are recorded in
 `pairwise_registration_qc.csv` and `pairwise_registration_identity_conflicts.csv`.
 Selected image transforms are stored under `registration_transforms/`. Registration
-mode, smoothing, and red-image hashes participate in the run fingerprint, so a legacy
-output cannot be resumed as an image-registration run.
+mode, smoothing, red-image hashes, and the image-registration algorithm version
+participate in the run fingerprint, so stale image-registration outputs cannot be
+resumed silently. Cycle identity evidence is only taken from supporting stages whose
+transform/deformation QC passed; identity auditing remains separate from that QC.
+Use `--registration-mode legacy` for the explicit mask-only escape hatch.
 
 The master runner accepts the same `--registration-mode` and
-`--registration-smoothing-um` options. Its default run naming preserves existing legacy
-names and adds the selected non-legacy mode to new run names.
+`--registration-smoothing-um` options. Its default run names include the selected
+non-legacy mode; explicit legacy runs retain the legacy name.

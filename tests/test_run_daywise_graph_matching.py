@@ -11,7 +11,14 @@ import tifffile
 
 import run_daywise_graph_matching as graph_runner
 import run_daywise_roi_matching as affine_runner
-from run_daywise_graph_matching import _affine_git_commit_from_log, _pair_table_groups, parse_args, run_daywise_graph_matching
+from run_daywise_graph_matching import (
+    _affine_git_commit_from_log,
+    _pair_table_groups,
+    _restore_cycle_supported_graph_matches,
+    parse_args,
+    run_daywise_graph_matching,
+)
+from spatial_graph_matcher import GraphPairMatchResult
 from tools.compare_matcher_outputs import compare_matcher_outputs
 
 
@@ -38,6 +45,45 @@ def test_graph_registration_defaults_to_local_image_mode() -> None:
     args = parse_args(["--manifest", "manifest.csv", "--output-dir", "out"])
     assert args.registration_mode == "image_affine_local"
     assert args.registration_smoothing_um == 15.0
+
+
+def test_graph_restores_pairwise_edge_when_cycle_supports_old_assignment() -> None:
+    baseline = pd.DataFrame({
+        "label_a": [3705, 3707], "label_b": [3550, 3980],
+        "dice": [.36, .51], "distance_um": [5.0, 6.1],
+        "area_ratio": [.8, .8], "ambiguity": [.9, 1.0],
+    })
+    candidates = baseline.assign(balanced_rule=True, score=[.32, .34])
+    candidates = pd.concat([
+        candidates,
+        pd.DataFrame({"label_a": [3707], "label_b": [3550], "balanced_rule": [True], "score": [.28]}),
+    ], ignore_index=True)
+    graph = candidates.iloc[[2]].copy()
+    graph["assignment_source"] = "graph_refined"
+    result = GraphPairMatchResult(
+        candidates=candidates,
+        anchors=pd.DataFrame(),
+        graph_matches=graph,
+        changes=pd.DataFrame(),
+        summary={"day_a": "A", "day_b": "B", "n_graph": 1, "n_graph_changed": 2},
+    )
+    support = {
+        ("B", "C"): pd.DataFrame({"label_a": [3980, 3550], "label_b": [3519, 3518]}),
+        ("A", "C"): pd.DataFrame({"label_a": [3707, 3705], "label_b": [3519, 3518]}),
+    }
+
+    restored = _restore_cycle_supported_graph_matches(
+        result,
+        baseline_matches=baseline,
+        pairwise_balanced_by_pair=support,
+        ordered_sessions=["A", "B", "C"],
+    )
+
+    assert set(map(tuple, restored.graph_matches[["label_a", "label_b"]].to_numpy())) == {
+        (3705, 3550), (3707, 3980),
+    }
+    assert restored.summary["n_graph"] == 2
+    assert restored.summary["n_graph_changed"] == 0
 
 
 def test_run_daywise_graph_matching_exports_graph_tables(tmp_path: Path, monkeypatch) -> None:

@@ -29,6 +29,8 @@ from image_registration import (
     DEFAULT_REGISTRATION_MODE,
     REGISTRATION_MODES,
     ImageTransform,
+    classify_identity_conflicts,
+    identity_conflicts,
 )
 from daywise_roi_matcher_qc_plots import DaywiseQCPlotConfig, generate_matching_qc
 from match_policy_registry import DEFAULT_ANALYSIS_POLICIES, SUPPORTED_MATCH_POLICIES, resolve_requested_policies
@@ -50,6 +52,7 @@ from spatial_graph_matcher import (
     GRAPH_MATCHER_IMPLEMENTATION_VERSION,
     GraphPairMatchResult,
     SpatialGraphParams,
+    compare_balanced_and_graph_matches,
     refine_pair_with_spatial_graph,
 )
 from session_manifest import load_session_manifest
@@ -238,6 +241,109 @@ def _graph_pair_task(
     return result, float(time.perf_counter() - pair_start_seconds)
 
 
+def _cycle_classified_graph_conflicts(
+    *,
+    day_a: str,
+    day_b: str,
+    baseline_matches: pd.DataFrame,
+    graph_matches: pd.DataFrame,
+    pairwise_balanced_by_pair: dict[tuple[str, str], pd.DataFrame],
+    ordered_sessions: list[str],
+) -> tuple[pd.DataFrame, str | None]:
+    """Classify graph replacements using available pairwise three-session evidence."""
+
+    # Graph protection audits every balanced edge.  The image-registration
+    # identity audit is intentionally restricted to strong anchors, but a
+    # graph replacement can still be a low-Dice/high-rule conflict.
+    audit_baseline = baseline_matches.copy()
+    audit_baseline["dice"] = 1.0
+    audit_baseline["distance_um"] = 0.0
+    audit_baseline["area_ratio"] = 1.0
+    audit_baseline["ambiguity"] = 0.0
+    conflicts = identity_conflicts(audit_baseline, graph_matches)
+    if conflicts.empty:
+        return conflicts, None
+    index = {session: position for position, session in enumerate(ordered_sessions)}
+    if index[day_b] - index[day_a] != 1:
+        return conflicts, None
+    if index[day_b] + 1 < len(ordered_sessions):
+        day_c = ordered_sessions[index[day_b] + 1]
+        bridge = pairwise_balanced_by_pair.get((day_b, day_c))
+        direct = pairwise_balanced_by_pair.get((day_a, day_c))
+        if bridge is not None and direct is not None:
+            return classify_identity_conflicts(conflicts, bridge, direct, pair_role="ab"), "pairwise"
+    if index[day_a] > 0:
+        day_previous = ordered_sessions[index[day_a] - 1]
+        bridge = pairwise_balanced_by_pair.get((day_previous, day_a))
+        direct = pairwise_balanced_by_pair.get((day_previous, day_b))
+        if bridge is not None and direct is not None:
+            return classify_identity_conflicts(conflicts, bridge, direct, pair_role="bc"), "pairwise"
+    return conflicts, None
+
+
+def _restore_cycle_supported_graph_matches(
+    result: GraphPairMatchResult,
+    *,
+    baseline_matches: pd.DataFrame,
+    pairwise_balanced_by_pair: dict[tuple[str, str], pd.DataFrame],
+    ordered_sessions: list[str],
+) -> GraphPairMatchResult:
+    """Keep a pairwise edge when graph reassignment contradicts a valid cycle."""
+
+    day_a = str(result.summary["day_a"])
+    day_b = str(result.summary["day_b"])
+    conflicts, evidence = _cycle_classified_graph_conflicts(
+        day_a=day_a,
+        day_b=day_b,
+        baseline_matches=baseline_matches,
+        graph_matches=result.graph_matches,
+        pairwise_balanced_by_pair=pairwise_balanced_by_pair,
+        ordered_sessions=ordered_sessions,
+    )
+    if evidence is None or conflicts.empty:
+        return result
+    supported = conflicts[
+        conflicts["cycle_support_old"].astype(bool)
+        & ~conflicts["cycle_support_new"].astype(bool)
+    ]
+    if supported.empty:
+        return result
+
+    old_keys = {(int(row.roi_a), int(row.old_roi_b)) for row in supported.itertuples(index=False)}
+    graph_matches = result.graph_matches.copy()
+    graph_matches = graph_matches.loc[
+        ~graph_matches["label_a"].isin({key[0] for key in old_keys})
+        & ~graph_matches["label_b"].isin({key[1] for key in old_keys})
+    ].copy()
+    restored_rows = []
+    for label_a, label_b in sorted(old_keys):
+        candidate = result.candidates[
+            (result.candidates["label_a"].astype(int) == label_a)
+            & (result.candidates["label_b"].astype(int) == label_b)
+            & result.candidates["balanced_rule"].astype(bool)
+        ]
+        if candidate.empty:
+            continue
+        row = candidate.iloc[0].to_dict()
+        row.update(
+            assignment_policy="graph",
+            assignment_source="cycle_fallback",
+            match_policy="graph",
+            is_graph_anchor=False,
+        )
+        restored_rows.append(row)
+    if not restored_rows:
+        return result
+    graph_matches = pd.concat([graph_matches, pd.DataFrame(restored_rows)], ignore_index=True, sort=False)
+    result.graph_matches = graph_matches.reset_index(drop=True)
+    result.changes = compare_balanced_and_graph_matches(baseline_matches, result.graph_matches)
+    result.summary.update(
+        n_graph=int(len(result.graph_matches)),
+        n_graph_changed=int(result.changes["changed"].sum()) if not result.changes.empty else 0,
+    )
+    return result
+
+
 def _export_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -389,6 +495,15 @@ def run_daywise_graph_matching(
     graph_pair_processing_seconds = time.perf_counter() - stage_start_seconds
 
     stage_start_seconds = time.perf_counter()
+    graph_results = [
+        _restore_cycle_supported_graph_matches(
+            result,
+            baseline_matches=pairwise_balanced_by_pair[(str(result.summary["day_a"]), str(result.summary["day_b"]))],
+            pairwise_balanced_by_pair=pairwise_balanced_by_pair,
+            ordered_sessions=ordered_sessions,
+        )
+        for result in graph_results
+    ]
     graph_pair_tables = {
         (result.summary["day_a"], result.summary["day_b"]): result.graph_matches
         for result in graph_results

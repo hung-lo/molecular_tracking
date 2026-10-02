@@ -97,9 +97,16 @@ def selected_catalog_rows(context: DatasetContext) -> list[dict[str,str]]:
         all_rows = list(csv.DictReader(handle))
     if str(context.mouse_id).startswith("Fucci-") and all_rows and not {"settings_qc_pass", "settings_qc_reason", "analysis_eligible"}.issubset(all_rows[0]):
         raise ValueError("Acquisition catalog lacks settings QC fields; rebuild it with tools/build_data_catalog.py")
-    rows=[row for row in all_rows if row["mouse_id"]==context.mouse_id and row["laser_nm"]==str(context.laser_nm) and row["analysis_included"].lower()=="true" and row.get("analysis_eligible", "true").lower()=="true"]
+    rows=[row for row in all_rows if row["mouse_id"]==context.mouse_id and _laser_matches(row.get("laser_nm"), context.laser_nm) and row["analysis_included"].lower()=="true" and row.get("analysis_eligible", "true").lower()=="true"]
     if not rows: raise ValueError(f"No usable {context.laser_nm} acquisitions exist for {context.mouse_id}")
     return rows
+
+
+def _laser_matches(value: object, wavelength: int | None) -> bool:
+    try:
+        return wavelength is not None and int(float(str(value).strip())) == int(wavelength)
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 def catalog_spacing(context: DatasetContext) -> tuple[float,float,float]:
     rows=selected_catalog_rows(context)

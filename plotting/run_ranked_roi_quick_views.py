@@ -19,6 +19,7 @@ from run_matched_roi_quick_view import _tracks_from_raw_table, render_ranked_roi
 
 
 METRIC_NAMES = (
+    "matched_roi_metrics_primary_final.csv",
     "weekly_matched_roi_log_ratio_metrics_complete.csv",
     "matched_roi_log_ratio_metrics_complete.csv",
 )

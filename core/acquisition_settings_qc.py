@@ -25,6 +25,7 @@ EXPECTED_ACQUISITION_SETTINGS: dict[str, dict[str, float]] = {
     "Fucci-Dead_1": {"pmt_gain_a": 10, "pmt_gain_b": 10, "laser_920_power": 70, "laser_1050_power": 70},
     "Fucci-Dead_2": {"pmt_gain_a": 10, "pmt_gain_b": 10, "laser_920_power": 70, "laser_1050_power": 70},
     "Fucci-Tri_5": {"pmt_gain_a": 10, "pmt_gain_b": 10, "laser_920_power": 70, "laser_1050_power": 70},
+    "Fucci-Tri_6": {"pmt_gain_a": 10, "pmt_gain_b": 10, "laser_920_power": 60, "laser_1050_power": 60},
 }
 
 QC_COLUMNS = [
@@ -188,7 +189,7 @@ def acquisition_settings_qc_table(rows: list[dict[str, Any]], *, tolerance: floa
             for row in table.loc[~table["pipeline_enabled"], ["mouse_id", "pipeline_exclusion_reason"]].drop_duplicates().itertuples(index=False)
         ]
     return table, {
-        "status": "PASS" if failed.empty else "FAIL",
+        "status": "NOT_EVALUATED" if table.empty else ("PASS" if failed.empty else "FAIL"),
         "n_sessions": int(len(table)),
         "n_pass": int(table["settings_qc_status"].eq("pass").sum()) if not table.empty else 0,
         "n_fail": int(len(failed)),
@@ -348,7 +349,14 @@ def acquisition_settings_qc(rows: list[dict], session_ids: list[str], laser_nm: 
     selected = {str(session_id): index for index, session_id in enumerate(session_ids)}
     frame = pd.DataFrame([row for row in rows if str(row.get("session_id")) in selected]).copy()
     if frame.empty:
-        return pd.DataFrame(columns=REPORT_COLUMNS), {"status": "unavailable_legacy", "changed_required_fields": [], "informational_changes": []}
+        return pd.DataFrame(columns=REPORT_COLUMNS), {
+            "status": "NOT_EVALUATED",
+            "n_sessions": 0,
+            "changed_required_fields": [],
+            "changed_parameters": [],
+            "informational_changes": [],
+            "reason": "no selected acquisition rows were available",
+        }
     frame["session_index"] = frame["session_id"].astype(str).map(selected)
     for column in REPORT_COLUMNS:
         if column not in frame:
@@ -356,10 +364,24 @@ def acquisition_settings_qc(rows: list[dict], session_ids: list[str], laser_nm: 
     frame = frame[REPORT_COLUMNS].sort_values("session_index").reset_index(drop=True)
     required = ["pmt_a_gain", "pmt_b_gain", f"pockels_{laser_nm}_start_pct", f"pockels_{laser_nm}_stop_pct", "average_num"]
     changed = []
+    changed_parameters = []
     for column in required:
-        values = pd.to_numeric(frame[column], errors="coerce").dropna().to_numpy(float)
+        numeric = pd.to_numeric(frame[column], errors="coerce")
+        values = numeric.dropna().to_numpy(float)
         if len(values) > 1 and not all(math.isclose(values[0], value, rel_tol=tolerance, abs_tol=tolerance) for value in values[1:]):
             changed.append(column)
+            changed_parameters.append({
+                "parameter": column,
+                "values": [float(value) for value in dict.fromkeys(values.tolist())],
+                "sessions": [
+                    str(session_id)
+                    for session_id in frame.loc[
+                        numeric.notna()
+                        & ~numeric.map(lambda value: math.isclose(float(value), values[0], rel_tol=tolerance, abs_tol=tolerance)),
+                        "session_id",
+                    ]
+                ],
+            })
     informational = []
     versions = frame["software_version"].dropna().astype(str).unique()
     if len(versions) > 1:
@@ -367,6 +389,8 @@ def acquisition_settings_qc(rows: list[dict], session_ids: list[str], laser_nm: 
     return frame, {
         "status": "warning" if changed or informational else "pass",
         "laser_nm": int(laser_nm), "numeric_tolerance": tolerance,
-        "changed_required_fields": changed, "informational_changes": informational,
+        "changed_required_fields": changed,
+        "changed_parameters": changed_parameters,
+        "informational_changes": informational,
         "n_sessions": len(frame),
     }

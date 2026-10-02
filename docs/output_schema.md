@@ -27,11 +27,14 @@ Empty files keep the same headers as populated files.
 
 ## Daywise analysis tables
 
-- `matched_session_population_roi_metrics.csv`: every native ROI in every required session, with corrected signals and signal-validity flags.
+- `matched_session_population_roi_metrics.csv`: every native ROI in every required session, with corrected signals, signal-validity flags, and explicit fit-population artifact/include flags.
 - `matched_session_population_signal_qc_summary.csv`: per-session zero-hit and positive-signal counts.
-- `matched_daywise_green_red_linear_fit_summary.csv`: canonical OLS fits from all signal-valid native session ROIs.
+- `matched_daywise_green_red_linear_fit_summary.csv`: canonical fit-clean OLS fits with fit rule and included/excluded counts.
 - `matched_roi_day_table_all.csv`: every observed longitudinal ROI/session row.
 - `matched_roi_day_table_complete.csv`: only tracks observed in every required session.
+- `primary_final_tracks.csv` and `matched_roi_metrics_primary_final.csv`: default post-cycle-QC biological population.
+- `primary_final_strict_tracks.csv`: `primary_final` excluding `review_required` tracks.
+- `policy_status.csv`: requested/not-requested and evaluated track counts for each policy.
 - `matched_roi_metrics_with_session_normalized_residuals_all_observed.csv`: canonical fit residuals for complete and partial observations.
 - `matched_daywise_green_red_linear_fit_summary_complete_track_sensitivity.csv`: legacy complete-track-only fit for sensitivity analysis.
 - `matched_roi_trajectory_eligibility.csv`: track-level usable-session counts and eligibility reasons.

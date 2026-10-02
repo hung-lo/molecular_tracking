@@ -72,7 +72,7 @@ from session_manifest import SessionRecord, load_session_manifest
 
 
 MASTER_RUNNER_VERSION = "daywise_master_graph_affine_consensus_v1"
-MIN_REUSABLE_EXTRACTION_VERSION = (0, 3, 1)
+MIN_REUSABLE_EXTRACTION_VERSION = (0, 3, 2)
 AGREEMENT_COLUMNS = [
     "track_match_source",
     "n_accepted_graph_edges",
@@ -289,6 +289,22 @@ def _read_csv(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _selected_acquisition_rows(
+    rows: list[dict[str, Any]],
+    records: list[SessionRecord],
+    selected_acquisition_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Keep the catalog acquisitions that back the effective manifest."""
+
+    session_ids = {str(record.session_id) for record in records}
+    acquisition_ids = {str(value) for value in (selected_acquisition_ids or [])}
+    return [
+        row for row in rows
+        if str(row.get("session_id", "")) in session_ids
+        and (not acquisition_ids or str(row.get("acquisition_id", "")) in acquisition_ids)
+    ]
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -456,6 +472,9 @@ def _has_current_extraction(extraction_dir: Path) -> bool:
         "matched_daywise_green_red_linear_fit_summary.csv",
         "matched_roi_metrics_with_session_normalized_residuals_all_observed.csv",
         "matched_roi_trajectory_eligibility.csv",
+        "primary_final_tracks.csv",
+        "matched_roi_metrics_primary_final.csv",
+        "policy_status.csv",
     ]
     log_path = extraction_dir / "run_log.json"
     if not log_path.is_file() or any(not (extraction_dir / name).is_file() for name in required):
@@ -465,7 +484,7 @@ def _has_current_extraction(extraction_dir: Path) -> bool:
         version = tuple(int(part) for part in str(payload.get("analysis_version", "0.0.0")).split(".")[:3])
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return False
-    return version >= MIN_REUSABLE_EXTRACTION_VERSION and payload.get("normalization", {}).get("population") == "all_valid_session_rois"
+    return version >= MIN_REUSABLE_EXTRACTION_VERSION and payload.get("normalization", {}).get("population") == "fit_clean_signal_valid_session_rois"
 
 
 def _verify_resume_session_selection(
@@ -841,19 +860,6 @@ def annotate_extraction_outputs(extraction_dir: Path, tracks_path: Path) -> dict
     return summary
 
 
-def _filter_green_artifacts(day_table: pd.DataFrame, green_artifact_threshold: float) -> tuple[pd.DataFrame, int]:
-    if day_table.empty:
-        return day_table.copy(), 0
-    cleaned = day_table.replace([np.inf, -np.inf], np.nan).dropna(subset=["red", "green"]).copy()
-    if cleaned.empty:
-        return cleaned, 0
-    artifact_mask = cleaned["green"].gt(float(green_artifact_threshold))
-    excluded_count = int(artifact_mask.sum())
-    if excluded_count == 0:
-        return cleaned.reset_index(drop=True), 0
-    return cleaned.loc[~artifact_mask].reset_index(drop=True), excluded_count
-
-
 def _actual_date_label(day_table: pd.DataFrame, day_value: int, start_date: str) -> str:
     if "acquisition_date" in day_table.columns:
         values = day_table["acquisition_date"].dropna()
@@ -872,7 +878,6 @@ def plot_wrapped_daywise_linear_relationships(
     *,
     start_date: str,
     max_columns: int = 7,
-    green_artifact_threshold: float = 1500.0,
 ) -> None:
     """Plot one red-vs-green panel per session, wrapping after max_columns."""
 
@@ -901,14 +906,16 @@ def plot_wrapped_daywise_linear_relationships(
     )
     flat_axes = axes.ravel()
 
-    panels: list[tuple[int, pd.DataFrame, int]] = []
+    panels: list[tuple[int, pd.DataFrame, pd.DataFrame, int]] = []
     x_min = np.inf
     x_max = -np.inf
     y_min = np.inf
     y_max = -np.inf
-    excluded_total = 0
     for day_value in day_values:
         columns = ["red", "green"]
+        for column in ("fit_population_artifact", "artifact_reason"):
+            if column in metrics.columns:
+                columns.append(column)
         if "acquisition_date" in metrics.columns:
             columns.append("acquisition_date")
         day_table_raw = (
@@ -917,15 +924,21 @@ def plot_wrapped_daywise_linear_relationships(
             .dropna(subset=["red", "green"])
             .reset_index(drop=True)
         )
-        day_table, excluded_count = day_table_raw, 0
+        if "fit_population_artifact" in day_table_raw.columns:
+            artifact_mask = day_table_raw["fit_population_artifact"].eq(True)
+        else:
+            artifact_mask = pd.Series(False, index=day_table_raw.index)
+        artifact_table = day_table_raw.loc[artifact_mask].copy()
+        day_table = day_table_raw.loc[~artifact_mask].copy()
+        excluded_count = int(len(artifact_table))
         if not day_table.empty:
             x_min = min(x_min, float(day_table["red"].min()))
             x_max = max(x_max, float(day_table["red"].max()))
             y_min = min(y_min, float(day_table["green"].min()))
             y_max = max(y_max, float(day_table["green"].max()))
-        panels.append((int(day_value), day_table, excluded_count))
+        panels.append((int(day_value), day_table, artifact_table, excluded_count))
 
-    for axis, (day_value, day_table, excluded_count) in zip(flat_axes, panels, strict=False):
+    for axis, (day_value, day_table, artifact_table, excluded_count) in zip(flat_axes, panels, strict=False):
         x_values = day_table["red"].to_numpy(dtype=float)
         y_values = day_table["green"].to_numpy(dtype=float)
         fit_row = fit_summary.loc[fit_summary["day"].eq(day_value)].iloc[0]
@@ -941,6 +954,12 @@ def plot_wrapped_daywise_linear_relationships(
             y_high = np.asarray([], dtype=float)
 
         axis.scatter(x_values, y_values, s=10, alpha=0.2, color="#1f3b4d", edgecolors="none", rasterized=True)
+        if not artifact_table.empty:
+            axis.scatter(
+                artifact_table["red"], artifact_table["green"],
+                marker="x", s=38, color="#f77f00", linewidths=1.2,
+                clip_on=False, label="excluded fit artifact",
+            )
 
         if len(x_grid) > 0 and np.all(np.isfinite(y_hat)):
             ci_available = (
@@ -973,6 +992,7 @@ def plot_wrapped_daywise_linear_relationships(
                 f"slope={fit_row['slope']:.3f}\n"
                 f"R²={fit_row['r_squared']:.3f}\n"
                 f"n={int(fit_row['n_rois'])}"
+                + (f"\nexcluded fit artifacts={excluded_count}" if excluded_count else "")
             ),
             transform=axis.transAxes,
             ha="left",
@@ -995,7 +1015,7 @@ def plot_wrapped_daywise_linear_relationships(
     if handles:
         figure.legend(handles, labels, loc="upper right", frameon=False)
     figure.suptitle(
-        "Daywise corrected red-green relationships: all signal-valid native session ROIs",
+        "Daywise corrected red-green relationships: fit-clean native session ROIs",
         fontsize=14,
         y=0.995,
     )
@@ -1003,8 +1023,8 @@ def plot_wrapped_daywise_linear_relationships(
         0.5,
         0.01,
         (
-            "Points are all signal-valid native session ROIs; the red line is the "
-            "saved canonical session-population fit."
+            "Points are signal-valid native session ROIs; orange x marks are excluded "
+            "fit-population artifacts. The red line is the saved fit-clean canonical fit."
         ),
         ha="center",
         va="bottom",
@@ -1115,22 +1135,60 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         if catalog_source.is_file():
             try:
                 catalog_frame = pd.read_csv(catalog_source, low_memory=False)
-                qc_rows = catalog_frame.loc[
+                catalog_rows = catalog_frame.loc[
                     catalog_frame["mouse_id"].astype(str).eq(str((config.project_provenance or {}).get("mouse_id", "")))
-                    & catalog_frame["laser_nm"].astype(str).eq(str((config.project_provenance or {}).get("laser_nm", "")))
                 ].to_dict("records")
+                qc_rows = _selected_acquisition_rows(
+                    catalog_rows,
+                    selected_records,
+                    (config.project_provenance or {}).get("selected_acquisition_ids"),
+                )
             except (OSError, KeyError, pd.errors.ParserError):
                 pass
-        qc_table, acquisition_qc = acquisition_settings_qc_table(qc_rows)
+        qc_rows = _selected_acquisition_rows(
+            qc_rows,
+            selected_records,
+            (config.project_provenance or {}).get("selected_acquisition_ids"),
+        )
+        qc_table, table_qc = acquisition_settings_qc_table(qc_rows)
         qc_table.to_csv(run_dir / "acquisition_settings_qc.csv", index=False)
         # This writes only derived QC artifacts under the run directory.
         write_acquisition_settings_qc_artifacts(qc_rows, run_dir)
         acquisition_table, consistency_qc = acquisition_settings_qc(
-            list(config.acquisition_settings_rows),
+            qc_rows,
             [str(record.session_id) for record in selected_records],
             int((config.project_provenance or {})["laser_nm"]),
         )
-        acquisition_qc["consistency"] = consistency_qc
+        expected_session_ids = {str(record.session_id) for record in selected_records}
+        session_values = qc_table.get("session_id", pd.Series(dtype=str)).dropna().astype(str)
+        actual_session_ids = set(session_values)
+        duplicate_session_ids = sorted(session_values[session_values.duplicated()].unique().tolist())
+        missing_session_ids = sorted(expected_session_ids - actual_session_ids)
+        selection_qc = {
+            "status": "PASS" if not missing_session_ids and not duplicate_session_ids and len(actual_session_ids) == len(expected_session_ids) else "ERROR",
+            "n_selected_sessions": len(expected_session_ids),
+            "n_qc_sessions": len(actual_session_ids),
+            "n_qc_rows": len(session_values),
+            "missing_session_ids": missing_session_ids,
+            "duplicate_session_ids": duplicate_session_ids,
+            "selected_acquisition_ids": sorted({str(row.get("acquisition_id", "")) for row in qc_rows if row.get("acquisition_id")}),
+        }
+        if selection_qc["status"] == "ERROR" or table_qc["status"] == "NOT_EVALUATED":
+            overall_status = "ERROR"
+        elif table_qc["status"] == "FAIL":
+            overall_status = "FAIL"
+        elif consistency_qc["status"] == "warning":
+            overall_status = "PASS_WITH_WARNING"
+        else:
+            overall_status = "PASS"
+        acquisition_qc = {
+            **table_qc,
+            "status": overall_status,
+            "selection_status": selection_qc["status"],
+            "settings_consistency_status": consistency_qc["status"],
+            "selection": selection_qc,
+            "consistency": consistency_qc,
+        }
         for failed in acquisition_qc.get("failed_sessions", []):
             _log(start_seconds, f"[QC SKIP] session={failed['session_id']} reason={failed['reason']}")
         acquisition_table.to_csv(run_dir / "acquisition_settings_by_session.csv", index=False)

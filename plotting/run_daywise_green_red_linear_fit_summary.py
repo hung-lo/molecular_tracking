@@ -100,24 +100,6 @@ def make_day_date_labels(
     return labels
 
 
-def _filter_green_artifacts(
-    day_table: pd.DataFrame,
-    green_artifact_threshold: float,
-) -> tuple[pd.DataFrame, int]:
-    """Drop rows that look like obvious green-channel artifacts."""
-
-    if day_table.empty:
-        return day_table.copy(), 0
-    cleaned = day_table.replace([np.inf, -np.inf], np.nan).dropna(subset=["red", "green"]).copy()
-    if cleaned.empty:
-        return cleaned, 0
-    artifact_mask = cleaned["green"].gt(float(green_artifact_threshold))
-    excluded_count = int(artifact_mask.sum())
-    if excluded_count == 0:
-        return cleaned.reset_index(drop=True), 0
-    return cleaned.loc[~artifact_mask].reset_index(drop=True), excluded_count
-
-
 def _resolve_day_date_labels(
     roi_metrics: pd.DataFrame,
     day_values: np.ndarray,
@@ -212,7 +194,6 @@ def plot_daywise_scatter_summary(
     fit_summary: pd.DataFrame,
     output_path: Path,
     start_date: str | None = None,
-    green_artifact_threshold: float = 1500.0,
 ) -> None:
     """Plot per-day red-vs-green scatters with fitted lines and CI bands.
 
@@ -228,9 +209,6 @@ def plot_daywise_scatter_summary(
         PNG path for the saved scatter summary figure.
     start_date : str, default=None
         Reference date used to convert day offsets into date labels.
-    green_artifact_threshold : float, default=1500.0
-        Retained for API compatibility; it does not alter a supplied canonical
-        fit or its display population.
     """
 
     if roi_metrics.empty:
@@ -244,7 +222,6 @@ def plot_daywise_scatter_summary(
         ].copy()
     if roi_metrics.empty:
         raise ValueError("No signal-valid ROI metrics were available for scatter plotting.")
-    excluded_total = 0
     timing = resolve_plot_day_axis(roi_metrics, start_date=start_date)
     source_to_plot = dict(zip(timing["source_day"], timing["plot_day"], strict=True))
     source_to_date = dict(zip(timing["source_day"], timing["date_label"], strict=True))
@@ -255,7 +232,7 @@ def plot_daywise_scatter_summary(
         start_date=start_date,
     )
 
-    panels: list[tuple[int, pd.DataFrame, int]] = []
+    panels: list[tuple[int, pd.DataFrame, pd.DataFrame, int]] = []
     x_min = np.inf
     x_max = -np.inf
     y_min = np.inf
@@ -266,7 +243,7 @@ def plot_daywise_scatter_summary(
                 roi_metrics["day"].eq(day_value),
                 [
                     column
-                    for column in ["red", "green", "track_match_source"]
+                    for column in ["red", "green", "track_match_source", "fit_population_artifact", "artifact_reason"]
                     if column in roi_metrics.columns
                 ],
             ]
@@ -274,13 +251,19 @@ def plot_daywise_scatter_summary(
             .dropna(subset=["red", "green"])
             .reset_index(drop=True)
         )
-        filtered_day_table, excluded_count = day_table, 0
+        if "fit_population_artifact" in day_table.columns:
+            artifact_mask = day_table["fit_population_artifact"].eq(True)
+        else:
+            artifact_mask = pd.Series(False, index=day_table.index)
+        artifact_table = day_table.loc[artifact_mask].copy()
+        filtered_day_table = day_table.loc[~artifact_mask].copy()
+        excluded_count = int(len(artifact_table))
         if not filtered_day_table.empty:
             x_min = min(x_min, float(filtered_day_table["red"].min()))
             x_max = max(x_max, float(filtered_day_table["red"].max()))
             y_min = min(y_min, float(filtered_day_table["green"].min()))
             y_max = max(y_max, float(filtered_day_table["green"].max()))
-        panels.append((int(day_value), filtered_day_table, excluded_count))
+        panels.append((int(day_value), filtered_day_table, artifact_table, excluded_count))
 
     figure, axes = plt.subplots(
         1,
@@ -293,7 +276,7 @@ def plot_daywise_scatter_summary(
     if len(day_values) == 1:
         axes = [axes]
 
-    for axis, (day_value, day_table, excluded_count), date_label in zip(
+    for axis, (day_value, day_table, artifact_table, excluded_count), date_label in zip(
         axes, panels, date_labels, strict=True
     ):
         fit_row = plot_fit_summary.loc[plot_fit_summary["day"].eq(day_value)].iloc[0]
@@ -321,6 +304,12 @@ def plot_daywise_scatter_summary(
         )
         if len(x_grid) > 0:
             axis.plot(x_grid, y_hat, color="#d62828", linewidth=2.0)
+        if not artifact_table.empty:
+            axis.scatter(
+                artifact_table["red"], artifact_table["green"],
+                marker="x", s=38, color="#f77f00", linewidths=1.2,
+                clip_on=False, label="excluded fit artifact",
+            )
 
         axis.set_title(f"Day {int(source_to_plot[int(day_value)])}\n{source_to_date[int(day_value)]}", fontsize=11)
         axis.set_xlabel("Corrected red intensity", fontsize=10)
@@ -336,7 +325,7 @@ def plot_daywise_scatter_summary(
                 f"R² = {fit_row['r_squared']:.3f}\n"
                 f"n = {int(fit_row['n_rois'])}"
                 + (
-                    f"\nexcluded green>{green_artifact_threshold:g}: {excluded_count}"
+                    f"\nexcluded fit artifacts: {excluded_count}"
                     if excluded_count
                     else ""
                 )
@@ -363,9 +352,9 @@ def plot_daywise_scatter_summary(
         0.5,
         0.02,
         (
-            "Each panel shows all signal-valid native session ROIs. The red line "
-            "is the saved canonical session-population fit; no display filter "
-            "recomputes or changes that fit."
+            "Each panel shows signal-valid native session ROIs; orange x marks are "
+            "excluded fit-population artifacts. The red line is the saved fit-clean "
+            "canonical fit."
         ),
         ha="center",
         va="bottom",
@@ -381,7 +370,6 @@ def plot_fit_parameter_summary(
     output_path: Path,
     roi_metrics: pd.DataFrame | None = None,
     start_date: str | None = None,
-    green_artifact_threshold: float = 1500.0,
 ) -> None:
     """Plot day-wise slope, intercept, fit quality, and ROI count summaries.
 
@@ -393,13 +381,9 @@ def plot_fit_parameter_summary(
     output_path : pathlib.Path
         PNG path for the saved summary figure.
     roi_metrics : pandas.DataFrame, optional
-        Raw ROI/day table. When provided, the plotted fit summary is recomputed
-        after excluding rows whose corrected green values exceed
-        ``green_artifact_threshold``.
+        Raw ROI/day table used only for date labels and signal-valid display rows.
     start_date : str, default=None
         Reference date used to convert day offsets into date labels.
-    green_artifact_threshold : float, default=1500.0
-        Retained for API compatibility; it does not alter a supplied fit.
     """
 
     plot_fit_summary = fit_summary.copy()
@@ -488,9 +472,8 @@ def plot_fit_parameter_summary(
         0.5,
         0.02,
         (
-            "This summary uses the saved canonical fit from all signal-valid "
-            "native session ROIs. Plotting does not refit or apply an artifact "
-            "threshold to the canonical fit."
+            "This summary uses the saved fit-clean canonical fit. Excluded artifact "
+            "counts and the reproducible fit-population rule are stored in the fit table."
         ),
         ha="center",
         va="bottom",

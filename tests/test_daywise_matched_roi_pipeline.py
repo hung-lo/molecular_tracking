@@ -247,12 +247,17 @@ def test_run_daywise_matched_roi_pipeline_accepts_graph_policy(tmp_path: Path) -
 
     complete = pd.read_csv(output_dir / "matched_roi_day_table_complete.csv")
     fit_summary = pd.read_csv(output_dir / "matched_daywise_green_red_linear_fit_summary.csv")
+    primary_final = pd.read_csv(output_dir / "primary_final_tracks.csv")
+    policy_status = pd.read_csv(output_dir / "policy_status.csv")
     run_log = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
 
     assert set(complete["match_policy"].astype(str)) == {"graph"}
     assert complete.shape[0] == 6
     assert set(complete["elapsed_days"].astype(int)) == {0, 1}
-    assert set(fit_summary["normalization_population"]) == {"all_valid_session_rois"}
+    assert set(fit_summary["normalization_population"]) == {"fit_clean_signal_valid_session_rois"}
+    assert set(primary_final["match_policy"]) == {"graph"}
+    assert policy_status.loc[policy_status["policy"].eq("high"), "status"].item() == "not_requested"
+    assert not (output_dir / "primary_high_complete_matching.csv").exists()
     assert run_log["output_paths"]["matched_daywise_green_red_linear_fit_summary"].endswith("matched_daywise_green_red_linear_fit_summary.csv")
 
 

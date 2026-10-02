@@ -495,6 +495,8 @@ def summarize_daily_green_red_linear_fits(
                 day_table["red_signal_qc_pass"].eq(True)
                 & day_table["green_signal_qc_pass"].eq(True)
             ]
+        if "fit_population_include" in day_table.columns:
+            day_table = day_table.loc[day_table["fit_population_include"].eq(True)]
         valid_rows = day_table[[red_column, green_column]].replace([np.inf, -np.inf], np.nan)
         valid_rows = valid_rows.dropna().reset_index(drop=True)
         if len(valid_rows) < 2:

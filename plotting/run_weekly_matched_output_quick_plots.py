@@ -117,6 +117,20 @@ def _first_existing_path(analysis_dir: Path, *names: str) -> Path:
     raise FileNotFoundError(f"None of the expected input tables were found in {analysis_dir}: {expected}")
 
 
+def _population_title(analysis_dir: Path) -> str:
+    run_log = analysis_dir / "run_log.json"
+    if run_log.is_file():
+        try:
+            status = json.loads(run_log.read_text(encoding="utf-8")).get("segmentation_qc_status")
+        except (OSError, json.JSONDecodeError):
+            status = None
+        if status == "not_configured_bypassed":
+            return "ROI population summaries (segmentation QC bypassed)"
+        if status:
+            return "ROI population summaries (segmentation QC applied)"
+    return "ROI population summaries"
+
+
 def _filter_table_by_policy(table: pd.DataFrame, policy: str) -> pd.DataFrame:
     """Keep a single match policy when policy-specific data is available."""
 
@@ -180,6 +194,7 @@ def build_quick_plots(
     log_message(run_start_seconds, f"Starting matched ROI quick plots | analysis_dir={analysis_dir}")
     metrics_path = _first_existing_path(
         analysis_dir,
+        "matched_roi_metrics_primary_final.csv",
         "weekly_matched_roi_log_ratio_metrics_complete.csv",
         "matched_roi_log_ratio_metrics_complete.csv",
     )
@@ -188,6 +203,7 @@ def build_quick_plots(
         fit_population_path = metrics_path
     residuals_path = _first_existing_path(
         analysis_dir,
+        "matched_roi_metrics_primary_final_with_green_red_fit_residuals.csv",
         "weekly_matched_roi_metrics_with_green_red_fit_residuals.csv",
         "matched_roi_metrics_with_green_red_fit_residuals.csv",
     )
@@ -222,12 +238,14 @@ def build_quick_plots(
         output_path=output_dir / "population_longitudinal_summary.png",
         start_date=start_date,
         include_traces=False,
+        population_title=_population_title(analysis_dir),
     )
     plot_population_summary(
         roi_metrics=metrics_table,
         output_path=output_dir / "population_longitudinal_summary_with_traces.png",
         start_date=start_date,
         include_traces=True,
+        population_title=_population_title(analysis_dir),
     )
     plot_daywise_scatter_summary(
         roi_metrics=fit_population,

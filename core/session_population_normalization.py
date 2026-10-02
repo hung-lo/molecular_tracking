@@ -9,6 +9,41 @@ import tifffile
 from roi_log_ratio_analysis import compute_log_ratio_metrics, extract_roi_mean_intensities, summarize_daily_green_red_linear_fits
 
 
+FIT_POPULATION_RULE = (
+    "signal-valid Green values with modified_z <= 10 and no conservative upper-tail "
+    "outlier above Q3 + 30*IQR; if MAD is zero use that IQR rule alone"
+)
+
+
+def flag_fit_population_artifacts(population: pd.DataFrame) -> pd.DataFrame:
+    """Flag conservative, session-local extreme Green values for fitting."""
+
+    output = population.copy()
+    output["fit_population_artifact"] = False
+    output["fit_population_include"] = output["ratio_qc_pass"].eq(True)
+    output["artifact_reason"] = ""
+    for _, indexes in output.groupby("day", sort=False).groups.items():
+        group = output.loc[indexes]
+        valid = group.loc[group["ratio_qc_pass"].eq(True), "green"].astype(float)
+        if len(valid) < 3:
+            continue
+        median = float(valid.median())
+        mad = float(np.median(np.abs(valid.to_numpy() - median)))
+        q1, q3 = valid.quantile([0.25, 0.75]).tolist()
+        iqr = float(q3 - q1)
+        upper_iqr = float(q3 + 30.0 * iqr) if iqr > 0 else median
+        if mad > 0:
+            modified_z = 0.6745 * (valid - median) / mad
+            artifact = (modified_z > 10.0) & (valid > upper_iqr)
+        else:
+            artifact = valid > upper_iqr
+        artifact_indexes = valid.index[artifact]
+        output.loc[artifact_indexes, "fit_population_artifact"] = True
+        output.loc[artifact_indexes, "fit_population_include"] = False
+        output.loc[artifact_indexes, "artifact_reason"] = "green_robust_upper_outlier"
+    return output
+
+
 def extract_session_population(records, *, green_dark: float, red_dark: float, epsilon: float) -> pd.DataFrame:
     required = [record for record in records if record.required]
     start_date = min(record.acquisition_date for record in required)
@@ -40,27 +75,35 @@ def extract_session_population(records, *, green_dark: float, red_dark: float, e
     wide["__session_native_roi_key"] = wide["session_id"].astype(str) + "::" + wide["mask_label"].astype(str)
     wide["roi_id"] = wide["__session_native_roi_key"]
     metrics = compute_log_ratio_metrics(wide, epsilon=epsilon)
-    return metrics.drop(columns=["roi_id", "__session_native_roi_key"] + [column for column in metrics if column.startswith("day0_") or "first_observed" in column or column.startswith("delta_")])
+    metrics = metrics.drop(columns=["roi_id", "__session_native_roi_key"] + [column for column in metrics if column.startswith("day0_") or "first_observed" in column or column.startswith("delta_")])
+    return flag_fit_population_artifacts(metrics)
 
 
 def fit_session_population(population: pd.DataFrame) -> pd.DataFrame:
-    fits = summarize_daily_green_red_linear_fits(population)
+    if "fit_population_include" not in population.columns:
+        population = flag_fit_population_artifacts(population)
+    fit_population = population.loc[population["fit_population_include"].eq(True)].copy()
+    fits = summarize_daily_green_red_linear_fits(fit_population)
     diagnostics = []
     for day, group in population.groupby("day", sort=True):
-        valid = group.loc[group["ratio_qc_pass"].eq(True)]
+        valid = group.loc[group["fit_population_include"].eq(True)]
         fit = fits.loc[fits["day"].eq(day)].iloc[0]
         residuals = valid["green"] - (fit["intercept"] + fit["slope"] * valid["red"])
         diagnostics.append({
             "day": int(day), "n_rois_total": int(len(group)),
-            "n_rois_signal_valid": int(len(valid)),
-            "signal_valid_fraction": float(len(valid) / len(group)) if len(group) else np.nan,
+            "n_rois_signal_valid": int(group["ratio_qc_pass"].eq(True).sum()),
+            "signal_valid_fraction": float(group["ratio_qc_pass"].eq(True).mean()) if len(group) else np.nan,
+            "n_fit_included": int(len(valid)),
+            "n_fit_excluded": int(group["ratio_qc_pass"].eq(True).sum() - len(valid)),
+            "fit_population_fraction": float(len(valid) / group["ratio_qc_pass"].eq(True).sum()) if group["ratio_qc_pass"].eq(True).sum() else np.nan,
             "residual_mean_fit_population": float(residuals.mean()),
             "residual_std_fit_population": float(residuals.std(ddof=1)),
         })
     fits = fits.merge(pd.DataFrame(diagnostics), on="day", validate="one_to_one")
     metadata = population[["day", "session_index", "session_id", "acquisition_date", "elapsed_days"]].drop_duplicates("day")
     fits = fits.merge(metadata, on="day", how="left", validate="one_to_one")
-    fits["normalization_population"] = "all_valid_session_rois"
+    fits["normalization_population"] = "fit_clean_signal_valid_session_rois"
+    fits["fit_population_rule"] = FIT_POPULATION_RULE
     return fits
 
 
@@ -81,6 +124,7 @@ def summarize_signal_qc(population: pd.DataFrame) -> pd.DataFrame:
             "red_signal_valid_fraction": float(group["red_signal_qc_pass"].mean()),
             "green_signal_valid_fraction": float(group["green_signal_qc_pass"].mean()),
             "ratio_valid_fraction": float(group["ratio_qc_pass"].mean()),
-            "n_fit_population": int(group["ratio_qc_pass"].sum()),
+            "n_fit_population": int(group.get("fit_population_include", group["ratio_qc_pass"]).sum()),
+            "n_fit_excluded_artifact": int(group.get("fit_population_artifact", pd.Series(False, index=group.index)).sum()),
         })
     return pd.DataFrame(rows)

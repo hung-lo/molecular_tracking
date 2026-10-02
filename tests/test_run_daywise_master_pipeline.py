@@ -60,10 +60,10 @@ def test_resume_requires_current_normalization_provenance(tmp_path: Path) -> Non
         (extraction / name).touch()
     assert not _has_current_extraction(extraction)
     (extraction / "run_log.json").write_text(json.dumps({"analysis_version": "0.3.0", "normalization": {"population": "all_valid_session_rois"}}))
-    for name in ("matched_session_population_roi_metrics.csv", "matched_session_population_signal_qc_summary.csv", "matched_roi_metrics_with_session_normalized_residuals_all_observed.csv", "matched_roi_trajectory_eligibility.csv"):
+    for name in ("matched_session_population_roi_metrics.csv", "matched_session_population_signal_qc_summary.csv", "matched_roi_metrics_with_session_normalized_residuals_all_observed.csv", "matched_roi_trajectory_eligibility.csv", "primary_final_tracks.csv", "matched_roi_metrics_primary_final.csv", "policy_status.csv"):
         (extraction / name).touch()
     assert not _has_current_extraction(extraction)
-    (extraction / "run_log.json").write_text(json.dumps({"analysis_version": "0.3.1", "normalization": {"population": "all_valid_session_rois"}}))
+    (extraction / "run_log.json").write_text(json.dumps({"analysis_version": "0.3.2", "normalization": {"population": "fit_clean_signal_valid_session_rois"}}))
     assert _has_current_extraction(extraction)
 
 

@@ -22,7 +22,9 @@ The pipeline separates missing segmentation from failed intensity extraction.
 
 ## Normalization and trajectories
 
-Session normalization uses all signal-valid native ROIs in each imaging session and does not require longitudinal track completeness. The OLS-with-intercept fit is saved once per session and applied unchanged to complete and partial track observations.
+Session normalization uses signal-valid native ROIs after a conservative, session-local Green artifact rule (modified z-score plus an upper-tail IQR check). Raw measurements remain unchanged; the OLS-with-intercept fit is saved once per session and applied unchanged to complete and partial track observations. Fit inclusion/exclusion counts and the rule are stored in the fit summary.
+
+Canonical biological outputs use the post-cycle-QC `primary_final_tracks.csv` population. `primary_final_strict_tracks.csv` is the review-free subset; broader complete-track tables remain sensitivity/QC outputs. `policy_status.csv` distinguishes policies that were not requested from policies evaluated with zero tracks.
 
 Trajectory eligibility is a downstream identity/coverage criterion and does not influence the session normalization fit. Its defaults require two usable sessions, with no fraction, internal-gap, first-session, or last-session requirement.
 

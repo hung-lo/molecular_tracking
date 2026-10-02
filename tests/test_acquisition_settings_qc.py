@@ -1,4 +1,4 @@
-from acquisition_settings_qc import _session_plot_rows, acquisition_settings_qc, acquisition_settings_qc_table, validate_acquisition_row, write_acquisition_settings_qc_artifacts
+from acquisition_settings_qc import _selected_laser, _session_plot_rows, acquisition_settings_qc, acquisition_settings_qc_table, validate_acquisition_row, write_acquisition_settings_qc_artifacts
 
 
 def test_selected_laser_acquisition_changes_warn() -> None:
@@ -27,6 +27,16 @@ def test_acquisition_qc_only_uses_selected_subset() -> None:
     rows = [{"session_id": "s0", "pmt_a_gain": 1}, {"session_id": "s1", "pmt_a_gain": 1}, {"session_id": "s2", "pmt_a_gain": 9}]
     _, qc = acquisition_settings_qc(rows, ["s0", "s1"], 1050)
     assert qc["status"] == "pass" and qc["n_sessions"] == 2
+
+
+def test_acquisition_qc_accepts_numeric_laser_representations() -> None:
+    rows = [{"session_id": "s0", "laser_nm": "1050.0"}, {"session_id": "s1", "laser_nm": 1050.0}]
+    assert all(_selected_laser(row["laser_nm"], 1050) for row in rows)
+
+
+def test_empty_acquisition_qc_is_not_evaluated() -> None:
+    _, summary = acquisition_settings_qc_table([])
+    assert summary["status"] == "NOT_EVALUATED"
 
 
 def test_software_change_warns_but_is_not_strict_numeric_failure() -> None:

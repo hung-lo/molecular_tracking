@@ -514,6 +514,7 @@ def plot_population_summary(
     output_path: Path,
     start_date: str,
     include_traces: bool,
+    population_title: str = "ROI population summaries",
 ) -> None:
     """Plot population summaries for raw and normalized green/red metrics.
 
@@ -623,10 +624,7 @@ def plot_population_summary(
         axis.set_xticks(day_values, [f"Day {int(day)}\n{label}" for day, label in zip(day_values, date_labels, strict=True)])
         axis.tick_params(labelsize=9)
 
-    figure.suptitle(
-        "Size+shape-filtered ROI population summaries",
-        fontsize=14,
-    )
+    figure.suptitle(population_title, fontsize=14)
     caption = (
         "Solid lines show the median across ROIs and shaded bands show the "
         "interquartile range. Faint lines show individual ROIs."

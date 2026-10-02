@@ -5,7 +5,7 @@ import pandas as pd
 import tifffile
 
 from session_manifest import SessionRecord
-from session_population_normalization import extract_session_population, summarize_signal_qc
+from session_population_normalization import extract_session_population, fit_session_population, flag_fit_population_artifacts, summarize_signal_qc
 
 
 def _write_session(tmp_path, session_id, red, green):
@@ -35,3 +35,29 @@ def test_native_population_keeps_both_channel_zero_hit_and_has_no_longitudinal_i
     qc = summarize_signal_qc(population).set_index("session_id")
     assert qc.loc["s0", "n_native_rois"] == 2
     assert qc.loc["s0", "n_ratio_valid"] == 1
+
+
+def test_fit_population_flags_only_extreme_green_and_preserves_measurements():
+    population = pd.DataFrame({
+        "day": [0] * 6,
+        "ratio_qc_pass": [True] * 6,
+        "red": [100., 110., 120., 130., 140., 150.],
+        "green": [100., 110., 105., 108., 300., 5974.],
+        "session_index": [0] * 6,
+        "session_id": ["s0"] * 6,
+        "acquisition_date": ["2026-01-01"] * 6,
+        "elapsed_days": [0] * 6,
+    })
+    flagged = flag_fit_population_artifacts(population)
+
+    assert flagged.loc[flagged["green"].eq(5974.), "fit_population_artifact"].item()
+    assert not flagged.loc[flagged["green"].eq(300.), "fit_population_artifact"].item()
+    assert not bool(flagged.loc[flagged["green"].eq(5974.), "fit_population_include"].item())
+    assert flagged.loc[flagged["green"].eq(5974.), "artifact_reason"].item() == "green_robust_upper_outlier"
+    assert population.loc[population["green"].eq(5974.), "green"].item() == 5974.
+
+    fit = fit_session_population(population)
+    row = fit.iloc[0]
+    assert row["n_fit_included"] == 5
+    assert row["n_fit_excluded"] == 1
+    assert row["fit_population_rule"]

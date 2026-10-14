@@ -114,7 +114,7 @@ python tools/build_session_manifest.py \
   --laser-nm 1050
 ```
 
-If the required registered images and masks are not available yet, the builder writes a planning manifest rather than pretending the dataset is analysis-ready.
+Every build writes `session_manifest_plan.csv`, which includes a readiness status for each selected session. When every session has preprocessed red and green images and a segmentation mask, the builder also writes `daywise_session_manifest.csv` in the historical analysis-ready schema and returns that path. If any session is unready, it returns the plan path instead.
 
 ### 5. Run the primary daywise pipeline
 
@@ -145,6 +145,32 @@ For a small contiguous test run:
 
 `--sessions first:N` and `--sessions last:N` create a run-local subset and never modify the validated project manifest.
 
+Project-mode full runs use the analysis-ready manifest and require all source sessions to be ready. Project-mode subset runs use the plan and validate readiness only for the selected sessions. The subset is recorded with contiguous run-local indices while provenance retains the source session indices and IDs.
+
+### Current Fucci-Tri_5 1050-nm run
+
+For the current 12-session Fucci-Tri_5 dataset (2026-09-24 through 2026-10-14), the 2026-09-24 session is excluded from this analysis because it does not meet the downstream minimum of two valid ROIs after invalid rows are dropped. Keep that session in the catalog and use the subset selector for this run; do not loosen the fluorescence fitting or QC thresholds to include it.
+
+```bash
+python tools/build_data_catalog.py \
+  --project-config config/project.local.toml \
+  --strict
+
+python tools/build_session_manifest.py \
+  --project-config config/project.local.toml \
+  --mouse-id Fucci-Tri_5 \
+  --laser-nm 1050
+
+.venv/bin/python core/run_daywise_master_pipeline.py \
+  --project-config config/project.local.toml \
+  --mouse-id Fucci-Tri_5 \
+  --laser-nm 1050 \
+  --pair-workers 8 \
+  --sessions last:11
+```
+
+With exactly 12 source sessions, `last:11` selects source indices 1 through 11 and omits the 2026-09-24 session. This count is specific to the current catalog: if sessions are added, review the selection because `last:11` will continue to select the 11 most recent sessions.
+
 ---
 
 # Current tracking architecture
@@ -173,15 +199,22 @@ The currently configured Fucci acquisition expectations are:
 | `Fucci-Tri_1` | enabled | 10 | 10 | 50 | 50 |
 | `Fucci-Tri_2` | excluded — poor FoV quality | n/a | n/a | n/a | n/a |
 | `Fucci-Tri_3` | enabled | 10 | 10 | 60 | 60 |
-| `Fucci-Tri_4` | enabled | 10 | 10 | 70 | 70 |
+| `Fucci-Tri_4` | enabled | 10 | 10 | 75 | 75 |
+| `Fucci-Tri_5` | enabled | 10 | 10 | 70 | 70 |
+| `Fucci-Tri_6` | enabled | 10 | 10 | 60 | 60 |
+| `Fucci-Tri_7` | enabled | 10 | 10 | 60 | 60 |
 | `Fucci-Dead_1` | enabled | 10 | 10 | 70 | 70 |
 | `Fucci-Dead_2` | enabled | 10 | 10 | 70 | 70 |
+| `Fucci-Dead_3` | enabled | 10 | 10 | 60 | 60 |
+| `Fucci-Dead_4` | enabled | 10 | 10 | 60 | 60 |
 
 For an active laser, both Pockels start and stop values must match the configured expected power. The selected laser is always treated as active, so an accidentally zero or incorrect selected-laser power fails QC.
 
 A Fucci acquisition that fails this check is marked `analysis_eligible = False` and is excluded from manifest generation.
 
 `Fucci-Tri_2` is explicitly disabled from the longitudinal pipeline because of poor FoV quality. Its raw acquisitions remain in the catalog for provenance, but it is omitted from analysis manifests and the primary QC plot; it is not reported as an acquisition-settings failure.
+
+`Fucci-Tri_4` follows the LP75 longitudinal policy beginning 2026-09-17; earlier sessions are excluded by that policy.
 
 The Fucci workflow also **fails closed on old catalogs** that do not contain the acquisition-QC fields. Rebuild them with `tools/build_data_catalog.py` rather than silently analyzing data with unknown acquisition settings.
 

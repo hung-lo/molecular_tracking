@@ -446,6 +446,9 @@ def build_manifest_plan(config,rows,mouse_id:str,laser_nm:int|None=None,*,source
     metadata={"mouse_id":mouse_id,"laser_nm":laser,"reference_session_id":reference["session_id"],"reference_acquisition_id":reference["acquisition_id"],"reference_acquisition_path":reference["source_path"],"source_catalog":str(catalog),"catalog_sha256":catalog_hash,"catalog_version":(validation_report or {}).get("catalog_version",CATALOG_VERSION),"generated_utc":datetime.now(timezone.utc).isoformat(),"selected_session_ids":[r["session_id"] for r in selected],"selected_acquisition_ids":[r["acquisition_id"] for r in selected]}
     _atomic_text(manifest_dir/"manifest_metadata.json",json.dumps(metadata,indent=2,sort_keys=True)); _atomic_text(manifest_dir/"manifest_state.json",json.dumps({"ready":ready,"catalog_path":str(catalog),"catalog_sha256":catalog_hash,"manifest_metadata":"manifest_metadata.json"},indent=2,sort_keys=True))
     fields=["session_index","session_id","acquisition_date","mask_path","red_image_path","green_image_path","required"]
-    if ready: path=manifest_dir/"daywise_session_manifest.csv"; _atomic_csv(path,planned,fields)
-    else: path=manifest_dir/"session_manifest_plan.csv"; _atomic_csv(path,planned,fields+["status"])
+    plan_path=manifest_dir/"session_manifest_plan.csv"; _atomic_csv(plan_path,planned,fields+["status"])
+    if ready:
+        path=manifest_dir/"daywise_session_manifest.csv"; _atomic_csv(path,planned,fields)
+    else:
+        path=plan_path
     return path,ready

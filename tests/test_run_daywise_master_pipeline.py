@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from datetime import date, timedelta
 import json
 import pandas as pd
@@ -265,6 +266,48 @@ def test_selected_manifest_reindexes_and_preserves_resolved_paths(tmp_path: Path
     assert rows[0].split(",")[1] == "source_session_index"
     assert [row.split(",")[1] for row in rows[1:]] == ["3", "4", "5"]
     assert all(row.rsplit(",", 1)[-1] == "true" for row in rows[1:])
+
+
+def test_last_eleven_of_twelve_excludes_first_source_and_reindexes(tmp_path: Path) -> None:
+    base_records = _build_records(tmp_path, count=12)
+    source_records = [
+        SessionRecord(
+            session_index=index,
+            session_id=f"Fucci-Tri_5_session_{index:02d}",
+            acquisition_date=date(2026, 9, 24) + timedelta(days=round(index * 20 / 11)),
+            mask_path=record.mask_path,
+            red_image_path=record.red_image_path,
+            green_image_path=record.green_image_path,
+            required=record.required,
+        )
+        for index, record in enumerate(base_records)
+    ]
+    selection = _parse_session_selection("last:11")
+    selected = _select_session_records(source_records, selection)
+
+    assert source_records[0].acquisition_date == date(2026, 9, 24)
+    assert [record.session_index for record in selected] == list(range(1, 12))
+    assert [record.session_id for record in selected] == [
+        f"Fucci-Tri_5_session_{index:02d}" for index in range(1, 12)
+    ]
+
+    effective_manifest = tmp_path / "run" / "selected_session_manifest.csv"
+    _write_selected_session_manifest(effective_manifest, selected)
+    loaded = load_session_manifest(effective_manifest)
+    with effective_manifest.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert [record.session_index for record in loaded] == list(range(11))
+    assert [int(row["source_session_index"]) for row in rows] == list(range(1, 12))
+    assert [row["session_id"] for row in rows] == [record.session_id for record in selected]
+    provenance = _session_selection_provenance(
+        selection,
+        source_records,
+        selected,
+        master._sha256_bytes(effective_manifest.read_bytes()),
+    )
+    assert provenance["selected_source_session_indices"] == list(range(1, 12))
+    assert provenance["selected_session_ids"] == [record.session_id for record in selected]
 
 
 def test_resume_rejects_different_effective_selection(tmp_path: Path) -> None:

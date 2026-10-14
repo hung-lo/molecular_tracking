@@ -460,33 +460,78 @@ def test_manifest_plan_classifies_missing_mask_as_segmentation_required(tmp_path
 
 def test_manifest_plan_all_present_writes_ready_manifest(tmp_path):
     config, _ = _project(tmp_path)
-    rows = _manifest_rows(config)
-    _write_manifest_inputs(config, rows, {0})
+    rows = _manifest_rows(config, count=2)
+    _write_manifest_inputs(config, rows, {0, 1})
 
     manifest, ready = build_manifest_plan(config, rows, "mouse_1")
+
     assert ready
     assert manifest.name == "daywise_session_manifest.csv"
-    assert "status" not in manifest.read_text().splitlines()[0]
+    assert manifest.read_text().splitlines()[0].split(",") == [
+        "session_index",
+        "session_id",
+        "acquisition_date",
+        "mask_path",
+        "red_image_path",
+        "green_image_path",
+        "required",
+    ]
+    with manifest.open(newline="") as handle:
+        ready_rows = list(csv.DictReader(handle))
+    assert [row["session_id"] for row in ready_rows] == ["session_0", "session_1"]
+
+    plan = manifest.with_name("session_manifest_plan.csv")
+    assert plan.is_file()
+    with plan.open(newline="") as handle:
+        plan_reader = csv.DictReader(handle)
+        plan_rows = list(plan_reader)
+    assert plan_reader.fieldnames == [
+        "session_index",
+        "session_id",
+        "acquisition_date",
+        "mask_path",
+        "red_image_path",
+        "green_image_path",
+        "required",
+        "status",
+    ]
+    assert [row["session_id"] for row in plan_rows] == ["session_0", "session_1"]
+    assert [row["status"] for row in plan_rows] == ["ready", "ready"]
 
 
 def test_manifest_plan_mixed_sessions_reports_each_status_and_not_ready(tmp_path):
     config, _ = _project(tmp_path)
-    rows = _manifest_rows(config, count=3)
-    _write_manifest_inputs(config, rows, {0})
-    second_base = config.paths.derivatives_root / "mouse_1" / "sessions" / "20260820" / "1050"
-    (second_base / "preprocessing").mkdir(parents=True)
-    (second_base / "preprocessing" / "red.tif").touch()
-    (second_base / "preprocessing" / "green.tif").touch()
+    rows = _manifest_rows(config, count=4)
+    _write_manifest_inputs(config, rows, {0, 1})
+    third_base = config.paths.derivatives_root / "mouse_1" / "sessions" / "20260821" / "1050"
+    (third_base / "preprocessing").mkdir(parents=True)
+    (third_base / "preprocessing" / "red.tif").touch()
+    (third_base / "preprocessing" / "green.tif").touch()
 
     plan, ready = build_manifest_plan(config, rows, "mouse_1")
     assert not ready
     assert plan.name == "session_manifest_plan.csv"
-    statuses = {
-        row["session_id"]: row["status"]
-        for row in __import__("csv").DictReader(plan.open(newline=""))
-    }
+    with plan.open(newline="") as handle:
+        statuses = {row["session_id"]: row["status"] for row in csv.DictReader(handle)}
     assert statuses == {
         "session_0": "ready",
-        "session_1": "segmentation_required",
-        "session_2": "preprocessing_required",
+        "session_1": "ready",
+        "session_2": "segmentation_required",
+        "session_3": "preprocessing_required",
     }
+
+    from run_daywise_master_pipeline import (
+        _parse_session_selection,
+        _select_session_records,
+        _validate_selected_plan_ready,
+    )
+    from session_manifest import load_session_manifest
+
+    records = load_session_manifest(plan, check_paths=False)
+    _validate_selected_plan_ready(
+        plan, _select_session_records(records, _parse_session_selection("first:2"))
+    )
+    with pytest.raises(FileNotFoundError, match="2026-08-21: segmentation_required"):
+        _validate_selected_plan_ready(
+            plan, _select_session_records(records, _parse_session_selection("first:3"))
+        )

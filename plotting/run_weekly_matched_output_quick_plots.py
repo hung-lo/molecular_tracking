@@ -25,11 +25,10 @@ for _import_dir in (
 from project_cli import add_project_selector, resolve_analysis_selection
 from project_config import validate_output_path, is_relative_to
 from roi_log_ratio_analysis import (
+    decide_ranking_population,
     has_usable_day0_baseline,
     select_ranked_roi_days,
     select_top_changing_rois,
-    summarize_roi_metrics,
-    summarize_window_metrics_for_ranking,
 )
 from run_registered_roi_pipeline import plot_population_summary, plot_ranked_heatmap
 from run_daywise_green_red_fit_residuals import (
@@ -203,6 +202,7 @@ def _ranking_provenance(
     selection: dict[str, object] | None,
     metrics: pd.DataFrame,
     residual_join_status: str,
+    ranking_decision=None,
 ) -> dict[str, object]:
     manifest_path = analysis_dir / "session_manifest_resolved.csv"
     manifest = pd.read_csv(manifest_path) if manifest_path.is_file() else pd.DataFrame()
@@ -240,11 +240,14 @@ def _ranking_provenance(
                 f"Source session {first_index} ({first_manifest.get('session_id', '')}, "
                 f"{first_manifest.get('acquisition_date', '')}) remains in the manifest but has no rows in the selected-window cohort."
             )
-    return {
+    provenance = {
         "ranking_population": population,
         "ranking_baseline_session_index": baseline_index,
         "ranking_baseline_session_id": baseline_id,
         "ranking_baseline_acquisition_date": baseline_date,
+        "ranking_baseline_source_session_index": baseline_index,
+        "ranking_baseline_source_session_id": baseline_id,
+        "ranking_baseline_source_acquisition_date": baseline_date,
         "window_status": (selection or {}).get("status", "unavailable"),
         "window_start_session_index": window_indices[0] if window_indices else None,
         "window_end_session_index": window_indices[-1] if window_indices else None,
@@ -262,6 +265,18 @@ def _ranking_provenance(
         "residual_join_status": residual_join_status,
         "ranking_baseline_note": first_absent_note,
     }
+    if ranking_decision is not None:
+        provenance.update({
+            "ranking_decision_reason": ranking_decision.decision_reason,
+            "ranking_original_day0_signal_valid_count": ranking_decision.original_day0_signal_valid_count,
+            "ranking_original_day0_rankable_track_count": ranking_decision.original_day0_rankable_track_count,
+            "ranking_window_rankable_track_count": ranking_decision.window_rankable_track_count,
+            "ranking_selected_rankable_track_count": ranking_decision.selected_rankable_track_count,
+            "ranking_low_n_warning": ranking_decision.low_n_warning,
+            "ranking_low_n_threshold": ranking_decision.low_n_threshold,
+            "ranking_window_status_reason": ranking_decision.window_status_reason,
+        })
+    return provenance
 
 
 def _annotate_rank_table(table: pd.DataFrame, provenance: dict[str, object]) -> pd.DataFrame:
@@ -324,6 +339,7 @@ def build_quick_plots(
     policy: str = "high",
     output_dir: str | Path | None = None,
     project_context=None,
+    ranking_population: str = "auto",
 ) -> Path:
     """Render a small set of no-rerun QC plots from saved matched output tables."""
 
@@ -418,17 +434,67 @@ def build_quick_plots(
         start_date=start_date,
     )
 
-    roi_summary = summarize_roi_metrics(metrics_table) if not metrics_table.empty else pd.DataFrame()
-    ranking_population = "original_day0"
-    ranking_metrics_table = metrics_table
-    ranking_residual_table = residuals_table
-    ranking_input_path = metrics_path
-    ranking_residual_path = residuals_path
-    ranking_metric_column = "delta_log2_green_over_red"
-    ranking_summary = roi_summary
     window_selection, window_problem = _read_window_selection(analysis_dir)
+    window_metrics_path = analysis_dir / "matched_roi_metrics_longest_supported_window.csv"
+    window_tracks_path = analysis_dir / "matched_roi_tracks_longest_supported_window.csv"
+    saved_window_metrics = None
+    saved_window_tracks = None
+    if window_selection and window_selection.get("status") == "valid":
+        try:
+            if window_metrics_path.is_file():
+                saved_window_metrics = _filter_table_by_policy(
+                    _load_metrics_table(window_metrics_path), policy,
+                )
+            else:
+                window_problem = "selected_window_metrics_table_missing"
+            if window_tracks_path.is_file():
+                saved_window_tracks = _filter_table_by_policy(
+                    _load_metrics_table(window_tracks_path), policy,
+                )
+            else:
+                window_problem = "selected_window_tracks_table_missing"
+        except (ValueError, KeyError, pd.errors.EmptyDataError) as error:
+            saved_window_metrics = None
+            saved_window_tracks = None
+            window_problem = f"selected_window_inputs_invalid:{type(error).__name__}"
+
+    ranking_decision = decide_ranking_population(
+        metrics_table,
+        window_selection=window_selection,
+        window_metrics=saved_window_metrics,
+        window_tracks=saved_window_tracks,
+        window_unavailable_reason=window_problem or None,
+        requested_population=ranking_population,
+    )
+    ranking_population = ranking_decision.population
+    ranking_metric_column = (
+        "delta_log2_green_over_red_from_window_baseline"
+        if ranking_population == "longest_supported_window"
+        else "delta_log2_green_over_red"
+    )
+    ranking_metrics_table = (
+        saved_window_metrics.copy()
+        if ranking_population == "longest_supported_window" and saved_window_metrics is not None
+        else metrics_table
+    )
+    ranking_residual_table = residuals_table
+    ranking_input_path = window_metrics_path if ranking_population == "longest_supported_window" else metrics_path
+    ranking_residual_path = residuals_path
+    ranking_summary = (
+        ranking_decision.window_summary
+        if ranking_population == "longest_supported_window"
+        else ranking_decision.original_summary
+    )
     residual_join_status = "original_population_residual_table"
-    top_level_reason = ""
+    top_level_reason = (
+        ranking_decision.window_status_reason
+        if (
+            ranking_summary.empty
+            and ranking_decision.original_day0_signal_valid_count == 0
+            and ranking_decision.window_status_reason == "no_supported_window"
+        )
+        else ranking_decision.decision_reason
+    )
     if (
         {"roi_id", "session_index", "session_id"}.issubset(metrics_table.columns)
         and {"roi_id", "session_index", "session_id"}.issubset(residuals_table.columns)
@@ -436,49 +502,25 @@ def build_quick_plots(
         ranking_residual_table, residual_join_status = _window_residual_table(
             metrics_table, residuals_table,
         )
-
-    if not has_usable_day0_baseline(metrics_table):
-        ranking_population = "longest_supported_window"
-        ranking_metric_column = "delta_log2_green_over_red_from_window_baseline"
-        ranking_input_path = analysis_dir / "matched_roi_metrics_longest_supported_window.csv"
+    if ranking_population == "longest_supported_window":
         all_observed_residual_path = analysis_dir / "matched_roi_metrics_with_session_normalized_residuals_all_observed.csv"
         ranking_residual_path = all_observed_residual_path if all_observed_residual_path.is_file() else residuals_path
-        ranking_summary = pd.DataFrame()
-        ranking_metrics_table = pd.DataFrame()
         ranking_residual_table = pd.DataFrame()
-        if window_problem:
-            top_level_reason = window_problem
-        elif not ranking_input_path.is_file():
-            top_level_reason = "selected_window_metrics_table_missing"
-        else:
+        if saved_window_metrics is not None and saved_window_tracks is not None:
             try:
-                ranking_metrics_table = _filter_table_by_policy(
-                    _load_metrics_table(ranking_input_path), policy,
-                )
-                if ranking_metrics_table.empty:
-                    top_level_reason = "selected_window_has_no_rows_for_requested_policy"
-                else:
-                    ranking_summary = summarize_window_metrics_for_ranking(
-                        ranking_metrics_table,
-                        window_session_indices=window_selection["window_session_indices"],
+                if ranking_residual_path.is_file():
+                    residual_source = _filter_table_by_policy(
+                        _load_metrics_table(ranking_residual_path), policy,
                     )
-                    if ranking_summary.empty:
-                        top_level_reason = "selected_window_has_no_eligible_ranked_tracks"
-                    if ranking_residual_path.is_file():
-                        residual_source = _filter_table_by_policy(
-                            _load_metrics_table(ranking_residual_path), policy,
-                        )
-                        ranking_residual_table, residual_join_status = _window_residual_table(
-                            ranking_metrics_table, residual_source,
-                        )
-                    else:
-                        ranking_residual_table = ranking_metrics_table.copy()
-                        ranking_residual_table["green_fit_residual"] = float("nan")
-                        residual_join_status = "native_residual_table_missing"
+                    ranking_residual_table, residual_join_status = _window_residual_table(
+                        ranking_metrics_table, residual_source,
+                    )
+                else:
+                    ranking_residual_table = ranking_metrics_table.copy()
+                    ranking_residual_table["green_fit_residual"] = float("nan")
+                    residual_join_status = "native_residual_table_missing"
             except (ValueError, KeyError, pd.errors.EmptyDataError) as error:
-                ranking_metrics_table = pd.DataFrame()
                 ranking_residual_table = pd.DataFrame()
-                ranking_summary = pd.DataFrame()
                 top_level_reason = f"selected_window_inputs_invalid:{type(error).__name__}"
 
     provenance = _ranking_provenance(
@@ -490,13 +532,14 @@ def build_quick_plots(
         selection=window_selection,
         metrics=ranking_metrics_table,
         residual_join_status=residual_join_status,
+        ranking_decision=ranking_decision,
     )
     provenance["ranking_n_candidate_tracks"] = int(len(ranking_summary))
     provenance["ranking_original_day0_baseline_available"] = bool(
         has_usable_day0_baseline(metrics_table)
     )
     provenance["ranking_fallback_reason"] = (
-        "original_day0_baseline_unavailable" if ranking_population == "longest_supported_window" else ""
+        ranking_decision.decision_reason if ranking_population == "longest_supported_window" else ""
     )
     ranking_columns = [
         "selection_rank",
@@ -515,7 +558,10 @@ def build_quick_plots(
         f"{ranking_population}; baseline session "
         f"{provenance['ranking_baseline_session_index']} "
         f"({provenance['ranking_baseline_session_id']}, "
-        f"{provenance['ranking_baseline_acquisition_date']})"
+        f"{provenance['ranking_baseline_acquisition_date']}); "
+        f"{ranking_decision.selected_rankable_track_count} rankable tracks; "
+        f"decision={ranking_decision.decision_reason}"
+        f"{f'; LOW-N warning (<{ranking_decision.low_n_threshold})' if ranking_decision.low_n_warning else ''}"
     )
     for direction_label in ("decreasing", "increasing"):
         if ranking_summary.empty:
@@ -580,8 +626,7 @@ def build_quick_plots(
             start_date=start_date,
             title=(
                 f"Top {len(top_rois)} {direction_label} matched clusters: delta log2(G/R)\n"
-                f"Ranking baseline: session {provenance['ranking_baseline_session_index']} "
-                f"({provenance['ranking_baseline_session_id']}, {provenance['ranking_baseline_acquisition_date']})"
+                f"Ranking: {source_label}"
             ),
             colorbar_label="Delta log2(G/R)",
             cmap="coolwarm",
@@ -641,8 +686,20 @@ def build_quick_plots(
         f"Ranking population: {ranking_population}",
         f"Ranking baseline: session {provenance['ranking_baseline_session_index']} "
         f"({provenance['ranking_baseline_session_id']}, {provenance['ranking_baseline_acquisition_date']})",
+        f"Source session indices spanned: {provenance['window_session_indices']}",
         f"Ranking metric: {ranking_metric_column}",
         f"Ranking input table: {ranking_input_path.name}",
+        f"Ranking delta semantics: {ranking_status['ranking_delta_semantics']}",
+        f"Ranking decision: {ranking_decision.decision_reason}",
+        f"Original Day-0 signal-valid tracks: {ranking_decision.original_day0_signal_valid_count}",
+        f"Original Day-0 rankable tracks: {ranking_decision.original_day0_rankable_track_count}",
+        "Window rankable tracks: " + (
+            "unavailable" if ranking_decision.window_rankable_track_count is None
+            else str(ranking_decision.window_rankable_track_count)
+        ),
+        f"Selected rankable tracks: {ranking_decision.selected_rankable_track_count}",
+        f"Low-N warning (<{ranking_decision.low_n_threshold}): {ranking_decision.low_n_warning}",
+        f"Window status reason: {ranking_decision.window_status_reason}",
         "Residual plots retain native-session fit residual definitions; no ranking-baseline subtraction is applied.",
         str(provenance["ranking_baseline_note"]),
         "",
@@ -689,6 +746,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["high", "balanced", "graph", "all"],
         help="When match_policy is present, choose which policy to plot. Use 'all' to keep both.",
     )
+    parser.add_argument(
+        "--ranking-population",
+        choices=["auto", "original_day0", "longest_supported_window"],
+        default="auto",
+        help="Choose the ranking display population; auto preserves Day 0 when at least two tracks are rankable.",
+    )
     return parser.parse_args(argv)
 
 
@@ -704,6 +767,7 @@ def main() -> None:
         policy=args.policy,
         output_dir=args.output_dir,
         project_context=_context,
+        ranking_population=args.ranking_population,
     )
     print(f"quick_plot_dir={output_dir}")
 

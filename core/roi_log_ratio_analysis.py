@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -1010,9 +1011,8 @@ def summarize_roi_metrics(roi_metrics: pd.DataFrame) -> pd.DataFrame:
 def has_usable_day0_baseline(roi_metrics: pd.DataFrame) -> bool:
     """Return whether any ROI has a usable original Day-0 measurement.
 
-    This is a population-level check for deciding whether an explicitly
-    selected supported-window ranking fallback is allowed. A valid baseline
-    in even one ROI keeps the original Day-0 ranking population authoritative.
+    This reports signal existence only. It does not establish that the track is
+    rankable; plotting population decisions use :func:`decide_ranking_population`.
     """
 
     required = {"roi_id", "day", "red", "green"}
@@ -1553,6 +1553,237 @@ def select_top_changing_rois(
         np.nan if max_proj_area_px is None else float(max_proj_area_px)
     )
     return ranked
+
+
+@dataclass(frozen=True)
+class RankingPopulationDecision:
+    """Shared plotting decision and diagnostics for ranking population choice."""
+
+    population: str
+    decision_reason: str
+    original_day0_signal_valid_count: int
+    original_day0_rankable_track_count: int
+    window_rankable_track_count: int | None
+    selected_rankable_track_count: int
+    low_n_warning: bool
+    low_n_threshold: int
+    window_status_reason: str
+    original_summary: pd.DataFrame
+    window_summary: pd.DataFrame
+
+
+def _signal_valid_mask(metrics: pd.DataFrame, *, include_fit_population: bool) -> pd.Series:
+    """Return rows with finite, positive, QC-passing fluorescence signals."""
+
+    red = pd.to_numeric(metrics.get("red", pd.Series(index=metrics.index, dtype=float)), errors="coerce")
+    green = pd.to_numeric(metrics.get("green", pd.Series(index=metrics.index, dtype=float)), errors="coerce")
+    valid = pd.Series(
+        np.isfinite(red.to_numpy(dtype=float))
+        & np.isfinite(green.to_numpy(dtype=float))
+        & (red.to_numpy(dtype=float) > 0)
+        & (green.to_numpy(dtype=float) > 0),
+        index=metrics.index,
+    )
+    for column in ("ratio_qc_pass", "red_signal_qc_pass", "green_signal_qc_pass"):
+        if column in metrics:
+            valid &= metrics[column].eq(True)
+    if include_fit_population and "fit_population_include" in metrics:
+        valid &= metrics["fit_population_include"].eq(True)
+    if "log2_green_over_red" in metrics:
+        ratio = pd.to_numeric(metrics["log2_green_over_red"], errors="coerce")
+        valid &= np.isfinite(ratio.to_numpy(dtype=float))
+    return valid
+
+
+def _ranking_identity_keys(rows: pd.DataFrame) -> set[tuple[str, ...]]:
+    """Count selector identities without double-counting either direction."""
+
+    identities: set[tuple[str, ...]] = set()
+    for _, row in rows.iterrows():
+        policy = str(row.get("match_policy", ""))
+        track_uid = row.get("track_uid")
+        if track_uid is not None and not pd.isna(track_uid) and str(track_uid).strip():
+            identities.add(("track_uid", policy, str(track_uid)))
+        else:
+            roi_id = row.get("roi_id")
+            if roi_id is not None and not pd.isna(roi_id):
+                identities.add(("roi_id", policy, str(roi_id)))
+    return identities
+
+
+def _count_rankable_tracks(
+    summary: pd.DataFrame,
+    *,
+    red_cv_max: float,
+    min_day0_brightness_quantile: float,
+) -> int:
+    if summary.empty:
+        return 0
+    selected = [
+        select_top_changing_rois(
+            summary,
+            max_rois=max(1, len(summary)),
+            red_cv_max=red_cv_max,
+            min_day0_brightness_quantile=min_day0_brightness_quantile,
+            direction=direction,
+            ranking_mode="final",
+        )
+        for direction in ("increasing", "decreasing")
+    ]
+    return len(_ranking_identity_keys(pd.concat(selected, ignore_index=True)))
+
+
+def _original_day0_ranking_summary(metrics: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Summarize only original-baseline tracks with valid baseline and post rows."""
+
+    required = {"roi_id", "day", "red", "green", "brightness", "log2_green_over_red", "delta_log2_green_over_red"}
+    if metrics.empty or not required.issubset(metrics.columns):
+        return pd.DataFrame(), 0
+    data = metrics.copy()
+    data["day"] = pd.to_numeric(data["day"], errors="coerce")
+    signal_valid = _signal_valid_mask(data, include_fit_population=False)
+    valid_baselines = data.loc[data["day"].eq(0) & signal_valid].copy()
+    signal_count = len(_ranking_identity_keys(valid_baselines))
+
+    ranking_valid = _signal_valid_mask(data, include_fit_population=True)
+    baseline_counts = data.loc[data["day"].eq(0) & ranking_valid].groupby("roi_id").size()
+    one_baseline_ids = set(baseline_counts.index[baseline_counts.eq(1)])
+    post_ids = set(data.loc[data["day"].gt(0) & ranking_valid, "roi_id"])
+    eligible_ids = one_baseline_ids.intersection(post_ids)
+    if not eligible_ids:
+        return pd.DataFrame(), signal_count
+
+    ranking_rows = data.loc[ranking_valid & data["roi_id"].isin(eligible_ids)].copy()
+    summary = summarize_roi_metrics(ranking_rows)
+    summary = summary.loc[summary["roi_id"].isin(eligible_ids)].copy()
+
+    # The selector ranks by roi_id. Retain track identity only for deduplicated
+    # counts and output diagnostics; its row-selection behavior stays unchanged.
+    baseline_identity = valid_baselines.drop_duplicates("roi_id", keep="first")
+    identity_columns = [column for column in ("roi_id", "track_uid", "match_policy") if column in baseline_identity]
+    if len(identity_columns) > 1:
+        summary = summary.merge(baseline_identity[identity_columns], on="roi_id", how="left", validate="one_to_one")
+    return summary.reset_index(drop=True), signal_count
+
+
+def decide_ranking_population(
+    original_metrics: pd.DataFrame,
+    *,
+    window_selection: dict[str, object] | None = None,
+    window_metrics: pd.DataFrame | None = None,
+    window_tracks: pd.DataFrame | None = None,
+    window_unavailable_reason: str | None = None,
+    requested_population: str = "auto",
+    min_rankable_tracks: int = 2,
+    low_n_threshold: int = 10,
+    red_cv_max: float = 0.1,
+    min_day0_brightness_quantile: float = 0.25,
+) -> RankingPopulationDecision:
+    """Choose one ranking population using the same selectors as both plotters.
+
+    ``original_metrics``, ``window_metrics`` and ``window_tracks`` must already
+    be filtered to the requested matching policy. A saved window is eligible
+    only when its metadata, complete-window metrics, and track identities agree.
+    """
+
+    if requested_population not in {"auto", "original_day0", "longest_supported_window"}:
+        raise ValueError("requested_population must be auto, original_day0, or longest_supported_window")
+    if min_rankable_tracks < 1 or low_n_threshold < 1:
+        raise ValueError("ranking population thresholds must be positive")
+
+    original_summary, signal_count = _original_day0_ranking_summary(original_metrics)
+    original_count = _count_rankable_tracks(
+        original_summary,
+        red_cv_max=red_cv_max,
+        min_day0_brightness_quantile=min_day0_brightness_quantile,
+    )
+
+    window_summary = pd.DataFrame()
+    window_count: int | None = None
+    window_problem = window_unavailable_reason or "longest_supported_window_metadata_missing"
+    window_ready = False
+    if window_selection is not None:
+        indices_value = window_selection.get("window_session_indices", [])
+        try:
+            indices = [int(value) for value in indices_value]
+        except (TypeError, ValueError):
+            indices = []
+        if window_selection.get("status") != "valid" or len(indices) < 2 or indices != sorted(set(indices)):
+            window_problem = "no_supported_window"
+        elif window_metrics is None or window_metrics.empty:
+            window_problem = window_unavailable_reason or "selected_window_metrics_table_missing"
+        elif window_tracks is None or "track_uid" not in window_tracks.columns:
+            window_problem = window_unavailable_reason or "selected_window_tracks_table_missing"
+        elif window_tracks["track_uid"].dropna().astype(str).duplicated().any():
+            window_problem = "selected_window_track_identity_ambiguous"
+        else:
+            try:
+                window_summary = summarize_window_metrics_for_ranking(window_metrics, indices)
+                track_uids = set(window_tracks["track_uid"].dropna().astype(str))
+                if "track_uid" not in window_summary or not set(window_summary.get("track_uid", pd.Series(dtype=str)).dropna().astype(str)).issubset(track_uids):
+                    window_problem = "selected_window_track_identity_unavailable_or_ambiguous"
+                    window_summary = pd.DataFrame()
+                else:
+                    window_count = _count_rankable_tracks(
+                        window_summary,
+                        red_cv_max=red_cv_max,
+                        min_day0_brightness_quantile=min_day0_brightness_quantile,
+                    )
+                    window_ready = True
+                    window_problem = ""
+            except (ValueError, KeyError, TypeError):
+                window_summary = pd.DataFrame()
+                window_problem = "selected_window_inputs_invalid"
+
+    population = "original_day0"
+    if requested_population == "original_day0":
+        reason = "ranking_population_forced_original_day0"
+    elif requested_population == "longest_supported_window":
+        if window_ready:
+            population = "longest_supported_window"
+            reason = "ranking_population_forced_longest_supported_window"
+        else:
+            reason = f"requested_window_unavailable:{window_problem}"
+    elif original_count >= min_rankable_tracks:
+        reason = "original_day0_ranking_population_adequate"
+    elif window_ready and window_count is not None and window_count >= min_rankable_tracks and window_count > original_count:
+        population = "longest_supported_window"
+        reason = (
+            "original_day0_ranking_population_insufficient"
+            if signal_count > 0
+            else "original_day0_baseline_unavailable"
+        )
+    else:
+        reason = (
+            "original_day0_ranking_population_insufficient"
+            if signal_count > 0
+            else "original_day0_baseline_unavailable"
+        )
+        if not window_ready:
+            reason += f";no_qualifying_window:{window_problem}"
+        elif window_count is not None and window_count < min_rankable_tracks:
+            reason += ";no_qualifying_window:window_population_below_minimum"
+        elif window_count is not None and window_count <= original_count:
+            reason += ";no_qualifying_window:window_population_not_larger"
+
+    selected_count = (
+        int(window_count or 0)
+        if population == "longest_supported_window"
+        else original_count
+    )
+    return RankingPopulationDecision(
+        population=population,
+        decision_reason=reason,
+        original_day0_signal_valid_count=int(signal_count),
+        original_day0_rankable_track_count=int(original_count),
+        window_rankable_track_count=None if window_count is None else int(window_count),
+        selected_rankable_track_count=selected_count,
+        low_n_warning=selected_count < low_n_threshold,
+        low_n_threshold=int(low_n_threshold),
+        window_status_reason=window_problem,
+        original_summary=original_summary,
+        window_summary=window_summary,
+    )
 
 
 def compute_roi_size_table(

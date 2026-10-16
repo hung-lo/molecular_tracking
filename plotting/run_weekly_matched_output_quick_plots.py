@@ -25,9 +25,11 @@ for _import_dir in (
 from project_cli import add_project_selector, resolve_analysis_selection
 from project_config import validate_output_path, is_relative_to
 from roi_log_ratio_analysis import (
+    has_usable_day0_baseline,
     select_ranked_roi_days,
     select_top_changing_rois,
     summarize_roi_metrics,
+    summarize_window_metrics_for_ranking,
 )
 from run_registered_roi_pipeline import plot_population_summary, plot_ranked_heatmap
 from run_daywise_green_red_fit_residuals import (
@@ -128,6 +130,147 @@ def _first_nonempty_metrics_path(analysis_dir: Path, *names: str) -> Path:
         except pd.errors.EmptyDataError:
             continue
     return existing[0]
+
+
+def _read_window_selection(analysis_dir: Path) -> tuple[dict[str, object] | None, str]:
+    path = analysis_dir / "longest_supported_window.json"
+    if not path.is_file():
+        return None, "longest_supported_window_metadata_missing"
+    try:
+        selection = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, "longest_supported_window_metadata_invalid"
+    if selection.get("status") != "valid" or not selection.get("window_session_indices"):
+        return selection, "no_supported_window"
+    return selection, ""
+
+
+def _window_residual_table(
+    window_metrics: pd.DataFrame,
+    residuals_table: pd.DataFrame,
+) -> tuple[pd.DataFrame, str]:
+    """Attach native-session fit residuals by track and source-session keys."""
+
+    output = window_metrics.copy()
+    residual_columns = [
+        column for column in (
+            "fit_status", "fit_reason", "green_fit_residual", "green_fit_signed_distance",
+            "predicted_green_from_fit",
+        )
+        if column in residuals_table.columns
+    ]
+    for column in residual_columns:
+        output = output.drop(columns=column, errors="ignore")
+    if not residual_columns:
+        output["green_fit_residual"] = float("nan")
+        return output, "residual_columns_unavailable"
+    required_keys = ["roi_id", "session_index", "session_id"]
+    if not set(required_keys).issubset(output.columns) or not set(required_keys).issubset(residuals_table.columns):
+        output["green_fit_residual"] = float("nan")
+        return output, "source_session_join_keys_unavailable"
+    keys = [*required_keys]
+    if "day" in output and "day" in residuals_table:
+        keys.append("day")
+    if "match_policy" in output and "match_policy" in residuals_table:
+        keys.append("match_policy")
+    left = output.copy()
+    right = residuals_table.loc[:, [*keys, *residual_columns]].copy()
+    for frame in (left, right):
+        frame["roi_id"] = pd.to_numeric(frame["roi_id"], errors="coerce")
+        frame["session_index"] = pd.to_numeric(frame["session_index"], errors="coerce")
+        frame["session_id"] = frame["session_id"].astype(str)
+    if left.duplicated(keys).any() or right.duplicated(keys).any():
+        output["green_fit_residual"] = float("nan")
+        return output, "source_session_join_not_unique"
+    try:
+        output = left.merge(right, on=keys, how="left", validate="one_to_one")
+    except (pd.errors.MergeError, ValueError):
+        output = left.copy()
+        output["green_fit_residual"] = float("nan")
+        return output, "source_session_join_failed"
+    if "green_fit_residual" not in output:
+        output["green_fit_residual"] = float("nan")
+    return output, "joined_by_roi_and_source_session"
+
+
+def _ranking_provenance(
+    *,
+    analysis_dir: Path,
+    population: str,
+    metric_column: str,
+    input_metrics_path: Path,
+    residual_input_path: Path,
+    selection: dict[str, object] | None,
+    metrics: pd.DataFrame,
+    residual_join_status: str,
+) -> dict[str, object]:
+    manifest_path = analysis_dir / "session_manifest_resolved.csv"
+    manifest = pd.read_csv(manifest_path) if manifest_path.is_file() else pd.DataFrame()
+    window_indices = [int(value) for value in (selection or {}).get("window_session_indices", [])]
+    window_ids = [str(value) for value in (selection or {}).get("window_session_ids", [])]
+    window_dates = [str(value) for value in (selection or {}).get("window_acquisition_dates", [])]
+    if population == "longest_supported_window" and window_indices:
+        baseline_index = window_indices[0]
+        baseline_id = window_ids[0] if window_ids else ""
+        baseline_date = window_dates[0] if window_dates else ""
+    elif population == "longest_supported_window":
+        baseline_index = None
+        baseline_id = ""
+        baseline_date = ""
+    else:
+        baseline_index = 0
+        baseline_id = ""
+        baseline_date = ""
+        if not manifest.empty and "session_index" in manifest:
+            baseline_rows = manifest.loc[pd.to_numeric(manifest["session_index"], errors="coerce").eq(0)]
+            if not baseline_rows.empty:
+                baseline_id = str(baseline_rows.iloc[0].get("session_id", ""))
+                baseline_date = str(baseline_rows.iloc[0].get("acquisition_date", ""))
+        if not baseline_id and "session_id" in metrics and "day" in metrics:
+            baseline_rows = metrics.loc[metrics["day"].eq(0)]
+            if not baseline_rows.empty:
+                baseline_id = str(baseline_rows.iloc[0]["session_id"])
+                baseline_date = str(baseline_rows.iloc[0].get("acquisition_date", ""))
+    first_manifest = manifest.sort_values("session_index").iloc[0] if not manifest.empty and "session_index" in manifest else None
+    first_absent_note = ""
+    if population == "longest_supported_window" and first_manifest is not None:
+        first_index = int(first_manifest["session_index"])
+        if first_index not in window_indices:
+            first_absent_note = (
+                f"Source session {first_index} ({first_manifest.get('session_id', '')}, "
+                f"{first_manifest.get('acquisition_date', '')}) remains in the manifest but has no rows in the selected-window cohort."
+            )
+    return {
+        "ranking_population": population,
+        "ranking_baseline_session_index": baseline_index,
+        "ranking_baseline_session_id": baseline_id,
+        "ranking_baseline_acquisition_date": baseline_date,
+        "window_status": (selection or {}).get("status", "unavailable"),
+        "window_start_session_index": window_indices[0] if window_indices else None,
+        "window_end_session_index": window_indices[-1] if window_indices else None,
+        "window_start_session_id": window_ids[0] if window_ids else "",
+        "window_end_session_id": window_ids[-1] if window_ids else "",
+        "window_start_acquisition_date": window_dates[0] if window_dates else "",
+        "window_end_acquisition_date": window_dates[-1] if window_dates else "",
+        "window_n_source_sessions": len(window_indices),
+        "window_n_candidate_tracks": int((selection or {}).get("n_complete_tracks", 0) or 0),
+        "window_session_indices": window_indices,
+        "window_session_ids": window_ids,
+        "ranking_input_metrics_table": str(input_metrics_path.name),
+        "ranking_metric_column": metric_column,
+        "residual_input_table": residual_input_path.name,
+        "residual_join_status": residual_join_status,
+        "ranking_baseline_note": first_absent_note,
+    }
+
+
+def _annotate_rank_table(table: pd.DataFrame, provenance: dict[str, object]) -> pd.DataFrame:
+    output = table.copy()
+    for column, value in provenance.items():
+        if isinstance(value, (dict, list, tuple)):
+            value = json.dumps(value, sort_keys=True)
+        output[column] = value
+    return output
 
 
 def _population_title(analysis_dir: Path) -> str:
@@ -276,6 +419,85 @@ def build_quick_plots(
     )
 
     roi_summary = summarize_roi_metrics(metrics_table) if not metrics_table.empty else pd.DataFrame()
+    ranking_population = "original_day0"
+    ranking_metrics_table = metrics_table
+    ranking_residual_table = residuals_table
+    ranking_input_path = metrics_path
+    ranking_residual_path = residuals_path
+    ranking_metric_column = "delta_log2_green_over_red"
+    ranking_summary = roi_summary
+    window_selection, window_problem = _read_window_selection(analysis_dir)
+    residual_join_status = "original_population_residual_table"
+    top_level_reason = ""
+    if (
+        {"roi_id", "session_index", "session_id"}.issubset(metrics_table.columns)
+        and {"roi_id", "session_index", "session_id"}.issubset(residuals_table.columns)
+    ):
+        ranking_residual_table, residual_join_status = _window_residual_table(
+            metrics_table, residuals_table,
+        )
+
+    if not has_usable_day0_baseline(metrics_table):
+        ranking_population = "longest_supported_window"
+        ranking_metric_column = "delta_log2_green_over_red_from_window_baseline"
+        ranking_input_path = analysis_dir / "matched_roi_metrics_longest_supported_window.csv"
+        all_observed_residual_path = analysis_dir / "matched_roi_metrics_with_session_normalized_residuals_all_observed.csv"
+        ranking_residual_path = all_observed_residual_path if all_observed_residual_path.is_file() else residuals_path
+        ranking_summary = pd.DataFrame()
+        ranking_metrics_table = pd.DataFrame()
+        ranking_residual_table = pd.DataFrame()
+        if window_problem:
+            top_level_reason = window_problem
+        elif not ranking_input_path.is_file():
+            top_level_reason = "selected_window_metrics_table_missing"
+        else:
+            try:
+                ranking_metrics_table = _filter_table_by_policy(
+                    _load_metrics_table(ranking_input_path), policy,
+                )
+                if ranking_metrics_table.empty:
+                    top_level_reason = "selected_window_has_no_rows_for_requested_policy"
+                else:
+                    ranking_summary = summarize_window_metrics_for_ranking(
+                        ranking_metrics_table,
+                        window_session_indices=window_selection["window_session_indices"],
+                    )
+                    if ranking_summary.empty:
+                        top_level_reason = "selected_window_has_no_eligible_ranked_tracks"
+                    if ranking_residual_path.is_file():
+                        residual_source = _filter_table_by_policy(
+                            _load_metrics_table(ranking_residual_path), policy,
+                        )
+                        ranking_residual_table, residual_join_status = _window_residual_table(
+                            ranking_metrics_table, residual_source,
+                        )
+                    else:
+                        ranking_residual_table = ranking_metrics_table.copy()
+                        ranking_residual_table["green_fit_residual"] = float("nan")
+                        residual_join_status = "native_residual_table_missing"
+            except (ValueError, KeyError, pd.errors.EmptyDataError) as error:
+                ranking_metrics_table = pd.DataFrame()
+                ranking_residual_table = pd.DataFrame()
+                ranking_summary = pd.DataFrame()
+                top_level_reason = f"selected_window_inputs_invalid:{type(error).__name__}"
+
+    provenance = _ranking_provenance(
+        analysis_dir=analysis_dir,
+        population=ranking_population,
+        metric_column=ranking_metric_column,
+        input_metrics_path=ranking_input_path,
+        residual_input_path=ranking_residual_path,
+        selection=window_selection,
+        metrics=ranking_metrics_table,
+        residual_join_status=residual_join_status,
+    )
+    provenance["ranking_n_candidate_tracks"] = int(len(ranking_summary))
+    provenance["ranking_original_day0_baseline_available"] = bool(
+        has_usable_day0_baseline(metrics_table)
+    )
+    provenance["ranking_fallback_reason"] = (
+        "original_day0_baseline_unavailable" if ranking_population == "longest_supported_window" else ""
+    )
     ranking_columns = [
         "selection_rank",
         "min_delta_log2_green_over_red",
@@ -283,35 +505,65 @@ def build_quick_plots(
         "delta_log2_range",
         "red_cv",
         "day0_brightness",
+        "ranking_baseline_red",
+        "ranking_baseline_green",
+        "ranking_baseline_brightness",
     ]
-
+    selected_counts: dict[str, int] = {}
+    direction_reasons: dict[str, str] = {}
+    source_label = (
+        f"{ranking_population}; baseline session "
+        f"{provenance['ranking_baseline_session_index']} "
+        f"({provenance['ranking_baseline_session_id']}, "
+        f"{provenance['ranking_baseline_acquisition_date']})"
+    )
     for direction_label in ("decreasing", "increasing"):
-        if metrics_table.empty:
-            log_message(run_start_seconds, f"No eligible ROI data; skipping {direction_label} ranked plots")
-            pd.DataFrame(columns=["selection_rank", "roi_id", "selection_mode"]).to_csv(
-                output_dir / f"top0_{direction_label}_clusters.csv", index=False,
+        if ranking_summary.empty:
+            top_rois = pd.DataFrame(columns=["selection_rank", "roi_id", "selection_mode"])
+            direction_reasons[direction_label] = top_level_reason or "no_eligible_tracks_for_ranking"
+        else:
+            top_rois = select_top_changing_rois(
+                roi_summary=ranking_summary,
+                max_rois=top_n,
+                direction=direction_label,
+                ranking_mode="final",
             )
-            continue
-        top_rois = select_top_changing_rois(
-            roi_summary=roi_summary,
-            max_rois=top_n,
-            direction=direction_label,
-            ranking_mode="final",
-        )
+            if top_rois.empty:
+                direction_reasons[direction_label] = (
+                    "no_window_cohort_tracks_met_directional_change_and_ranking_qc"
+                    if ranking_population == "longest_supported_window"
+                    else "no_original_day0_tracks_met_directional_change_and_ranking_qc"
+                )
         if top_rois.empty:
             log_message(run_start_seconds, f"No ranked {direction_label} clusters found; skipping directional plots")
+            empty_ranked = _annotate_rank_table(top_rois, provenance)
+            empty_ranked.to_csv(output_dir / f"top0_{direction_label}_clusters.csv", index=False)
+            selected_counts[direction_label] = 0
             continue
 
+        for baseline_name in ("red", "green", "brightness"):
+            column = f"ranking_baseline_{baseline_name}"
+            if column not in top_rois and f"day0_{baseline_name}" in top_rois:
+                top_rois[column] = top_rois[f"day0_{baseline_name}"]
+        top_rois = _annotate_rank_table(top_rois, provenance)
         log_message(
             run_start_seconds,
             f"Rendering {direction_label} directional plots for {len(top_rois)} ranked clusters",
         )
         ranked_roi_days = select_ranked_roi_days(
-            roi_day_table=residuals_table,
+            roi_day_table=ranking_residual_table,
             ranking_table=top_rois,
             top_n=min(int(top_n), len(top_rois)),
             ranking_columns=ranking_columns,
         )
+        if ranked_roi_days.empty:
+            direction_reasons[direction_label] = "ranked_rois_have_no_source_session_observations"
+            pd.DataFrame(columns=["selection_rank", "roi_id", "selection_mode"]).to_csv(
+                output_dir / f"top0_{direction_label}_clusters.csv", index=False,
+            )
+            selected_counts[direction_label] = 0
+            continue
+        ranked_roi_days = _annotate_rank_table(ranked_roi_days, provenance)
         ranked_roi_days.to_csv(
             output_dir / f"top{len(top_rois)}_{direction_label}_roi_day_metrics.csv",
             index=False,
@@ -323,10 +575,14 @@ def build_quick_plots(
 
         plot_ranked_heatmap(
             ranked_roi_days=ranked_roi_days,
-            value_column="delta_log2_green_over_red",
+            value_column=ranking_metric_column,
             output_path=output_dir / f"top{len(top_rois)}_{direction_label}_delta_log2_heatmap.png",
             start_date=start_date,
-            title=f"Top {len(top_rois)} {direction_label} matched clusters: delta log2(G/R)",
+            title=(
+                f"Top {len(top_rois)} {direction_label} matched clusters: delta log2(G/R)\n"
+                f"Ranking baseline: session {provenance['ranking_baseline_session_index']} "
+                f"({provenance['ranking_baseline_session_id']}, {provenance['ranking_baseline_acquisition_date']})"
+            ),
             colorbar_label="Delta log2(G/R)",
             cmap="coolwarm",
             center_zero=True,
@@ -334,7 +590,10 @@ def build_quick_plots(
         plot_directional_roi_residuals_vs_day(
             ranked_roi_table=ranked_roi_days,
             output_path=output_dir / f"top{len(top_rois)}_{direction_label}_green_fit_residual_vs_day.png",
-            title_prefix=f"Top {len(top_rois)}",
+            title_prefix=(
+                f"Top {len(top_rois)}; ranking relative to {source_label}; "
+                "residuals remain native-session fit residuals"
+            ),
             direction_label=direction_label,
             start_date=start_date,
         )
@@ -342,25 +601,33 @@ def build_quick_plots(
             ranked_roi_table=ranked_roi_days,
             fit_summary=fit_summary,
             output_path=output_dir / f"top{len(top_rois)}_{direction_label}_green_red_trajectory_scatter_average_fit.png",
-            title_prefix=f"Top {len(top_rois)}",
+            title_prefix=f"Top {len(top_rois)}; ranking relative to {source_label}",
             direction_label=direction_label,
             start_date=start_date,
         )
+        selected_counts[direction_label] = int(len(top_rois))
 
     ranking_status = {
-        "status": "no_eligible_data" if metrics_table.empty else "evaluated",
-        "reason": "no matched ROI observations were available" if metrics_table.empty else "",
+        "status": "evaluated" if any(selected_counts.values()) else "no_eligible_data",
+        "reason": "" if any(selected_counts.values()) else (top_level_reason or "no_directional_candidates_met_ranking_criteria"),
         "directions": {},
+        **provenance,
+        "ranking_input_metrics_path": str(ranking_input_path),
+        "residual_input_path": str(ranking_residual_path),
+        "ranking_delta_semantics": (
+            "Window-relative to the first actual source session in the selected complete cohort."
+            if ranking_population == "longest_supported_window"
+            else "Original source Day-0-relative log2(G/R)."
+        ),
+        "residual_semantics": "Signed residuals remain observed green minus that source session's native fitted green; they are not shifted to the ranking baseline.",
     }
-    if not metrics_table.empty:
-        for direction_label in ("decreasing", "increasing"):
-            clusters_path = output_dir / f"top{top_n}_{direction_label}_clusters.csv"
-            selected_count = len(pd.read_csv(clusters_path)) if clusters_path.is_file() else 0
-            ranking_status["directions"][direction_label] = {
-                "status": "evaluated" if selected_count else "no_eligible_data",
-                "n_ranked_rois": int(selected_count),
-                "reason": "no valid day-0-baselined ROIs met the ranking criteria" if not selected_count else "",
-            }
+    for direction_label in ("decreasing", "increasing"):
+        selected_count = int(selected_counts.get(direction_label, 0))
+        ranking_status["directions"][direction_label] = {
+            "status": "evaluated" if selected_count else "no_eligible_data",
+            "n_ranked_rois": selected_count,
+            "reason": direction_reasons.get(direction_label, "") if not selected_count else "",
+        }
     (output_dir / "ranked_roi_status.json").write_text(
         json.dumps(ranking_status, indent=2, sort_keys=True), encoding="utf-8",
     )
@@ -371,6 +638,13 @@ def build_quick_plots(
         f"Start date: {start_date}",
         f"Top-N directional plots: {top_n}",
         f"Policy filter: {policy}",
+        f"Ranking population: {ranking_population}",
+        f"Ranking baseline: session {provenance['ranking_baseline_session_index']} "
+        f"({provenance['ranking_baseline_session_id']}, {provenance['ranking_baseline_acquisition_date']})",
+        f"Ranking metric: {ranking_metric_column}",
+        f"Ranking input table: {ranking_input_path.name}",
+        "Residual plots retain native-session fit residual definitions; no ranking-baseline subtraction is applied.",
+        str(provenance["ranking_baseline_note"]),
         "",
         "Core plots:",
         "- population_longitudinal_summary.png",

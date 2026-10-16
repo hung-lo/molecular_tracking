@@ -788,9 +788,10 @@ def summarize_residual_sign_changes(
     Returns
     -------
     pandas.DataFrame
-        One row per ROI with columns ``roi_id``, the minimum, maximum, range,
-        and final residual value in corrected fluorescence units, plus the
-        integer column ``green_fit_residual_sign_change_count``.
+        One row per ROI with finite-only extrema and range, the last finite
+        residual, and sign-change counts. Non-finite residuals are omitted from
+        statistical comparisons; a comparison across a gap is between consecutive
+        valid observations and does not identify the transition date.
     """
 
     required_columns = {"roi_id", "day", residual_column}
@@ -799,30 +800,63 @@ def summarize_residual_sign_changes(
         missing_str = ", ".join(sorted(missing_columns))
         raise ValueError(f"Missing required columns: {missing_str}")
 
-    summary_rows: list[dict[str, float | int]] = []
+    summary_rows: list[dict[str, object]] = []
     for roi_id, roi_table in residual_table.groupby("roi_id", sort=True):
-        roi_table = roi_table.sort_values("day").reset_index(drop=True)
-        residual_values = roi_table[residual_column].to_numpy(dtype=float)
-        residual_sign = np.sign(residual_values)
-        nonzero_sign = residual_sign.copy()
-        for index in range(1, len(nonzero_sign)):
-            if nonzero_sign[index] == 0:
-                nonzero_sign[index] = nonzero_sign[index - 1]
-        sign_change_count = int(np.sum(np.diff(nonzero_sign) != 0))
+        order_columns = [column for column in ("session_index", "day") if column in roi_table]
+        roi_table = roi_table.sort_values(order_columns or ["day"], kind="stable").reset_index(drop=True)
+        numeric_values = pd.to_numeric(roi_table[residual_column], errors="coerce").to_numpy(dtype=float)
+        finite_mask = np.isfinite(numeric_values)
+        finite_values = numeric_values[finite_mask]
+        finite_days = roi_table.loc[finite_mask, "day"].tolist()
+        missing_count = int((~finite_mask).sum())
+        spanning_gap_comparisons = int(
+            np.sum(np.diff(np.flatnonzero(finite_mask)) > 1)
+        ) if len(finite_values) > 1 else 0
+
+        sign_change_count: object
+        if len(finite_values):
+            finite_sign = np.sign(finite_values)
+            # Keep the established zero rule: a zero after a known sign carries
+            # that sign forward, so zero values alone do not create reversals.
+            for index in range(1, len(finite_sign)):
+                if finite_sign[index] == 0:
+                    finite_sign[index] = finite_sign[index - 1]
+            sign_change_count = int(np.sum(np.diff(finite_sign) != 0))
+            minimum = float(np.min(finite_values))
+            maximum = float(np.max(finite_values))
+            last_value = float(finite_values[-1])
+            last_day = finite_days[-1]
+            status = "estimable"
+            reason = ""
+        else:
+            sign_change_count = pd.NA
+            minimum = maximum = last_value = float("nan")
+            last_day = pd.NA
+            status = "not_estimable"
+            reason = "no_finite_residual_observations"
         summary_rows.append(
             {
                 "roi_id": int(roi_id),
-                "min_green_fit_residual": float(np.min(residual_values)),
-                "max_green_fit_residual": float(np.max(residual_values)),
-                "green_fit_residual_range": float(
-                    np.max(residual_values) - np.min(residual_values)
-                ),
-                "last_green_fit_residual": float(residual_values[-1]),
+                "min_green_fit_residual": minimum,
+                "max_green_fit_residual": maximum,
+                "green_fit_residual_range": maximum - minimum if len(finite_values) else float("nan"),
+                # Compatibility name: this is the last finite observation.
+                "last_green_fit_residual": last_value,
+                "last_valid_residual_day": last_day,
+                "n_valid_residual_observations": int(len(finite_values)),
+                "n_missing_residual_observations": missing_count,
+                "n_comparisons_spanning_missing_residuals": spanning_gap_comparisons,
                 "green_fit_residual_sign_change_count": sign_change_count,
+                "green_fit_residual_sign_change_status": status,
+                "green_fit_residual_sign_change_reason": reason,
             }
         )
-
-    return pd.DataFrame(summary_rows).sort_values("roi_id").reset_index(drop=True)
+    summary = pd.DataFrame(summary_rows).sort_values("roi_id").reset_index(drop=True)
+    if not summary.empty:
+        summary["green_fit_residual_sign_change_count"] = summary[
+            "green_fit_residual_sign_change_count"
+        ].astype("Int64")
+    return summary
 
 
 def select_ranked_roi_days(
@@ -971,6 +1005,141 @@ def summarize_roi_metrics(roi_metrics: pd.DataFrame) -> pd.DataFrame:
     if not summaries:
         return pd.DataFrame(columns=columns)
     return pd.DataFrame(summaries, columns=columns).sort_values("roi_id").reset_index(drop=True)
+
+
+def has_usable_day0_baseline(roi_metrics: pd.DataFrame) -> bool:
+    """Return whether any ROI has a usable original Day-0 measurement.
+
+    This is a population-level check for deciding whether an explicitly
+    selected supported-window ranking fallback is allowed. A valid baseline
+    in even one ROI keeps the original Day-0 ranking population authoritative.
+    """
+
+    required = {"roi_id", "day", "red", "green"}
+    if roi_metrics.empty or not required.issubset(roi_metrics.columns):
+        return False
+    baseline = roi_metrics.loc[roi_metrics["day"].eq(0)].copy()
+    if baseline.empty:
+        return False
+    red = pd.to_numeric(baseline["red"], errors="coerce").to_numpy(dtype=float)
+    green = pd.to_numeric(baseline["green"], errors="coerce").to_numpy(dtype=float)
+    valid = np.isfinite(red) & np.isfinite(green) & (red > 0) & (green > 0)
+    if "ratio_qc_pass" in baseline:
+        valid &= baseline["ratio_qc_pass"].eq(True).to_numpy()
+    if "log2_green_over_red" in baseline:
+        log_ratio = pd.to_numeric(baseline["log2_green_over_red"], errors="coerce").to_numpy(dtype=float)
+    else:
+        log_ratio = np.log2((green + 1.0) / (red + 1.0))
+    return bool(np.any(valid & np.isfinite(log_ratio)))
+
+
+def summarize_window_metrics_for_ranking(
+    window_metrics: pd.DataFrame,
+    window_session_indices: list[int] | tuple[int, ...],
+    delta_column: str = "delta_log2_green_over_red_from_window_baseline",
+) -> pd.DataFrame:
+    """Build a ranking-only summary from the saved selected-window cohort.
+
+    The source observation table is never relabeled or modified. The legacy
+    ``day0_*`` summary fields consumed by the existing selector are populated
+    from the actual first source session in the selected window, while all
+    delta and day-of-extremum values retain that table's window-relative metric
+    and source-session indices.
+    """
+
+    required = {"roi_id", "session_index", "session_id", "red", "green", delta_column}
+    missing = required.difference(window_metrics.columns)
+    if missing:
+        raise ValueError(f"Missing selected-window ranking columns: {', '.join(sorted(missing))}")
+    indices = [int(value) for value in window_session_indices]
+    if len(indices) < 2 or len(set(indices)) != len(indices):
+        return pd.DataFrame()
+    data = window_metrics.copy()
+    data["session_index"] = pd.to_numeric(data["session_index"], errors="coerce")
+    data = data.loc[np.isfinite(data["session_index"]) & data["session_index"].isin(indices)].copy()
+    if data.duplicated(["roi_id", "session_index"]).any():
+        raise ValueError("Selected-window metrics contain duplicate ROI/session observations.")
+    if data.empty:
+        return pd.DataFrame()
+    expected_sessions = set(indices)
+    complete = data.groupby("roi_id")["session_index"].agg(lambda values: set(values.astype(int)))
+    cohort_ids = complete.index[complete.map(lambda values: values == expected_sessions)]
+    data = data.loc[data["roi_id"].isin(cohort_ids)].copy()
+    if data.empty:
+        return pd.DataFrame()
+
+    data["red"] = pd.to_numeric(data["red"], errors="coerce")
+    data["green"] = pd.to_numeric(data["green"], errors="coerce")
+    data["brightness"] = (
+        pd.to_numeric(data["brightness"], errors="coerce")
+        if "brightness" in data
+        else data["red"] + data["green"]
+    )
+    data[delta_column] = pd.to_numeric(data[delta_column], errors="coerce")
+    signal_valid = (
+        np.isfinite(data["red"]) & np.isfinite(data["green"])
+        & (data["red"] > 0) & (data["green"] > 0)
+    )
+    if "ratio_qc_pass" in data:
+        signal_valid &= data["ratio_qc_pass"].eq(True)
+    if "fit_population_include" in data:
+        signal_valid &= data["fit_population_include"].eq(True)
+    data["_ranking_signal_valid"] = signal_valid
+    if "log2_green_over_red" in data:
+        data["log2_green_over_red"] = pd.to_numeric(data["log2_green_over_red"], errors="coerce")
+    else:
+        data["log2_green_over_red"] = np.log2((data["green"] + 1.0) / (data["red"] + 1.0))
+
+    baseline_index = indices[0]
+    summaries: list[dict[str, object]] = []
+    for roi_id, group in data.groupby("roi_id", sort=True):
+        group = group.sort_values("session_index", kind="stable").reset_index(drop=True)
+        valid_group = group.loc[group["_ranking_signal_valid"]].copy()
+        baseline_rows = valid_group.loc[valid_group["session_index"].eq(baseline_index)]
+        if len(baseline_rows) != 1:
+            continue
+        baseline = baseline_rows.iloc[0]
+        post = valid_group.loc[valid_group["session_index"].gt(baseline_index)]
+        if post.empty:
+            continue
+        valid_delta = valid_group.loc[np.isfinite(valid_group[delta_column])]
+        if valid_delta.empty or not np.isfinite(float(baseline["log2_green_over_red"])):
+            continue
+        delta_values = valid_delta[delta_column].astype(float).to_numpy()
+        session_values = valid_delta["session_index"].astype(int).to_numpy()
+        min_pos = int(np.argmin(delta_values))
+        summary: dict[str, object] = {
+            "roi_id": int(roi_id),
+            "n_days": int(len(group)),
+            "n_valid_postbaseline_observations": int(len(post)),
+            "day0_red": float(baseline["red"]),
+            "day0_green": float(baseline["green"]),
+            "day0_brightness": float(baseline["brightness"]),
+            "day0_log2_green_over_red": float(baseline["log2_green_over_red"]),
+            "ranking_baseline_red": float(baseline["red"]),
+            "ranking_baseline_green": float(baseline["green"]),
+            "ranking_baseline_brightness": float(baseline["brightness"]),
+            "ranking_baseline_log2_green_over_red": float(baseline["log2_green_over_red"]),
+            "window_baseline_session_index": baseline_index,
+            "window_baseline_session_id": str(baseline["session_id"]),
+            "window_baseline_acquisition_date": baseline.get("acquisition_date", ""),
+            "red_cv": _coefficient_of_variation(valid_group["red"].to_numpy(dtype=float)),
+            "green_cv": _coefficient_of_variation(valid_group["green"].to_numpy(dtype=float)),
+            "brightness_cv": _coefficient_of_variation(valid_group["brightness"].to_numpy(dtype=float)),
+            "min_delta_log2_green_over_red": float(delta_values[min_pos]),
+            "day_of_min_delta": int(session_values[min_pos]),
+            "max_delta_log2_green_over_red": float(np.max(delta_values)),
+            "delta_log2_range": float(np.max(delta_values) - np.min(delta_values)),
+            "day_last_delta_log2_green_over_red": float(delta_values[-1]),
+        }
+        for column in ("track_uid", "cluster_id", "match_policy"):
+            if column in group:
+                summary[column] = baseline[column]
+        for column in ("proj_area_px", "circularity", "solidity", "axis_ratio", "shape_qc_pass"):
+            if column in group:
+                summary[column] = group[column].iloc[0]
+        summaries.append(summary)
+    return pd.DataFrame(summaries).sort_values("roi_id").reset_index(drop=True) if summaries else pd.DataFrame()
 
 
 def classify_roi_log_ratio_trajectories(

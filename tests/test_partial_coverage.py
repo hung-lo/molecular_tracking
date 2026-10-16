@@ -9,12 +9,16 @@ import tifffile
 from longest_supported_window import select_longest_supported_window
 from roi_log_ratio_analysis import (
     compute_green_red_fit_residuals,
+    compute_log_ratio_metrics,
+    select_top_changing_rois,
+    summarize_roi_metrics,
     summarize_daily_green_red_linear_fits_tolerant,
 )
 from session_manifest import SessionRecord
 from session_population_normalization import fit_session_population
 from run_daywise_matched_roi_pipeline import DaywiseMatchedPipelineConfig, run_daywise_matched_roi_pipeline
 from run_weekly_matched_output_quick_plots import build_quick_plots
+from run_ranked_roi_quick_views import build_ranked_roi_views
 
 
 def _records(n: int) -> list[SessionRecord]:
@@ -221,6 +225,7 @@ def test_synthetic_twelve_session_extraction_keeps_native_and_partial_track_data
     coverage = pd.read_csv(output / "session_coverage_fit_qc.csv").set_index("session_index")
     window = json.loads((output / "longest_supported_window.json").read_text(encoding="utf-8"))
     window_tracks = pd.read_csv(output / "matched_roi_tracks_longest_supported_window.csv")
+    window_metrics = pd.read_csv(output / "matched_roi_metrics_longest_supported_window.csv")
 
     assert complete.empty
     assert len(all_observed) == 20 * 11
@@ -236,4 +241,127 @@ def test_synthetic_twelve_session_extraction_keeps_native_and_partial_track_data
     plots = build_quick_plots(output, start_date="20260924", policy="graph", output_dir=tmp_path / "plots")
     assert (plots / "population_longitudinal_summary.png").is_file()
     assert (plots / "daywise_green_red_linear_fit_scatters.png").is_file()
-    assert json.loads((plots / "ranked_roi_status.json").read_text())["directions"]["increasing"]["status"] == "no_eligible_data"
+    plot_status = json.loads((plots / "ranked_roi_status.json").read_text())
+    assert plot_status["status"] == "evaluated"
+    assert plot_status["ranking_population"] == "longest_supported_window"
+    assert plot_status["ranking_metric_column"] == "delta_log2_green_over_red_from_window_baseline"
+    assert plot_status["ranking_baseline_session_index"] == 1
+    assert plot_status["ranking_baseline_session_id"] == "session_01"
+    assert plot_status["window_start_session_index"] == 1
+    assert plot_status["window_end_session_index"] == 11
+    assert plot_status["window_n_source_sessions"] == 11
+    assert plot_status["window_n_candidate_tracks"] == 20
+    assert "session_00" in plot_status["ranking_baseline_note"]
+    assert plot_status["directions"]["increasing"]["status"] == "evaluated"
+    n_increasing = plot_status["directions"]["increasing"]["n_ranked_rois"]
+    increasing_ranks = pd.read_csv(plots / f"top{n_increasing}_increasing_clusters.csv")
+    assert not increasing_ranks.empty
+    assert set(increasing_ranks["ranking_population"]) == {"longest_supported_window"}
+    assert set(increasing_ranks["ranking_metric_column"]) == {"delta_log2_green_over_red_from_window_baseline"}
+    ranked_days = pd.read_csv(plots / f"top{n_increasing}_increasing_roi_day_metrics.csv")
+    assert set(ranked_days["session_index"].astype(int)) == set(range(1, 12))
+    assert set(ranked_days["day"].astype(int)) == set(range(1, 12))
+    assert 0 not in set(ranked_days["session_index"].astype(int))
+    first_ranked_id = int(increasing_ranks.iloc[0]["roi_id"])
+    ranked_baseline = ranked_days.loc[
+        ranked_days["roi_id"].eq(first_ranked_id) & ranked_days["session_index"].eq(1)
+    ].iloc[0]
+    window_baseline = window_metrics.loc[
+        window_metrics["roi_id"].eq(first_ranked_id) & window_metrics["session_index"].eq(1)
+    ].iloc[0]
+    assert np.isclose(ranked_baseline["ranking_baseline_red"], window_baseline["red"])
+    assert np.isclose(ranked_baseline["ranking_baseline_green"], window_baseline["green"])
+    assert np.isclose(ranked_baseline["ranking_baseline_brightness"], window_baseline["brightness"])
+    assert (plots / f"top{n_increasing}_increasing_delta_log2_heatmap.png").is_file()
+    assert (plots / f"top{n_increasing}_increasing_green_fit_residual_vs_day.png").is_file()
+    assert plot_status["residual_join_status"] == "joined_by_roi_and_source_session"
+    source_residuals = pd.read_csv(output / "matched_roi_metrics_with_session_normalized_residuals_all_observed.csv")
+    expected_residuals = source_residuals.set_index(["roi_id", "session_index"])["green_fit_residual"]
+    observed_residuals = ranked_days.set_index(["roi_id", "session_index"])["green_fit_residual"]
+    pd.testing.assert_series_equal(
+        observed_residuals.sort_index(), expected_residuals.reindex(observed_residuals.index).sort_index(),
+        check_names=False,
+    )
+
+    raw_views = build_ranked_roi_views(
+        output, policy="graph", top_n=1, directions=("increasing",),
+        output_dir=tmp_path / "ranked_raw_views",
+    )
+    render_profile = json.loads((raw_views / "ranked_roi_render_profile.json").read_text())
+    raw_index = pd.read_csv(raw_views / "ranked_roi_batch_index.csv")
+    assert render_profile["ranking_population"] == "longest_supported_window"
+    assert render_profile["ranking_baseline_session_index"] == 1
+    assert render_profile["ranking_metric_column"] == "delta_log2_green_over_red_from_window_baseline"
+    assert render_profile["n_sessions"] == 11
+    assert raw_index.loc[0, "track_uid"] == increasing_ranks.iloc[0]["track_uid"]
+    raw_png = Path(raw_index.loc[0, "png_path"])
+    assert raw_png.is_file()
+    raw_metadata = pd.read_csv(raw_index.loc[0, "metadata_csv_path"])
+    assert set(raw_metadata["session_index"].astype(int)) == set(range(1, 12))
+    assert 0 not in set(raw_metadata["session_index"].astype(int))
+    pd.testing.assert_frame_equal(
+        pd.read_csv(output / "matched_roi_log_ratio_metrics_all_observed.csv"), all_observed,
+    )
+
+    # A usable Day-0 population remains authoritative even when a valid window
+    # exists and the decreasing direction has no qualifying ROI.
+    source = all_observed.copy()
+    baseline_rows = source.loc[source["day"].eq(1)].copy()
+    baseline_rows["day"] = 0
+    baseline_rows["session_index"] = 0
+    baseline_rows["session_id"] = "session_00"
+    baseline_rows["acquisition_date"] = "2026-09-24"
+    baseline_rows["elapsed_days"] = 0
+    baseline_rows["red"] = baseline_rows["red"].astype(float) - 1.0
+    baseline_rows["green"] = baseline_rows["green"].astype(float) - 2.0
+    day0_complete = compute_log_ratio_metrics(
+        pd.concat([baseline_rows, source], ignore_index=True), baseline_day=0,
+    )
+    day0_complete.to_csv(output / "matched_roi_metrics_primary_final.csv", index=False)
+    expected_summary = summarize_roi_metrics(day0_complete)
+    expected_increasing = select_top_changing_rois(
+        expected_summary, max_rois=20, direction="increasing", ranking_mode="final",
+    )
+    original_plots = build_quick_plots(
+        output, start_date="20260924", policy="graph", output_dir=tmp_path / "day0_plots",
+    )
+    original_status = json.loads((original_plots / "ranked_roi_status.json").read_text())
+    assert original_status["ranking_population"] == "original_day0"
+    assert original_status["ranking_metric_column"] == "delta_log2_green_over_red"
+    assert original_status["ranking_original_day0_baseline_available"] is True
+    assert original_status["directions"]["increasing"]["status"] == "evaluated"
+    assert original_status["directions"]["decreasing"]["status"] == "no_eligible_data"
+    n_original_increasing = original_status["directions"]["increasing"]["n_ranked_rois"]
+    actual_increasing = pd.read_csv(original_plots / f"top{n_original_increasing}_increasing_clusters.csv")
+    assert actual_increasing["roi_id"].tolist() == expected_increasing["roi_id"].tolist()
+    assert np.allclose(
+        actual_increasing["day_last_delta_log2_green_over_red"],
+        expected_increasing["day_last_delta_log2_green_over_red"],
+    )
+    assert (original_plots / "top0_decreasing_clusters.csv").is_file()
+
+    # No valid selected window yields an explicit status and never ranks the
+    # all-observed partial tracks as an ad hoc substitute cohort.
+    all_observed.to_csv(output / "matched_roi_metrics_primary_final.csv", index=False)
+    (output / "longest_supported_window.json").write_text(json.dumps({
+        "status": "no_supported_window", "window_session_indices": [],
+        "window_session_ids": [], "window_acquisition_dates": [],
+        "window_length": 0, "n_complete_tracks": 0,
+    }))
+    no_window_plots = build_quick_plots(
+        output, start_date="20260924", policy="graph", output_dir=tmp_path / "no_window_plots",
+    )
+    no_window_status = json.loads((no_window_plots / "ranked_roi_status.json").read_text())
+    assert no_window_status["status"] == "no_eligible_data"
+    assert no_window_status["reason"] == "no_supported_window"
+    assert no_window_status["ranking_population"] == "longest_supported_window"
+    assert no_window_status["directions"]["increasing"]["n_ranked_rois"] == 0
+    assert not list(no_window_plots.glob("top*_increasing_delta_log2_heatmap.png"))
+    no_window_raw = build_ranked_roi_views(
+        output, policy="graph", top_n=1, directions=("increasing",),
+        output_dir=tmp_path / "no_window_raw_views",
+    )
+    raw_no_window_status = json.loads((no_window_raw / "ranked_roi_render_profile.json").read_text())
+    assert raw_no_window_status["status"] == "no_eligible_data"
+    assert raw_no_window_status["reason"] == "no_supported_window"
+    assert not list(no_window_raw.glob("**/*.png"))

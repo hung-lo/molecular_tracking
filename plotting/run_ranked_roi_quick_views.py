@@ -14,7 +14,12 @@ for _directory in (_ROOT / "core", _ROOT / "plotting"):
     if str(_directory) not in sys.path:
         sys.path.append(str(_directory))
 
-from roi_log_ratio_analysis import select_top_changing_rois, summarize_roi_metrics
+from roi_log_ratio_analysis import (
+    has_usable_day0_baseline,
+    select_top_changing_rois,
+    summarize_roi_metrics,
+    summarize_window_metrics_for_ranking,
+)
 from run_matched_roi_quick_view import _tracks_from_raw_table, render_ranked_roi_batch
 
 
@@ -107,24 +112,158 @@ def build_ranked_roi_views(
     if render_z_radius < 0:
         raise ValueError("render_z_radius must be >= 0")
     metrics_path, raw_path, manifest_path = _resolve_run_inputs(root)
+    analysis_root = metrics_path.parent
     metrics = _filter_policy(pd.read_csv(metrics_path), policy)
     raw = _filter_policy(pd.read_csv(raw_path), policy)
     manifest = pd.read_csv(manifest_path)
     feature_path = _resolve_feature_table(root)
     features = pd.read_csv(feature_path) if feature_path is not None else None
-    tracks = _tracks_from_raw_table(raw, policy)
     output_root = Path(output_dir).resolve() if output_dir else root / "plots" / policy / "single_roi_raw_validation"
     output_root.mkdir(parents=True, exist_ok=True)
-    if metrics.empty:
-        pd.DataFrame(columns=["selection_direction", "selection_rank", "roi_id", "track_uid", "png_path", "metadata_csv_path"]).to_csv(
-            output_root / "ranked_roi_batch_index.csv", index=False,
+    ranking_population = "original_day0"
+    ranking_metric_column = "delta_log2_green_over_red"
+    ranking_input_path = metrics_path
+    summary = summarize_roi_metrics(metrics) if not metrics.empty else pd.DataFrame()
+    render_manifest = manifest
+    tracks = _tracks_from_raw_table(raw, policy) if not raw.empty and policy != "all" else pd.DataFrame()
+    selection: dict[str, object] = {}
+    fallback_reason = ""
+
+    if not has_usable_day0_baseline(metrics):
+        ranking_population = "longest_supported_window"
+        ranking_metric_column = "delta_log2_green_over_red_from_window_baseline"
+        summary = pd.DataFrame()
+        tracks = pd.DataFrame()
+        selection_path = analysis_root / "longest_supported_window.json"
+        window_metrics_path = analysis_root / "matched_roi_metrics_longest_supported_window.csv"
+        window_tracks_path = analysis_root / "matched_roi_tracks_longest_supported_window.csv"
+        if not selection_path.is_file():
+            summary = pd.DataFrame()
+            fallback_reason = "longest_supported_window_metadata_missing"
+        else:
+            try:
+                selection = json.loads(selection_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                selection = {}
+                fallback_reason = "longest_supported_window_metadata_invalid"
+        if not fallback_reason and selection.get("status") != "valid":
+            fallback_reason = "no_supported_window"
+        if not fallback_reason and (not selection.get("window_session_indices") or not window_metrics_path.is_file()):
+            fallback_reason = "selected_window_inputs_missing"
+        if not fallback_reason:
+            try:
+                window_metrics = _filter_policy(pd.read_csv(window_metrics_path), policy)
+                summary = summarize_window_metrics_for_ranking(
+                    window_metrics, selection["window_session_indices"],
+                )
+                ranking_input_path = window_metrics_path
+                if not window_tracks_path.is_file():
+                    summary = pd.DataFrame()
+                    fallback_reason = "selected_window_tracks_table_missing"
+                else:
+                    tracks = _filter_policy(pd.read_csv(window_tracks_path), policy)
+                    selected_indices = {int(value) for value in selection["window_session_indices"]}
+                    if "session_index" not in manifest:
+                        summary = pd.DataFrame()
+                        fallback_reason = "source_manifest_missing_session_indices"
+                    else:
+                        manifest_indices = pd.to_numeric(manifest["session_index"], errors="coerce")
+                        render_manifest = manifest.loc[manifest_indices.isin(selected_indices)].copy()
+                        if set(pd.to_numeric(render_manifest["session_index"], errors="coerce").dropna().astype(int)) != selected_indices:
+                            summary = pd.DataFrame()
+                            fallback_reason = "selected_window_sessions_missing_from_source_manifest"
+                        if summary.empty and not fallback_reason:
+                            fallback_reason = "selected_window_has_no_eligible_ranked_tracks"
+                    if not tracks.empty and "track_uid" in tracks:
+                        tracks = tracks.loc[tracks["track_uid"].astype(str).isin(set(summary.get("track_uid", pd.Series(dtype=str)).astype(str)))].copy()
+                    if not summary.empty and (
+                        "track_uid" not in summary
+                        or tracks.empty
+                        or tracks["track_uid"].astype(str).duplicated().any()
+                        or not set(summary["track_uid"].astype(str)).issubset(set(tracks["track_uid"].astype(str)))
+                    ):
+                        summary = pd.DataFrame()
+                        tracks = pd.DataFrame()
+                        fallback_reason = "selected_window_track_identity_unavailable_or_ambiguous"
+            except (OSError, ValueError, KeyError, pd.errors.EmptyDataError) as error:
+                summary = pd.DataFrame()
+                fallback_reason = f"selected_window_inputs_invalid:{type(error).__name__}"
+
+    window_indices = [int(value) for value in selection.get("window_session_indices", [])]
+    window_ids = [str(value) for value in selection.get("window_session_ids", [])]
+    window_dates = [str(value) for value in selection.get("window_acquisition_dates", [])]
+    if ranking_population == "longest_supported_window" and window_indices:
+        baseline_index = window_indices[0]
+        baseline_id = window_ids[0] if window_ids else ""
+        baseline_date = window_dates[0] if window_dates else ""
+    elif ranking_population == "longest_supported_window":
+        baseline_index, baseline_id, baseline_date = None, "", ""
+    else:
+        baseline_index, baseline_id, baseline_date = 0, "", ""
+        if not manifest.empty and "session_index" in manifest:
+            baseline_rows = manifest.loc[pd.to_numeric(manifest["session_index"], errors="coerce").eq(0)]
+            if not baseline_rows.empty:
+                baseline_id = str(baseline_rows.iloc[0].get("session_id", ""))
+                baseline_date = str(baseline_rows.iloc[0].get("acquisition_date", ""))
+    first_note = ""
+    if ranking_population == "longest_supported_window" and not manifest.empty and window_indices:
+        first_row = manifest.sort_values("session_index").iloc[0]
+        if int(first_row["session_index"]) not in window_indices:
+            first_note = (
+                f"Source session {int(first_row['session_index'])} ({first_row.get('session_id', '')}, "
+                f"{first_row.get('acquisition_date', '')}) remains in the manifest but is absent from the selected-window cohort."
+            )
+    provenance = {
+        "ranking_population": ranking_population,
+        "ranking_baseline_session_index": baseline_index,
+        "ranking_baseline_session_id": baseline_id,
+        "ranking_baseline_acquisition_date": baseline_date,
+        "window_status": selection.get("status", "unavailable"),
+        "window_start_session_index": window_indices[0] if window_indices else None,
+        "window_end_session_index": window_indices[-1] if window_indices else None,
+        "window_start_session_id": window_ids[0] if window_ids else "",
+        "window_end_session_id": window_ids[-1] if window_ids else "",
+        "window_start_acquisition_date": window_dates[0] if window_dates else "",
+        "window_end_acquisition_date": window_dates[-1] if window_dates else "",
+        "window_n_source_sessions": len(window_indices),
+        "window_n_candidate_tracks": int(selection.get("n_complete_tracks", 0) or 0),
+        "window_session_indices": window_indices,
+        "window_session_ids": window_ids,
+        "ranking_input_metrics_table": ranking_input_path.name,
+        "ranking_metric_column": ranking_metric_column,
+        "ranking_n_candidate_tracks": int(len(summary)),
+        "ranking_original_day0_baseline_available": bool(has_usable_day0_baseline(metrics)),
+        "ranking_fallback_reason": "original_day0_baseline_unavailable" if ranking_population == "longest_supported_window" else "",
+        "ranking_baseline_note": first_note,
+        "ranking_status_reason": fallback_reason,
+    }
+
+    if summary.empty or (ranking_population == "longest_supported_window" and tracks.empty):
+        reason = fallback_reason or (
+            "no_valid_day0_baseline_for_day0_change_ranking"
+            if ranking_population == "original_day0"
+            else "selected_window_has_no_eligible_ranked_tracks"
         )
+        empty_index = pd.DataFrame(columns=[
+            "selection_direction", "selection_rank", "roi_id", "cluster_id", "track_uid",
+            "selection_mode", "selection_metric_column", "selection_value",
+            "ranking_baseline_red", "ranking_baseline_green", "ranking_baseline_brightness",
+            "png_path", "metadata_csv_path",
+        ])
+        for key, value in provenance.items():
+            empty_index[key] = json.dumps(value, sort_keys=True) if isinstance(value, (dict, list, tuple)) else value
+        empty_index.to_csv(output_root / "ranked_roi_batch_index.csv", index=False)
+        profile = {"status": "no_eligible_data", "reason": reason, **provenance}
         (output_root / "ranked_roi_render_profile.json").write_text(
-            json.dumps({"status": "no_eligible_data", "reason": "no matched ROI metrics were available for ranking"}, indent=2),
-            encoding="utf-8",
+            json.dumps(profile, indent=2, sort_keys=True), encoding="utf-8",
+        )
+        (output_root / "README.txt").write_text(
+            f"Ranked raw-space views were not generated.\nRanking population: {ranking_population}\n"
+            f"Reason: {reason}\nRanking baseline: session {baseline_index} ({baseline_id}, {baseline_date})\n"
+            f"{first_note}\n", encoding="utf-8",
         )
         return output_root
-    summary = summarize_roi_metrics(metrics)
+
     index_rows = []
     render_specs = []
     for direction in directions:
@@ -145,41 +284,71 @@ def build_ranked_roi_views(
                 if len(matches) != 1:
                     raise ValueError(f"Could not resolve a unique track for ranked ROI {cluster_id!r}")
                 track_uid = matches.iloc[0]["track_uid"]
+            if ranking_population == "longest_supported_window":
+                track_matches = tracks.loc[tracks["track_uid"].astype(str).eq(str(track_uid))]
+                if len(track_matches) != 1:
+                    raise ValueError(f"Selected window does not contain a unique track {track_uid!r}")
             render_specs.append((str(track_uid), png_path))
             metadata_path = png_path.with_name(png_path.stem + "_metadata.csv")
             index_rows.append({
                 "selection_direction": direction, "selection_rank": rank,
                 "roi_id": roi_id, "cluster_id": cluster_id,
-                "track_uid": selected.get("track_uid", ""),
+                "track_uid": str(track_uid),
                 "selection_mode": selected["selection_mode"],
                 "selection_metric_column": selected["selection_metric_column"],
                 "selection_value": selected[selected["selection_metric_column"]],
+                "ranking_baseline_red": selected.get("ranking_baseline_red", selected.get("day0_red", float("nan"))),
+                "ranking_baseline_green": selected.get("ranking_baseline_green", selected.get("day0_green", float("nan"))),
+                "ranking_baseline_brightness": selected.get("ranking_baseline_brightness", selected.get("day0_brightness", float("nan"))),
                 "png_path": str(png_path), "metadata_csv_path": str(metadata_path),
+                **provenance,
             })
     if not render_specs:
-        reason = (
+        reason = fallback_reason or (
             "no_valid_day0_baseline_for_day0_change_ranking"
-            if "day0_brightness" in summary and summary["day0_brightness"].isna().all()
+            if ranking_population == "original_day0" and "day0_brightness" in summary and summary["day0_brightness"].isna().all()
             else "no_rois_met_ranking_criteria"
         )
-        pd.DataFrame(index_rows, columns=[
+        empty_columns = [
             "selection_direction", "selection_rank", "roi_id", "cluster_id", "track_uid",
-            "selection_mode", "selection_metric_column", "selection_value", "png_path", "metadata_csv_path",
-        ]).to_csv(output_root / "ranked_roi_batch_index.csv", index=False)
+            "selection_mode", "selection_metric_column", "selection_value",
+            "ranking_baseline_red", "ranking_baseline_green", "ranking_baseline_brightness",
+            "png_path", "metadata_csv_path",
+            *provenance.keys(),
+        ]
+        pd.DataFrame(index_rows, columns=empty_columns).to_csv(output_root / "ranked_roi_batch_index.csv", index=False)
         (output_root / "ranked_roi_render_profile.json").write_text(
-            json.dumps({"status": "no_eligible_data", "reason": reason}, indent=2, sort_keys=True),
+            json.dumps({"status": "no_eligible_data", "reason": reason, **provenance}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        (output_root / "README.txt").write_text(
+            f"Ranked raw-space views were not generated.\nRanking population: {ranking_population}\n"
+            f"Ranking baseline: session {baseline_index} ({baseline_id}, {baseline_date})\n{first_note}\n",
             encoding="utf-8",
         )
         return output_root
+    if ranking_population == "longest_supported_window":
+        selected_indices = set(window_indices)
+        manifest_indices = pd.to_numeric(render_manifest["session_index"], errors="coerce")
+        render_manifest = render_manifest.loc[manifest_indices.isin(selected_indices)].copy()
     profile = render_ranked_roi_batch(
         specs=render_specs,
         tracks_table=tracks,
-        session_table=manifest,
+        session_table=render_manifest,
         feature_table=features,
         z_radius=render_z_radius,
     )
     pd.DataFrame(index_rows).to_csv(output_root / "ranked_roi_batch_index.csv", index=False)
+    profile.update(provenance)
     (output_root / "ranked_roi_render_profile.json").write_text(json.dumps(profile, indent=2, sort_keys=True), encoding="utf-8")
+    (output_root / "README.txt").write_text(
+        "Ranked raw-space views rendered from saved extraction outputs.\n"
+        f"Ranking population: {ranking_population}\n"
+        f"Ranking baseline: session {baseline_index} ({baseline_id}, {baseline_date})\n"
+        f"Ranking metric: {ranking_metric_column}\n"
+        f"Ranking input: {ranking_input_path.name}\n{first_note}\n",
+        encoding="utf-8",
+    )
     return output_root
 
 

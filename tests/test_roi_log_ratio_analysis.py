@@ -870,6 +870,69 @@ def test_summarize_residual_sign_changes_counts_crossings() -> None:
     assert int(roi2["green_fit_residual_sign_change_count"]) == 0
 
 
+def test_summarize_residual_sign_changes_uses_finite_values_and_last_valid_day(tmp_path: Path) -> None:
+    values_by_roi = {
+        1: [2.0, np.nan, 1.0],
+        2: [2.0, np.nan, -1.0],
+        3: [np.nan, -2.0, 1.0, np.nan],
+        4: [np.nan, np.inf, -np.inf],
+        5: [4.0],
+        6: [np.inf, -np.inf],
+        7: [0.0, 0.0, 2.0, 1.0],
+        8: [2.0, 0.0, 0.0, -1.0],
+        9: [2.0, -1.0, -3.0],
+        10: [2.0, 0.0, 0.0],
+        11: [0.0, 0.0],
+    }
+    rows = []
+    for roi_id, values in values_by_roi.items():
+        for day, value in enumerate(values):
+            rows.append({"roi_id": roi_id, "day": day, "green_fit_residual": value})
+    # Deliberately shuffle input order to confirm summaries use real day order.
+    residual_table = pd.DataFrame(rows).sample(frac=1.0, random_state=14).reset_index(drop=True)
+    original = residual_table.copy(deep=True)
+
+    summary = summarize_residual_sign_changes(residual_table).set_index("roi_id")
+
+    assert np.isclose(summary.loc[1, "min_green_fit_residual"], 1.0)
+    assert np.isclose(summary.loc[1, "max_green_fit_residual"], 2.0)
+    assert np.isclose(summary.loc[1, "green_fit_residual_range"], 1.0)
+    assert summary.loc[1, "green_fit_residual_sign_change_count"] == 0
+    assert summary.loc[2, "green_fit_residual_sign_change_count"] == 1
+    assert summary.loc[2, "n_comparisons_spanning_missing_residuals"] == 1
+    assert summary.loc[3, "green_fit_residual_sign_change_count"] == 1
+    assert summary.loc[3, "last_green_fit_residual"] == 1.0
+    assert summary.loc[3, "last_valid_residual_day"] == 2
+    assert summary.loc[3, "n_valid_residual_observations"] == 2
+    assert summary.loc[3, "n_missing_residual_observations"] == 2
+    assert pd.isna(summary.loc[4, "green_fit_residual_sign_change_count"])
+    assert summary.loc[4, "green_fit_residual_sign_change_status"] == "not_estimable"
+    assert summary.loc[4, "green_fit_residual_sign_change_reason"] == "no_finite_residual_observations"
+    assert np.isnan(summary.loc[4, "min_green_fit_residual"])
+    assert summary.loc[5, "green_fit_residual_sign_change_count"] == 0
+    assert summary.loc[5, "green_fit_residual_range"] == 0.0
+    assert summary.loc[5, "last_valid_residual_day"] == 0
+    assert pd.isna(summary.loc[6, "green_fit_residual_sign_change_count"])
+    assert summary.loc[6, "n_valid_residual_observations"] == 0
+    # Leading zeros retain the established zero-fill convention; internal and
+    # trailing zeros do not introduce extra reversals.
+    assert summary.loc[7, "green_fit_residual_sign_change_count"] == 1
+    assert summary.loc[8, "green_fit_residual_sign_change_count"] == 1
+    assert summary.loc[10, "green_fit_residual_sign_change_count"] == 0
+    assert summary.loc[11, "green_fit_residual_sign_change_count"] == 0
+    # Fully finite regression case retains its previous extrema and crossing count.
+    assert summary.loc[9, "min_green_fit_residual"] == -3.0
+    assert summary.loc[9, "max_green_fit_residual"] == 2.0
+    assert summary.loc[9, "green_fit_residual_range"] == 5.0
+    assert summary.loc[9, "green_fit_residual_sign_change_count"] == 1
+    pd.testing.assert_frame_equal(residual_table, original)
+
+    output_csv = tmp_path / "residual_summary.csv"
+    summary.reset_index().to_csv(output_csv, index=False)
+    serialized = pd.read_csv(output_csv).set_index("roi_id")
+    assert pd.isna(serialized.loc[4, "green_fit_residual_sign_change_count"])
+
+
 def test_select_ranked_roi_days_returns_requested_top_n_rows() -> None:
     roi_day_table = pd.DataFrame(
         {

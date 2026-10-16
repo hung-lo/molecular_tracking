@@ -6,7 +6,11 @@ import numpy as np
 import pandas as pd
 import tifffile
 
-from roi_log_ratio_analysis import compute_log_ratio_metrics, extract_roi_mean_intensities, summarize_daily_green_red_linear_fits
+from roi_log_ratio_analysis import (
+    compute_log_ratio_metrics,
+    extract_roi_mean_intensities,
+    summarize_daily_green_red_linear_fits_tolerant,
+)
 
 
 FIT_POPULATION_RULE = (
@@ -79,52 +83,106 @@ def extract_session_population(records, *, green_dark: float, red_dark: float, e
     return flag_fit_population_artifacts(metrics)
 
 
-def fit_session_population(population: pd.DataFrame) -> pd.DataFrame:
+def fit_session_population(population: pd.DataFrame, records=None) -> pd.DataFrame:
     if "fit_population_include" not in population.columns:
         population = flag_fit_population_artifacts(population)
     fit_population = population.loc[population["fit_population_include"].eq(True)].copy()
-    fits = summarize_daily_green_red_linear_fits(fit_population)
+    metadata_columns = ["day", "session_index", "session_id", "acquisition_date", "elapsed_days"]
+    metadata = population.reindex(columns=metadata_columns).drop_duplicates("day")
+    if records is not None:
+        required_records = [record for record in records if record.required]
+        start_date = min((record.acquisition_date for record in required_records), default=None)
+        record_metadata = pd.DataFrame([
+            {
+                "day": int(record.session_index),
+                "session_index": int(record.session_index),
+                "session_id": str(record.session_id),
+                "acquisition_date": record.acquisition_date.isoformat(),
+                "elapsed_days": int((record.acquisition_date - start_date).days) if start_date else np.nan,
+            }
+            for record in required_records
+        ], columns=metadata_columns)
+        metadata = record_metadata
+    expected_days = metadata["day"].dropna().astype(int).tolist()
+    fits = summarize_daily_green_red_linear_fits_tolerant(
+        fit_population,
+        expected_days=expected_days,
+    )
     diagnostics = []
-    for day, group in population.groupby("day", sort=True):
+    for day in expected_days:
+        group = population.loc[population["day"].eq(day)]
         valid = group.loc[group["fit_population_include"].eq(True)]
         fit = fits.loc[fits["day"].eq(day)].iloc[0]
-        residuals = valid["green"] - (fit["intercept"] + fit["slope"] * valid["red"])
+        if fit["fit_status"] == "valid":
+            residuals = valid["green"] - (fit["intercept"] + fit["slope"] * valid["red"])
+            residual_mean = float(residuals.mean())
+            residual_std = float(residuals.std(ddof=1))
+        else:
+            residual_mean = np.nan
+            residual_std = np.nan
+        n_signal_valid = int(group["ratio_qc_pass"].eq(True).sum()) if "ratio_qc_pass" in group else 0
         diagnostics.append({
             "day": int(day), "n_rois_total": int(len(group)),
-            "n_rois_signal_valid": int(group["ratio_qc_pass"].eq(True).sum()),
-            "signal_valid_fraction": float(group["ratio_qc_pass"].eq(True).mean()) if len(group) else np.nan,
+            "n_rois_signal_valid": n_signal_valid,
+            "signal_valid_fraction": float(n_signal_valid / len(group)) if len(group) else np.nan,
             "n_fit_included": int(len(valid)),
-            "n_fit_excluded": int(group["ratio_qc_pass"].eq(True).sum() - len(valid)),
-            "fit_population_fraction": float(len(valid) / group["ratio_qc_pass"].eq(True).sum()) if group["ratio_qc_pass"].eq(True).sum() else np.nan,
-            "residual_mean_fit_population": float(residuals.mean()),
-            "residual_std_fit_population": float(residuals.std(ddof=1)),
+            "n_fit_excluded": int(n_signal_valid - len(valid)),
+            "fit_population_fraction": float(len(valid) / n_signal_valid) if n_signal_valid else np.nan,
+            "residual_mean_fit_population": residual_mean,
+            "residual_std_fit_population": residual_std,
         })
-    fits = fits.merge(pd.DataFrame(diagnostics), on="day", validate="one_to_one")
-    metadata = population[["day", "session_index", "session_id", "acquisition_date", "elapsed_days"]].drop_duplicates("day")
+    diagnostic_columns = [
+        "day", "n_rois_total", "n_rois_signal_valid", "signal_valid_fraction",
+        "n_fit_included", "n_fit_excluded", "fit_population_fraction",
+        "residual_mean_fit_population", "residual_std_fit_population",
+    ]
+    fits = fits.merge(pd.DataFrame(diagnostics, columns=diagnostic_columns), on="day", validate="one_to_one")
     fits = fits.merge(metadata, on="day", how="left", validate="one_to_one")
     fits["normalization_population"] = "fit_clean_signal_valid_session_rois"
     fits["fit_population_rule"] = FIT_POPULATION_RULE
     return fits
 
 
-def summarize_signal_qc(population: pd.DataFrame) -> pd.DataFrame:
+def summarize_signal_qc(population: pd.DataFrame, records=None) -> pd.DataFrame:
     rows = []
-    for _, group in population.groupby("day", sort=True):
-        row = group.iloc[0]
+    if records is not None:
+        grouped = {
+            int(day): group
+            for day, group in population.groupby("day", sort=True)
+        }
+        sessions = []
+        required_records = [record for record in records if record.required]
+        start_date = min((record.acquisition_date for record in required_records), default=None)
+        for record in required_records:
+            day = int(record.session_index)
+            group = grouped.get(day, population.iloc[0:0])
+            sessions.append((record, group, {
+                "session_id": str(record.session_id),
+                "session_index": day,
+                "acquisition_date": record.acquisition_date.isoformat(),
+                "elapsed_days": int((record.acquisition_date - start_date).days) if start_date else 0,
+            }))
+    else:
+        sessions = []
+        for _, group in population.groupby("day", sort=True):
+            row = group.iloc[0]
+            sessions.append((None, group, row))
+    for _, group, row in sessions:
         n = len(group)
+        count = lambda column: int(group[column].fillna(False).sum()) if column in group else 0
         rows.append({
             "session_id": row["session_id"], "session_index": int(row["session_index"]),
             "acquisition_date": row["acquisition_date"], "elapsed_days": int(row["elapsed_days"]),
             "n_native_rois": n,
-            "n_red_zero_hit_pass": int(group["red_zero_hit_pass"].sum()),
-            "n_green_zero_hit_pass": int(group["green_zero_hit_pass"].sum()),
-            "n_red_signal_valid": int(group["red_signal_qc_pass"].sum()),
-            "n_green_signal_valid": int(group["green_signal_qc_pass"].sum()),
-            "n_ratio_valid": int(group["ratio_qc_pass"].sum()),
-            "red_signal_valid_fraction": float(group["red_signal_qc_pass"].mean()),
-            "green_signal_valid_fraction": float(group["green_signal_qc_pass"].mean()),
-            "ratio_valid_fraction": float(group["ratio_qc_pass"].mean()),
-            "n_fit_population": int(group.get("fit_population_include", group["ratio_qc_pass"]).sum()),
-            "n_fit_excluded_artifact": int(group.get("fit_population_artifact", pd.Series(False, index=group.index)).sum()),
+            "n_red_zero_hit_pass": count("red_zero_hit_pass"),
+            "n_green_zero_hit_pass": count("green_zero_hit_pass"),
+            "n_red_signal_valid": count("red_signal_qc_pass"),
+            "n_green_signal_valid": count("green_signal_qc_pass"),
+            "n_ratio_valid": count("ratio_qc_pass"),
+            "red_signal_valid_fraction": float(count("red_signal_qc_pass") / n) if n else np.nan,
+            "green_signal_valid_fraction": float(count("green_signal_qc_pass") / n) if n else np.nan,
+            "ratio_valid_fraction": float(count("ratio_qc_pass") / n) if n else np.nan,
+            "n_fit_population": count("fit_population_include"),
+            "n_fit_excluded_artifact": count("fit_population_artifact"),
         })
     return pd.DataFrame(rows)

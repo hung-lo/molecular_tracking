@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from datetime import date, timedelta
 import json
+import numpy as np
 import pandas as pd
 from pathlib import Path
 
@@ -65,7 +66,47 @@ def test_resume_requires_current_normalization_provenance(tmp_path: Path) -> Non
         (extraction / name).touch()
     assert not _has_current_extraction(extraction)
     (extraction / "run_log.json").write_text(json.dumps({"analysis_version": "0.3.2", "normalization": {"population": "fit_clean_signal_valid_session_rois"}}))
+    assert not _has_current_extraction(extraction)
+    for name in ("session_coverage_fit_qc.csv", "longest_supported_window.json", "matched_roi_tracks_longest_supported_window.csv", "matched_roi_metrics_longest_supported_window.csv"):
+        (extraction / name).touch()
+    (extraction / "run_log.json").write_text(json.dumps({"analysis_version": "0.3.3", "normalization": {"population": "fit_clean_signal_valid_session_rois"}}))
     assert _has_current_extraction(extraction)
+
+
+def test_partial_fit_plots_keep_unavailable_sessions_and_empty_metrics(tmp_path: Path) -> None:
+    from run_daywise_green_red_linear_fit_summary import (
+        plot_daywise_scatter_summary,
+        plot_fit_parameter_summary,
+    )
+
+    fit = pd.DataFrame({
+        "day": [0, 1], "session_index": [0, 1],
+        "session_id": ["session_0", "session_1"],
+        "acquisition_date": ["2026-01-01", "2026-01-02"],
+        "elapsed_days": [0, 1], "n_rois": [0, 3],
+        "slope": [np.nan, 1.5], "intercept": [np.nan, 2.0],
+        "r_squared": [np.nan, 0.9], "slope_ci_low": [np.nan, 1.0],
+        "slope_ci_high": [np.nan, 2.0], "intercept_ci_low": [np.nan, 1.0],
+        "intercept_ci_high": [np.nan, 3.0],
+        "fit_status": ["not_estimable", "valid"],
+        "fit_reason": ["no_rois", ""],
+    })
+    native_metrics = pd.DataFrame(columns=["day", "red", "green", "red_signal_qc_pass", "green_signal_qc_pass"])
+    scatter = tmp_path / "scatter.png"
+    parameters = tmp_path / "parameters.png"
+    wrapped = tmp_path / "wrapped.png"
+    plot_daywise_scatter_summary(native_metrics, fit, scatter, start_date="20260101")
+    plot_fit_parameter_summary(fit, parameters, roi_metrics=native_metrics, start_date="20260101")
+
+    native_metrics.to_csv(tmp_path / "native.csv", index=False)
+    fit.to_csv(tmp_path / "fit.csv", index=False)
+    master.plot_wrapped_daywise_linear_relationships(
+        tmp_path / "native.csv", tmp_path / "fit.csv", wrapped,
+        start_date="20260101", max_columns=2,
+    )
+    assert scatter.is_file() and scatter.stat().st_size > 0
+    assert parameters.is_file() and parameters.stat().st_size > 0
+    assert wrapped.is_file() and wrapped.stat().st_size > 0
 
 
 def test_run_daywise_master_pipeline_config_defaults() -> None:

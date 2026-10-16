@@ -190,7 +190,7 @@ def compute_log_ratio_metrics(
     metrics["delta_log2_green_over_red"] = (
         metrics["log2_green_over_red"] - metrics["day0_log2_green_over_red"]
     )
-    first = metrics.drop_duplicates("roi_id").set_index("roi_id")
+    first = metrics.loc[metrics["ratio_qc_pass"].eq(True)].drop_duplicates("roi_id").set_index("roi_id")
     metrics["first_observed_day"] = metrics["roi_id"].map(first["day"])
     if "elapsed_days" in metrics:
         metrics["first_observed_elapsed_days"] = metrics["roi_id"].map(first["elapsed_days"])
@@ -546,12 +546,124 @@ def summarize_daily_green_red_linear_fits(
     return pd.DataFrame(summary_rows).sort_values("day").reset_index(drop=True)
 
 
+def summarize_daily_green_red_linear_fits_tolerant(
+    roi_metrics: pd.DataFrame,
+    *,
+    expected_days: list[int] | tuple[int, ...] | None = None,
+    red_column: str = "red",
+    green_column: str = "green",
+    alpha: float = 0.05,
+    not_run_reason: str | None = None,
+) -> pd.DataFrame:
+    """Return one fit/QC row per requested day without hiding unestimable fits.
+
+    The strict :func:`summarize_daily_green_red_linear_fits` remains unchanged
+    for callers that require every fit. This pipeline-facing variant preserves
+    missing coefficients as NaN and records whether a fit was valid,
+    unestimable, or not run because the cohort was unavailable.
+    """
+    required_columns = {"day", red_column, green_column}
+    missing_columns = required_columns.difference(roi_metrics.columns)
+    if missing_columns:
+        raise ValueError(f"Missing required columns: {', '.join(sorted(missing_columns))}")
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between 0 and 1.")
+
+    if expected_days is None:
+        days = sorted(int(day) for day in roi_metrics["day"].dropna().unique())
+    else:
+        days = [int(day) for day in expected_days]
+        if len(days) != len(set(days)):
+            raise ValueError("expected_days must not contain duplicates.")
+
+    statistic_columns = [
+        "n_rois", "slope", "intercept", "r_value", "r_squared", "p_value",
+        "slope_stderr", "intercept_stderr", "slope_ci_low", "slope_ci_high",
+        "intercept_ci_low", "intercept_ci_high",
+    ]
+    from scipy import stats
+
+    rows: list[dict[str, object]] = []
+    for day in days:
+        raw_day = roi_metrics.loc[roi_metrics["day"].eq(day)].copy()
+        row: dict[str, object] = {"day": day, **{name: np.nan for name in statistic_columns}}
+        row["n_rois"] = 0
+        if not_run_reason is not None and roi_metrics.empty:
+            row.update(fit_status="not_run", fit_reason=not_run_reason)
+            rows.append(row)
+            continue
+
+        group = raw_day
+        if {"red_signal_qc_pass", "green_signal_qc_pass"}.issubset(group.columns):
+            group = group.loc[group["red_signal_qc_pass"].eq(True) & group["green_signal_qc_pass"].eq(True)]
+        elif "ratio_qc_pass" in group.columns:
+            group = group.loc[group["ratio_qc_pass"].eq(True)]
+        n_signal_valid = len(group)
+        if "fit_population_include" in group.columns:
+            group = group.loc[group["fit_population_include"].eq(True)]
+        values = group[[red_column, green_column]].replace([np.inf, -np.inf], np.nan).dropna()
+        n = len(values)
+        row["n_rois"] = int(n)
+        reason = None
+        if n == 0:
+            if raw_day.empty:
+                reason = "no_rois"
+            elif n_signal_valid == 0:
+                reason = "no_signal_valid_pairs"
+            elif group.empty:
+                reason = "no_fit_eligible_pairs"
+            else:
+                reason = "no_finite_signal_valid_fit_pairs"
+        elif n < 2:
+            reason = "fewer_than_two_fit_eligible_pairs"
+        else:
+            x = values[red_column].to_numpy(dtype=float)
+            y = values[green_column].to_numpy(dtype=float)
+            if not np.isfinite(x).all() or not np.isfinite(y).all():
+                reason = "nonfinite_fit_input"
+            elif np.ptp(x) == 0:
+                reason = "constant_red_predictor"
+            else:
+                try:
+                    fit = stats.linregress(x, y)
+                    if not np.isfinite([fit.slope, fit.intercept, fit.rvalue]).all():
+                        reason = "nonfinite_fit_result"
+                    else:
+                        df = n - 2
+                        if df > 0:
+                            t_critical = float(stats.t.ppf(1.0 - alpha / 2.0, df=df))
+                            ci = (
+                                float(fit.slope - t_critical * fit.stderr),
+                                float(fit.slope + t_critical * fit.stderr),
+                                float(fit.intercept - t_critical * fit.intercept_stderr),
+                                float(fit.intercept + t_critical * fit.intercept_stderr),
+                            )
+                        else:
+                            ci = (np.nan, np.nan, np.nan, np.nan)
+                        row.update(
+                            slope=float(fit.slope), intercept=float(fit.intercept),
+                            r_value=float(fit.rvalue), r_squared=float(fit.rvalue ** 2),
+                            p_value=float(fit.pvalue), slope_stderr=float(fit.stderr),
+                            intercept_stderr=float(fit.intercept_stderr),
+                            slope_ci_low=ci[0], slope_ci_high=ci[1],
+                            intercept_ci_low=ci[2], intercept_ci_high=ci[3],
+                            fit_status="valid", fit_reason="",
+                        )
+                except (ValueError, FloatingPointError, OverflowError):
+                    reason = "numerical_fit_failure"
+        if reason is not None:
+            row.update(fit_status="not_estimable", fit_reason=reason)
+        rows.append(row)
+    return pd.DataFrame(rows, columns=["day", *statistic_columns, "fit_status", "fit_reason"])
+
+
 def compute_green_red_fit_residuals(
     roi_metrics: pd.DataFrame,
     fit_summary: pd.DataFrame | None = None,
     red_column: str = "red",
     green_column: str = "green",
     baseline_day: int = 0,
+    allow_missing_fits: bool = False,
 ) -> pd.DataFrame:
     """Compute day-specific signed deviations from the fitted green-vs-red line.
 
@@ -603,12 +715,13 @@ def compute_green_red_fit_residuals(
         raise ValueError(f"Missing required fit-summary columns: {missing_str}")
 
     output = roi_metrics.copy().sort_values(["roi_id", "day"]).reset_index(drop=True)
-    fit_table = fit_summary.loc[:, ["day", "slope", "intercept"]].copy()
+    extra_fit_columns = [column for column in ("fit_status", "fit_reason") if column in fit_summary.columns]
+    fit_table = fit_summary.loc[:, ["day", "slope", "intercept", *extra_fit_columns]].copy()
     if fit_table["day"].duplicated().any():
         raise ValueError("fit_summary must contain at most one row per day.")
 
     output = output.merge(fit_table, on="day", how="left", validate="many_to_one")
-    if output["slope"].isna().any() or output["intercept"].isna().any():
+    if not allow_missing_fits and (output["slope"].isna().any() or output["intercept"].isna().any()):
         raise ValueError("fit_summary did not provide slope and intercept for every day.")
 
     output["predicted_green_from_fit"] = (
@@ -624,7 +737,8 @@ def compute_green_red_fit_residuals(
     if "ratio_qc_pass" in output:
         invalid = ~output["ratio_qc_pass"].eq(True)
         output.loc[invalid, ["predicted_green_from_fit", "green_fit_residual", "green_fit_signed_distance"]] = np.nan
-    baseline_rows = output.loc[output["day"].eq(baseline_day)].drop_duplicates("roi_id")
+    baseline_rows = output.loc[output["day"].eq(baseline_day)]
+    baseline_rows = baseline_rows.loc[np.isfinite(baseline_rows["green_fit_residual"])].drop_duplicates("roi_id")
     baseline_rows = baseline_rows.set_index("roi_id")
     output["day0_green_fit_residual"] = output["roi_id"].map(
         baseline_rows["green_fit_residual"]
@@ -638,7 +752,8 @@ def compute_green_red_fit_residuals(
     output["delta_green_fit_signed_distance"] = (
         output["green_fit_signed_distance"] - output["day0_green_fit_signed_distance"]
     )
-    first = output.drop_duplicates("roi_id").set_index("roi_id")
+    first_rows = output.loc[np.isfinite(output["green_fit_residual"])].drop_duplicates("roi_id")
+    first = first_rows.set_index("roi_id")
     output["first_observed_green_fit_residual"] = output["roi_id"].map(
         first["green_fit_residual"]
     )
@@ -805,36 +920,57 @@ def summarize_roi_metrics(roi_metrics: pd.DataFrame) -> pd.DataFrame:
     summaries: list[dict[str, float | int]] = []
     for roi_id, roi_table in roi_metrics.groupby("roi_id", sort=True):
         roi_table = roi_table.sort_values("day").reset_index(drop=True)
-        delta_values = roi_table["delta_log2_green_over_red"].to_numpy()
-        day_values = roi_table["day"].to_numpy()
-        min_delta_index = int(np.argmin(delta_values))
+        day0_rows = roi_table.loc[roi_table["day"].eq(0)]
+        day0 = day0_rows.iloc[0] if not day0_rows.empty else None
+        valid_delta = roi_table.loc[np.isfinite(pd.to_numeric(roi_table["delta_log2_green_over_red"], errors="coerce"))]
+        delta_values = valid_delta["delta_log2_green_over_red"].astype(float).to_numpy()
+        day_values = valid_delta["day"].to_numpy()
+        if len(delta_values):
+            min_delta_index = int(np.argmin(delta_values))
+            min_delta = float(delta_values[min_delta_index])
+            max_delta = float(np.max(delta_values))
+            delta_range = float(max_delta - min_delta)
+            day_of_min = int(day_values[min_delta_index])
+            final_delta = float(delta_values[-1])
+        else:
+            min_delta = max_delta = delta_range = final_delta = np.nan
+            day_of_min = np.nan
+        day0_red = float(day0["red"]) if day0 is not None else np.nan
+        day0_green = float(day0["green"]) if day0 is not None else np.nan
+        day0_brightness = float(day0["brightness"]) if day0 is not None else np.nan
+        day0_log_ratio = float(day0["log2_green_over_red"]) if day0 is not None else np.nan
 
         summaries.append(
             {
                 "roi_id": int(roi_id),
                 "n_days": int(len(roi_table)),
-                "day0_red": float(roi_table["red"].iloc[0]),
-                "day0_green": float(roi_table["green"].iloc[0]),
-                "day0_brightness": float(roi_table["brightness"].iloc[0]),
-                "day0_log2_green_over_red": float(
-                    roi_table["log2_green_over_red"].iloc[0]
-                ),
+                "day0_red": day0_red,
+                "day0_green": day0_green,
+                "day0_brightness": day0_brightness,
+                "day0_log2_green_over_red": day0_log_ratio,
                 "red_cv": _coefficient_of_variation(roi_table["red"].to_numpy()),
                 "green_cv": _coefficient_of_variation(roi_table["green"].to_numpy()),
                 "brightness_cv": _coefficient_of_variation(
                     roi_table["brightness"].to_numpy()
                 ),
-                "min_delta_log2_green_over_red": float(delta_values[min_delta_index]),
-                "day_of_min_delta": int(day_values[min_delta_index]),
-                "max_delta_log2_green_over_red": float(np.max(delta_values)),
-                "delta_log2_range": float(
-                    np.max(delta_values) - np.min(delta_values)
-                ),
-                "day_last_delta_log2_green_over_red": float(delta_values[-1]),
+                "min_delta_log2_green_over_red": min_delta,
+                "day_of_min_delta": day_of_min,
+                "max_delta_log2_green_over_red": max_delta,
+                "delta_log2_range": delta_range,
+                "day_last_delta_log2_green_over_red": final_delta,
             }
         )
 
-    return pd.DataFrame(summaries).sort_values("roi_id").reset_index(drop=True)
+    columns = [
+        "roi_id", "n_days", "day0_red", "day0_green", "day0_brightness",
+        "day0_log2_green_over_red", "red_cv", "green_cv", "brightness_cv",
+        "min_delta_log2_green_over_red", "day_of_min_delta",
+        "max_delta_log2_green_over_red", "delta_log2_range",
+        "day_last_delta_log2_green_over_red",
+    ]
+    if not summaries:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(summaries, columns=columns).sort_values("roi_id").reset_index(drop=True)
 
 
 def classify_roi_log_ratio_trajectories(

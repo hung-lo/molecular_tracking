@@ -22,6 +22,7 @@ METRIC_NAMES = (
     "matched_roi_metrics_primary_final.csv",
     "weekly_matched_roi_log_ratio_metrics_complete.csv",
     "matched_roi_log_ratio_metrics_complete.csv",
+    "matched_roi_log_ratio_metrics_all_observed.csv",
 )
 RAW_NAMES = (
     "matched_roi_intensity_results_raw.csv",
@@ -37,17 +38,30 @@ def _first_existing(root: Path, names: tuple[str, ...]) -> Path:
     raise FileNotFoundError(f"None of {names} was found in {root}")
 
 
+def _first_nonempty_metrics(root: Path, names: tuple[str, ...]) -> Path:
+    existing = [root / name for name in names if (root / name).is_file()]
+    if not existing:
+        raise FileNotFoundError(f"None of {names} was found in {root}")
+    for candidate in existing:
+        try:
+            if not pd.read_csv(candidate, nrows=1).empty:
+                return candidate
+        except pd.errors.EmptyDataError:
+            continue
+    return existing[0]
+
+
 def _resolve_run_inputs(run_dir: Path) -> tuple[Path, Path, Path]:
     """Resolve current master-run inputs, with support for legacy flat runs."""
     extraction = run_dir / "extraction"
     if extraction.is_dir():
         return (
-            _first_existing(extraction, METRIC_NAMES),
+            _first_nonempty_metrics(extraction, METRIC_NAMES),
             _first_existing(extraction, RAW_NAMES),
             _first_existing(extraction, ("session_manifest_resolved.csv",)) if (extraction / "session_manifest_resolved.csv").is_file() else _first_existing(run_dir / "matching", ("session_manifest_resolved.csv",)),
         )
     return (
-        _first_existing(run_dir, METRIC_NAMES),
+        _first_nonempty_metrics(run_dir, METRIC_NAMES),
         _first_existing(run_dir, RAW_NAMES),
         _first_existing(run_dir, ("session_manifest_resolved.csv",)),
     )
@@ -101,6 +115,15 @@ def build_ranked_roi_views(
     tracks = _tracks_from_raw_table(raw, policy)
     output_root = Path(output_dir).resolve() if output_dir else root / "plots" / policy / "single_roi_raw_validation"
     output_root.mkdir(parents=True, exist_ok=True)
+    if metrics.empty:
+        pd.DataFrame(columns=["selection_direction", "selection_rank", "roi_id", "track_uid", "png_path", "metadata_csv_path"]).to_csv(
+            output_root / "ranked_roi_batch_index.csv", index=False,
+        )
+        (output_root / "ranked_roi_render_profile.json").write_text(
+            json.dumps({"status": "no_eligible_data", "reason": "no matched ROI metrics were available for ranking"}, indent=2),
+            encoding="utf-8",
+        )
+        return output_root
     summary = summarize_roi_metrics(metrics)
     index_rows = []
     render_specs = []
@@ -133,6 +156,21 @@ def build_ranked_roi_views(
                 "selection_value": selected[selected["selection_metric_column"]],
                 "png_path": str(png_path), "metadata_csv_path": str(metadata_path),
             })
+    if not render_specs:
+        reason = (
+            "no_valid_day0_baseline_for_day0_change_ranking"
+            if "day0_brightness" in summary and summary["day0_brightness"].isna().all()
+            else "no_rois_met_ranking_criteria"
+        )
+        pd.DataFrame(index_rows, columns=[
+            "selection_direction", "selection_rank", "roi_id", "cluster_id", "track_uid",
+            "selection_mode", "selection_metric_column", "selection_value", "png_path", "metadata_csv_path",
+        ]).to_csv(output_root / "ranked_roi_batch_index.csv", index=False)
+        (output_root / "ranked_roi_render_profile.json").write_text(
+            json.dumps({"status": "no_eligible_data", "reason": reason}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return output_root
     profile = render_ranked_roi_batch(
         specs=render_specs,
         tracks_table=tracks,

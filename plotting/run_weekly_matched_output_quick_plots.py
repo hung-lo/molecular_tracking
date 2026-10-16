@@ -117,6 +117,19 @@ def _first_existing_path(analysis_dir: Path, *names: str) -> Path:
     raise FileNotFoundError(f"None of the expected input tables were found in {analysis_dir}: {expected}")
 
 
+def _first_nonempty_metrics_path(analysis_dir: Path, *names: str) -> Path:
+    existing = [analysis_dir / name for name in names if (analysis_dir / name).is_file()]
+    if not existing:
+        raise FileNotFoundError(f"None of the expected input tables were found in {analysis_dir}: {', '.join(names)}")
+    for candidate in existing:
+        try:
+            if not pd.read_csv(candidate, nrows=1).empty:
+                return candidate
+        except pd.errors.EmptyDataError:
+            continue
+    return existing[0]
+
+
 def _population_title(analysis_dir: Path) -> str:
     run_log = analysis_dir / "run_log.json"
     if run_log.is_file():
@@ -192,20 +205,22 @@ def build_quick_plots(
         if start_date is None:
             raise ValueError("No reference-date metadata was found; pass --start-date for this legacy output.")
     log_message(run_start_seconds, f"Starting matched ROI quick plots | analysis_dir={analysis_dir}")
-    metrics_path = _first_existing_path(
+    metrics_path = _first_nonempty_metrics_path(
         analysis_dir,
         "matched_roi_metrics_primary_final.csv",
         "weekly_matched_roi_log_ratio_metrics_complete.csv",
         "matched_roi_log_ratio_metrics_complete.csv",
+        "matched_roi_log_ratio_metrics_all_observed.csv",
     )
     fit_population_path = analysis_dir / "matched_session_population_roi_metrics.csv"
     if not fit_population_path.is_file():
         fit_population_path = metrics_path
-    residuals_path = _first_existing_path(
+    residuals_path = _first_nonempty_metrics_path(
         analysis_dir,
         "matched_roi_metrics_primary_final_with_green_red_fit_residuals.csv",
         "weekly_matched_roi_metrics_with_green_red_fit_residuals.csv",
         "matched_roi_metrics_with_green_red_fit_residuals.csv",
+        "matched_roi_metrics_with_session_normalized_residuals_all_observed.csv",
     )
     fit_summary_path = _first_existing_path(
         analysis_dir,
@@ -260,7 +275,7 @@ def build_quick_plots(
         start_date=start_date,
     )
 
-    roi_summary = summarize_roi_metrics(metrics_table)
+    roi_summary = summarize_roi_metrics(metrics_table) if not metrics_table.empty else pd.DataFrame()
     ranking_columns = [
         "selection_rank",
         "min_delta_log2_green_over_red",
@@ -271,6 +286,12 @@ def build_quick_plots(
     ]
 
     for direction_label in ("decreasing", "increasing"):
+        if metrics_table.empty:
+            log_message(run_start_seconds, f"No eligible ROI data; skipping {direction_label} ranked plots")
+            pd.DataFrame(columns=["selection_rank", "roi_id", "selection_mode"]).to_csv(
+                output_dir / f"top0_{direction_label}_clusters.csv", index=False,
+            )
+            continue
         top_rois = select_top_changing_rois(
             roi_summary=roi_summary,
             max_rois=top_n,
@@ -325,6 +346,24 @@ def build_quick_plots(
             direction_label=direction_label,
             start_date=start_date,
         )
+
+    ranking_status = {
+        "status": "no_eligible_data" if metrics_table.empty else "evaluated",
+        "reason": "no matched ROI observations were available" if metrics_table.empty else "",
+        "directions": {},
+    }
+    if not metrics_table.empty:
+        for direction_label in ("decreasing", "increasing"):
+            clusters_path = output_dir / f"top{top_n}_{direction_label}_clusters.csv"
+            selected_count = len(pd.read_csv(clusters_path)) if clusters_path.is_file() else 0
+            ranking_status["directions"][direction_label] = {
+                "status": "evaluated" if selected_count else "no_eligible_data",
+                "n_ranked_rois": int(selected_count),
+                "reason": "no valid day-0-baselined ROIs met the ranking criteria" if not selected_count else "",
+            }
+    (output_dir / "ranked_roi_status.json").write_text(
+        json.dumps(ranking_status, indent=2, sort_keys=True), encoding="utf-8",
+    )
 
     summary_lines = [
         "Quick plots generated from saved matched ROI outputs.",

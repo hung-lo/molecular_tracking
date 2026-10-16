@@ -297,7 +297,9 @@ def test_log_ratio_requires_positive_dark_corrected_signals_and_true_day0() -> N
     metrics = compute_log_ratio_metrics(table)
     assert not bool(metrics.loc[0, "ratio_qc_pass"])
     assert np.isnan(metrics.loc[0, "log2_green_over_red"])
-    assert np.isnan(metrics.loc[1, "first_observed_log2_green_over_red"])
+    assert metrics.loc[1, "first_observed_day"] == 1
+    assert metrics.loc[1, "first_observed_log2_green_over_red"] == metrics.loc[1, "log2_green_over_red"]
+    assert metrics.loc[1, "delta_log2_green_over_red_from_first_observed"] == 0.0
     assert np.isnan(metrics.loc[2, "day0_log2_green_over_red"])
     assert metrics.loc[2, "first_observed_log2_green_over_red"] == metrics.loc[2, "log2_green_over_red"]
 

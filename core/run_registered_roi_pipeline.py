@@ -532,6 +532,23 @@ def plot_population_summary(
         summaries.
     """
 
+    required_columns = {
+        "roi_id", "day", "green_fraction", "log2_green_over_red",
+        "delta_log2_green_over_red",
+    }
+    missing_columns = required_columns.difference(roi_metrics.columns)
+    if missing_columns:
+        raise ValueError(f"Missing ROI metric columns: {sorted(missing_columns)}")
+    if roi_metrics.empty:
+        figure, axes = plt.subplots(1, 3, figsize=(13.8, 4.4), facecolor="white")
+        for axis in axes:
+            axis.axis("off")
+            axis.text(0.5, 0.5, "No eligible ROI observations", ha="center", va="center", fontsize=12)
+        figure.suptitle(population_title, fontsize=14)
+        figure.savefig(output_path, dpi=180, bbox_inches="tight")
+        plt.close(figure)
+        return
+
     timing = resolve_plot_day_axis(roi_metrics, start_date=start_date)
     day_values = timing["plot_day"].to_numpy(dtype=int)
     date_labels = timing["date_label"].tolist()

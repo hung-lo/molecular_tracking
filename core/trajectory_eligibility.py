@@ -107,6 +107,23 @@ def build_trajectory_eligibility(
             "trajectory_ineligibility_reasons": ",".join(reasons),
         })
     eligibility = pd.DataFrame(rows)
+    if eligibility.empty:
+        eligibility = pd.DataFrame(columns=[
+            "match_policy", "roi_id", "track_uid", "cluster_id", "n_required_sessions",
+            "n_track_labels_present", "n_signal_valid_sessions", "n_usable_trajectory_sessions",
+            "n_track_present_but_signal_invalid", "usable_session_fraction",
+            "first_usable_session_index", "last_usable_session_index",
+            "first_usable_session_id", "last_usable_session_id",
+            "first_usable_elapsed_days", "last_usable_elapsed_days", "usable_elapsed_day_span",
+            "n_internal_missing_sessions", "max_consecutive_usable_sessions",
+            "has_first_required_session", "has_last_required_session", "has_cycle_conflict",
+            "used_gap_bridge", "review_required", "review_reasons",
+            "trajectory_min_sessions_threshold", "trajectory_min_fraction_threshold",
+            "trajectory_max_internal_missing_threshold", "trajectory_require_first_session",
+            "trajectory_require_last_session", "trajectory_eligible",
+            "trajectory_ineligibility_reasons",
+        ])
+        return eligibility, usable_observations.iloc[0:0].copy()
     eligible_ids = set(eligibility.loc[eligibility["trajectory_eligible"], "track_uid"].astype(str))
     eligible_observations = usable_observations.loc[
         usable_observations["track_uid"].astype(str).isin(eligible_ids)

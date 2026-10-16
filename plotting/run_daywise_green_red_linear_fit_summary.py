@@ -211,23 +211,35 @@ def plot_daywise_scatter_summary(
         Reference date used to convert day offsets into date labels.
     """
 
-    if roi_metrics.empty:
-        raise ValueError("No ROI metrics were available for scatter plotting.")
-
     plot_fit_summary = fit_summary.copy()
+    required_fit_columns = {"day", "slope", "intercept", "r_squared", "n_rois"}
+    missing_fit_columns = required_fit_columns.difference(plot_fit_summary.columns)
+    if missing_fit_columns:
+        raise ValueError(f"Missing fit-summary columns: {sorted(missing_fit_columns)}")
+    required_metric_columns = {"day", "red", "green"}
+    missing_metric_columns = required_metric_columns.difference(roi_metrics.columns)
+    if missing_metric_columns:
+        raise ValueError(f"Missing ROI metric columns: {sorted(missing_metric_columns)}")
+    if plot_fit_summary.empty:
+        figure, axis = plt.subplots(figsize=(7, 4), facecolor="white")
+        axis.axis("off")
+        axis.text(0.5, 0.5, "No session fit rows were available.", ha="center", va="center")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output_path, dpi=180, bbox_inches="tight")
+        plt.close(figure)
+        return
     if {"red_signal_qc_pass", "green_signal_qc_pass"}.issubset(roi_metrics.columns):
         roi_metrics = roi_metrics.loc[
             roi_metrics["red_signal_qc_pass"].eq(True)
             & roi_metrics["green_signal_qc_pass"].eq(True)
         ].copy()
-    if roi_metrics.empty:
-        raise ValueError("No signal-valid ROI metrics were available for scatter plotting.")
-    timing = resolve_plot_day_axis(roi_metrics, start_date=start_date)
+    timing_source = plot_fit_summary
+    timing = resolve_plot_day_axis(timing_source, start_date=start_date)
     source_to_plot = dict(zip(timing["source_day"], timing["plot_day"], strict=True))
     source_to_date = dict(zip(timing["source_day"], timing["date_label"], strict=True))
     day_values = plot_fit_summary["day"].to_numpy(dtype=int)
     date_labels = _resolve_day_date_labels(
-        roi_metrics,
+        timing_source,
         day_values,
         start_date=start_date,
     )
@@ -282,7 +294,12 @@ def plot_daywise_scatter_summary(
         fit_row = plot_fit_summary.loc[plot_fit_summary["day"].eq(day_value)].iloc[0]
         x_values = day_table["red"].to_numpy(dtype=float)
         y_values = day_table["green"].to_numpy(dtype=float)
-        if len(day_table) >= 2:
+        fit_status = str(fit_row.get("fit_status", "valid"))
+        fit_available = (
+            fit_status == "valid"
+            and np.isfinite(pd.to_numeric(pd.Series([fit_row["slope"], fit_row["intercept"]]), errors="coerce")).all()
+        )
+        if fit_available and len(day_table) >= 2:
             x_grid = np.linspace(float(x_values.min()), float(x_values.max()), 200)
             y_hat = float(fit_row["intercept"]) + float(fit_row["slope"]) * x_grid
             y_low = np.asarray([], dtype=float)
@@ -302,7 +319,7 @@ def plot_daywise_scatter_summary(
             edgecolors="none",
             rasterized=True,
         )
-        if len(x_grid) > 0:
+        if len(x_grid) > 0 and np.isfinite(y_hat).all():
             axis.plot(x_grid, y_hat, color="#d62828", linewidth=2.0)
         if not artifact_table.empty:
             axis.scatter(
@@ -316,20 +333,21 @@ def plot_daywise_scatter_summary(
         if day_value == int(day_values[0]):
             axis.set_ylabel("Corrected green intensity", fontsize=10)
         axis.tick_params(labelsize=9)
-        axis.text(
-            0.04,
-            0.96,
-            (
+        if fit_available:
+            fit_annotation = (
                 f"slope = {fit_row['slope']:.3f}\n"
                 f"intercept = {fit_row['intercept']:.1f}\n"
                 f"R² = {fit_row['r_squared']:.3f}\n"
                 f"n = {int(fit_row['n_rois'])}"
-                + (
-                    f"\nexcluded fit artifacts: {excluded_count}"
-                    if excluded_count
-                    else ""
-                )
-            ),
+            )
+        else:
+            raw_reason = fit_row.get("fit_reason", "")
+            reason = str(raw_reason) if pd.notna(raw_reason) and str(raw_reason).strip() else fit_status
+            fit_annotation = f"Fit unavailable ({reason})\nn = {int(fit_row['n_rois'])}"
+        axis.text(
+            0.04,
+            0.96,
+            fit_annotation + (f"\nexcluded fit artifacts: {excluded_count}" if excluded_count else ""),
             transform=axis.transAxes,
             ha="left",
             va="top",
@@ -394,12 +412,13 @@ def plot_fit_parameter_summary(
         ].copy()
 
     day_values = plot_fit_summary["day"].to_numpy(dtype=int)
+    axis_source = plot_fit_summary
     date_labels = _resolve_day_date_labels(
-        roi_metrics if roi_metrics is not None else plot_fit_summary,
+        axis_source,
         day_values,
         start_date=start_date,
     )
-    timing = resolve_plot_day_axis(roi_metrics if roi_metrics is not None else plot_fit_summary, start_date=start_date)
+    timing = resolve_plot_day_axis(axis_source, start_date=start_date)
     source_to_plot = dict(zip(timing["source_day"], timing["plot_day"], strict=True))
     x_positions = np.asarray([source_to_plot[int(day)] for day in day_values], dtype=float)
 

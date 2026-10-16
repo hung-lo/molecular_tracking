@@ -71,8 +71,8 @@ from run_ranked_roi_quick_views import build_ranked_roi_views
 from session_manifest import SessionRecord, load_session_manifest
 
 
-MASTER_RUNNER_VERSION = "daywise_master_graph_affine_consensus_v1"
-MIN_REUSABLE_EXTRACTION_VERSION = (0, 3, 2)
+MASTER_RUNNER_VERSION = "daywise_master_graph_affine_consensus_v2"
+MIN_REUSABLE_EXTRACTION_VERSION = (0, 3, 3)
 AGREEMENT_COLUMNS = [
     "track_match_source",
     "n_accepted_graph_edges",
@@ -475,6 +475,10 @@ def _has_current_extraction(extraction_dir: Path) -> bool:
         "primary_final_tracks.csv",
         "matched_roi_metrics_primary_final.csv",
         "policy_status.csv",
+        "session_coverage_fit_qc.csv",
+        "longest_supported_window.json",
+        "matched_roi_tracks_longest_supported_window.csv",
+        "matched_roi_metrics_longest_supported_window.csv",
     ]
     log_path = extraction_dir / "run_log.json"
     if not log_path.is_file() or any(not (extraction_dir / name).is_file() for name in required):
@@ -887,12 +891,21 @@ def plot_wrapped_daywise_linear_relationships(
             metrics["red_signal_qc_pass"].eq(True)
             & metrics["green_signal_qc_pass"].eq(True)
         ].copy()
-    if metrics.empty:
-        raise ValueError("No signal-valid native session ROIs were available for wrapped plotting.")
-
     fit_summary = _read_csv(fit_summary_path)
+    required_fit_columns = {"day", "slope", "intercept", "r_squared", "n_rois"}
+    missing_fit_columns = required_fit_columns.difference(fit_summary.columns)
+    if missing_fit_columns:
+        raise ValueError(f"Missing fit-summary columns: {sorted(missing_fit_columns)}")
     fit_summary["day"] = pd.to_numeric(fit_summary["day"], errors="raise").astype(int)
     day_values = sorted(fit_summary["day"].unique().tolist())
+    if not day_values:
+        figure, axis = plt.subplots(figsize=(7, 4), facecolor="white")
+        axis.axis("off")
+        axis.text(0.5, 0.5, "No session fit rows were available.", ha="center", va="center")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output_path, dpi=180, bbox_inches="tight")
+        plt.close(figure)
+        return
     n_columns = min(max(1, int(max_columns)), len(day_values))
     n_rows = int(math.ceil(len(day_values) / n_columns))
     figure, axes = plt.subplots(
@@ -942,7 +955,12 @@ def plot_wrapped_daywise_linear_relationships(
         x_values = day_table["red"].to_numpy(dtype=float)
         y_values = day_table["green"].to_numpy(dtype=float)
         fit_row = fit_summary.loc[fit_summary["day"].eq(day_value)].iloc[0]
-        if len(day_table) >= 2:
+        fit_status = str(fit_row.get("fit_status", "valid"))
+        fit_available = (
+            fit_status == "valid"
+            and np.isfinite(pd.to_numeric(pd.Series([fit_row["slope"], fit_row["intercept"]]), errors="coerce")).all()
+        )
+        if fit_available and len(day_table) >= 2:
             x_grid = np.linspace(float(x_values.min()), float(x_values.max()), 200)
             y_hat = float(fit_row["intercept"]) + float(fit_row["slope"]) * x_grid
             y_low = np.asarray([], dtype=float)
@@ -980,20 +998,26 @@ def plot_wrapped_daywise_linear_relationships(
                 )
             axis.plot(x_grid, y_hat, color="#d62828", linewidth=1.8)
 
-        date_label = _actual_date_label(day_table, day_value, start_date)
+        fit_date = pd.to_datetime(fit_row.get("acquisition_date"), errors="coerce")
+        date_label = fit_date.strftime("%Y%m%d") if pd.notna(fit_date) else _actual_date_label(day_table, day_value, start_date)
         axis.set_title(f"Session {day_value} | {date_label}", fontsize=10)
         axis.set_xlabel("Corrected red", fontsize=9)
         axis.set_ylabel("Corrected green", fontsize=9)
         axis.tick_params(labelsize=8)
-        axis.text(
-            0.04,
-            0.96,
-            (
+        if fit_available:
+            fit_annotation = (
                 f"slope={fit_row['slope']:.3f}\n"
                 f"R²={fit_row['r_squared']:.3f}\n"
                 f"n={int(fit_row['n_rois'])}"
-                + (f"\nexcluded fit artifacts={excluded_count}" if excluded_count else "")
-            ),
+            )
+        else:
+            raw_reason = fit_row.get("fit_reason", "")
+            reason = str(raw_reason) if pd.notna(raw_reason) and str(raw_reason).strip() else fit_status
+            fit_annotation = f"Fit unavailable\n({reason})\nn={int(fit_row['n_rois'])}"
+        axis.text(
+            0.04,
+            0.96,
+            fit_annotation + (f"\nexcluded fit artifacts={excluded_count}" if excluded_count else ""),
             transform=axis.transAxes,
             ha="left",
             va="top",
@@ -1052,6 +1076,10 @@ def _write_master_summary(
     ranked_roi_views_dir: Path | None,
 ) -> None:
     acquisition_status = json.loads((run_dir / "acquisition_settings_qc.json").read_text(encoding="utf-8"))["status"]
+    coverage_path = extraction_dir / "session_coverage_fit_qc.csv"
+    coverage = pd.read_csv(coverage_path) if coverage_path.is_file() else pd.DataFrame()
+    window_path = extraction_dir / "longest_supported_window.json"
+    window = json.loads(window_path.read_text(encoding="utf-8")) if window_path.is_file() else None
     selection_label = selection.raw if selection.mode != "all" else "all"
     selected_ids = ", ".join(selected_meta["session_ids"])
     lines = [
@@ -1104,6 +1132,30 @@ def _write_master_summary(
         ),
         f"The wrapped linear-fit plot is `plots/graph/daywise_green_red_linear_fit_scatters_wrapped_{int(config.plot_columns)}cols.png` by default.",
     ]
+    if not coverage.empty:
+        lines.extend(["", "## Session coverage and fit QC", ""])
+        for _, row in coverage.sort_values("session_index").iterrows():
+            status = (
+                f"native fit `{row['native_fit_status']}`; full-manifest sensitivity fit `"
+                f"{row['sensitivity_fit_status']}`"
+            )
+            detail = f"; reasons: {row['reason']}" if str(row.get("reason", "")) else ""
+            counts = (
+                f"native ROIs={int(row['n_native_rois'])}, tracked observed={int(row['n_tracked_observed'])}, "
+                f"full-manifest complete={int(row['n_complete_full_manifest'])}"
+                if bool(row.get("required", True)) else "not required for fit/extraction population"
+            )
+            lines.append(
+                f"- {row['session_id']} (session {int(row['session_index'])}): "
+                f"{counts}; {status}{detail}"
+            )
+    if window is not None:
+        lines.extend([
+            "", "## Longest supported contiguous window", "",
+            f"- Status: `{window.get('status')}`",
+            f"- Sessions: `{', '.join(window.get('window_session_ids', [])) or 'none'}`",
+            f"- Complete tracked ROIs: `{int(window.get('n_complete_tracks', 0))}`",
+        ])
     (run_dir / "SUMMARY.md").write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -1455,6 +1507,21 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
     finished_utc = datetime.now(timezone.utc).isoformat()
     total_seconds = time.perf_counter() - start_seconds
     stage_durations_seconds["total"] = float(total_seconds)
+    extraction_coverage_path = extraction_dir / "session_coverage_fit_qc.csv"
+    extraction_window_path = extraction_dir / "longest_supported_window.json"
+    extraction_run_log_path = extraction_dir / "run_log.json"
+    extraction_coverage = (
+        pd.read_csv(extraction_coverage_path).to_dict("records")
+        if extraction_coverage_path.is_file() else []
+    )
+    extraction_window = (
+        json.loads(extraction_window_path.read_text(encoding="utf-8"))
+        if extraction_window_path.is_file() else None
+    )
+    extraction_warnings = (
+        json.loads(extraction_run_log_path.read_text(encoding="utf-8")).get("warnings", [])
+        if extraction_run_log_path.is_file() else []
+    )
     outputs = {
         "run_dir": str(run_dir),
         "matching_dir": str(match_dir),
@@ -1462,6 +1529,11 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         "extraction_dir": str(extraction_dir),
         "plots_dir": str(plots_dir),
         "wrapped_linear_fit_plot": str(wrapped_plot_path),
+        "session_coverage_fit_qc": str(extraction_coverage_path) if extraction_coverage_path.is_file() else None,
+        "longest_supported_window": str(extraction_window_path) if extraction_window_path.is_file() else None,
+        "longest_supported_window_ranking": str(extraction_dir / "longest_supported_window_ranking.csv") if (extraction_dir / "longest_supported_window_ranking.csv").is_file() else None,
+        "longest_supported_window_tracks": str(extraction_dir / "matched_roi_tracks_longest_supported_window.csv") if (extraction_dir / "matched_roi_tracks_longest_supported_window.csv").is_file() else None,
+        "longest_supported_window_metrics": str(extraction_dir / "matched_roi_metrics_longest_supported_window.csv") if (extraction_dir / "matched_roi_metrics_longest_supported_window.csv").is_file() else None,
         "acquisition_settings_by_session": str(run_dir / "acquisition_settings_by_session.csv"),
         "acquisition_settings_qc": str(run_dir / "acquisition_settings_qc.json"),
         "ranked_roi_views_dir": (
@@ -1505,6 +1577,9 @@ def run_master_pipeline(config: MasterPipelineConfig) -> Path:
         },
         "agreement": agreement_summary,
         "extraction_annotation": extraction_annotation,
+        "extraction_session_coverage_fit_qc": extraction_coverage,
+        "longest_supported_window": extraction_window,
+        "extraction_warnings": extraction_warnings,
         "outputs": outputs,
         "acquisition_settings_qc": acquisition_qc,
     }

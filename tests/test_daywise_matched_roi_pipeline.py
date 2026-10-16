@@ -99,6 +99,8 @@ def test_run_daywise_matched_roi_pipeline_exports_expected_tables(tmp_path: Path
     filter_counts = pd.read_csv(output_dir / "filter_step_counts_with_percentages.csv")
     run_log = json.loads((output_dir / "run_log.json").read_text(encoding="utf-8"))
     summary = (output_dir / "SUMMARY.md").read_text(encoding="utf-8")
+    coverage = pd.read_csv(output_dir / "session_coverage_fit_qc.csv")
+    window = json.loads((output_dir / "longest_supported_window.json").read_text(encoding="utf-8"))
 
     assert raw["channel"].isin(["red", "green"]).all()
     assert complete.shape[0] == 12
@@ -122,6 +124,11 @@ def test_run_daywise_matched_roi_pipeline_exports_expected_tables(tmp_path: Path
     assert "segmentation_qc_not_configured" in run_log["warnings"]
     assert "Segmentation QC status: `not_configured_bypassed`" in summary
     assert run_log["output_paths"]["matched_track_qc_summary"].endswith("matched_track_qc_summary.csv")
+    assert len(coverage) == 2
+    assert {"n_native_rois", "n_tracked_observed", "n_complete_full_manifest", "native_fit_status", "sensitivity_fit_status"}.issubset(coverage.columns)
+    assert len(pd.read_csv(output_dir / "matched_daywise_green_red_linear_fit_summary.csv")) == 2
+    assert "longest_supported_window" in run_log["output_paths"]
+    assert window["status"] in {"valid", "no_supported_window"}
 
 
 def test_configured_segmentation_qc_still_filters_tracks(tmp_path: Path) -> None:

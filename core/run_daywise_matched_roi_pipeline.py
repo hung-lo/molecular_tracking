@@ -33,16 +33,17 @@ from roi_log_ratio_analysis import (
     compute_log_ratio_metrics,
     extract_roi_mean_intensities,
     filter_complete_rois,
-    summarize_daily_green_red_linear_fits,
+    summarize_daily_green_red_linear_fits_tolerant,
     summarize_residual_sign_changes,
     wide_table_from_long_table,
 )
 from session_manifest import SessionRecord, load_session_manifest, validate_manifest_for_intensity
 from session_population_normalization import extract_session_population, fit_session_population, summarize_signal_qc
+from longest_supported_window import select_longest_supported_window
 from trajectory_eligibility import TrajectoryEligibilityConfig, build_trajectory_eligibility, build_trajectory_matrices
 from match_policy_registry import DEFAULT_ANALYSIS_POLICIES, SUPPORTED_MATCH_POLICIES, resolve_requested_policies
 
-ANALYSIS_VERSION = "0.3.2"
+ANALYSIS_VERSION = "0.3.3"
 
 
 @dataclass(frozen=True)
@@ -638,15 +639,33 @@ def _policy_analysis(
         green_dark=green_dark,
         red_dark=red_dark,
     )
+    empty_roi_day = pd.DataFrame({
+        "roi_id": pd.Series(dtype=int), "day": pd.Series(dtype=int),
+        "red": pd.Series(dtype=float), "green": pd.Series(dtype=float),
+        "track_uid": pd.Series(dtype=str), "cluster_id": pd.Series(dtype=int),
+        "match_policy": pd.Series(dtype=str), "session_index": pd.Series(dtype=int),
+        "session_id": pd.Series(dtype=str), "acquisition_date": pd.Series(dtype=str),
+        "elapsed_days": pd.Series(dtype=int), "session_roi_label": pd.Series(dtype=int),
+        "mask_label": pd.Series(dtype=int), "required": pd.Series(dtype=bool),
+    })
+    empty_metrics = compute_log_ratio_metrics(empty_roi_day, epsilon=epsilon, baseline_day=min(required_days))
     empty_result = {
         "raw_table": raw_table,
         "corrected_table": raw_table,
-        "roi_day_table": pd.DataFrame(),
-        "complete_table": pd.DataFrame(),
-        "metrics_table": pd.DataFrame(),
-        "all_metrics_table": pd.DataFrame(),
-        "fit_summary": pd.DataFrame(),
-        "residual_table": pd.DataFrame(),
+        "roi_day_table": empty_roi_day,
+        "complete_table": empty_roi_day.copy(),
+        "metrics_table": empty_metrics.copy(),
+        "all_metrics_table": empty_metrics.copy(),
+        "fit_summary": summarize_daily_green_red_linear_fits_tolerant(
+            empty_metrics, expected_days=required_days,
+            not_run_reason="no_full_manifest_complete_tracks",
+        ).assign(match_policy=policy),
+        "residual_table": compute_green_red_fit_residuals(
+            empty_metrics, fit_summary=summarize_daily_green_red_linear_fits_tolerant(
+                empty_metrics, expected_days=required_days,
+                not_run_reason="no_full_manifest_complete_tracks",
+            ), baseline_day=min(required_days), allow_missing_fits=True,
+        ),
         "residual_summary": pd.DataFrame(),
         "geometry_long": pd.DataFrame(),
         "track_summary": pd.DataFrame(),
@@ -685,12 +704,15 @@ def _policy_analysis(
     all_metrics_table = compute_log_ratio_metrics(roi_day_table, epsilon=epsilon, baseline_day=baseline_day)
     if not complete_table.empty:
         metrics_table = compute_log_ratio_metrics(complete_table, epsilon=epsilon, baseline_day=baseline_day)
-        fit_summary = summarize_daily_green_red_linear_fits(metrics_table)
+        fit_summary = summarize_daily_green_red_linear_fits_tolerant(
+            metrics_table, expected_days=required_days,
+        )
         fit_summary.insert(0, "match_policy", policy)
         residual_table = compute_green_red_fit_residuals(
             metrics_table,
             fit_summary=fit_summary.drop(columns=["match_policy"]),
             baseline_day=baseline_day,
+            allow_missing_fits=True,
         )
         residual_summary = summarize_residual_sign_changes(residual_table)
         residual_summary = residual_summary.merge(
@@ -704,6 +726,22 @@ def _policy_analysis(
             on="roi_id",
             how="left",
             validate="many_to_one",
+        )
+    else:
+        metrics_table = compute_log_ratio_metrics(
+            complete_table, epsilon=epsilon, baseline_day=baseline_day,
+        )
+        fit_summary = summarize_daily_green_red_linear_fits_tolerant(
+            metrics_table,
+            expected_days=required_days,
+            not_run_reason="no_full_manifest_complete_tracks",
+        )
+        fit_summary.insert(0, "match_policy", policy)
+        residual_table = compute_green_red_fit_residuals(
+            metrics_table,
+            fit_summary=fit_summary.drop(columns=["match_policy"]),
+            baseline_day=baseline_day,
+            allow_missing_fits=True,
         )
 
     geometry_long = track_lookup.merge(
@@ -852,6 +890,8 @@ def _write_summary_markdown(
     canonical_policy: str,
     primary_final: pd.DataFrame,
     primary_final_strict: pd.DataFrame,
+    session_coverage_qc: pd.DataFrame,
+    window_selection: dict[str, object],
 ) -> None:
     summary_lines = [
         "# Daywise Matched ROI Pipeline",
@@ -913,10 +953,33 @@ def _write_summary_markdown(
     if not fit_summary.empty:
         summary_lines.extend(["", "Green-vs-red fit summary:"])
         for _, row in fit_summary.sort_values("day").iterrows():
-            summary_lines.append(
-                f"- day {int(row['day'])}: slope `{row['slope']:.3f}`, "
-                f"intercept `{row['intercept']:.1f}`, R² `{row['r_squared']:.3f}`"
+            if row.get("fit_status") == "valid":
+                detail = f"slope `{row['slope']:.3f}`, intercept `{row['intercept']:.1f}`, R² `{row['r_squared']:.3f}`"
+            else:
+                detail = f"fit unavailable ({row.get('fit_reason') or row.get('fit_status')})"
+            summary_lines.append(f"- day {int(row['day'])}: {detail}")
+    summary_lines.extend(["", "Session coverage and fit QC:"])
+    for _, row in session_coverage_qc.sort_values("session_index").iterrows():
+        if bool(row["required"]):
+            coverage_counts = (
+                f"native ROIs={int(row['n_native_rois'])}, native signal-valid={int(row['n_native_signal_valid'])}, "
+                f"tracked observed={int(row['n_tracked_observed'])}, full-manifest complete="
+                f"{int(row['n_complete_full_manifest'])}"
             )
+        else:
+            coverage_counts = "not required for fit/extraction population"
+        summary_lines.append(
+            f"- {row['session_id']} (session {int(row['session_index'])}): {coverage_counts}; "
+            f"native fit={row['native_fit_status']}, "
+            f"sensitivity fit={row['sensitivity_fit_status']}"
+            + (f" ({row['reason']})" if row["reason"] else "")
+        )
+    summary_lines.extend([
+        "", "Longest supported contiguous window:",
+        f"- Status: `{window_selection['status']}`",
+        f"- Sessions: `{', '.join(window_selection.get('window_session_ids', [])) or 'none'}`",
+        f"- Complete tracked ROIs: `{int(window_selection.get('n_complete_tracks', 0))}`",
+    ])
     (output_dir / "SUMMARY.md").write_text("\n".join(summary_lines), encoding="utf-8")
 
 
@@ -1002,8 +1065,8 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         red_dark=config.red_dark,
         epsilon=config.epsilon,
     )
-    fit_summary = fit_session_population(session_population)
-    signal_qc_summary = summarize_signal_qc(session_population)
+    fit_summary = fit_session_population(session_population, records=required_manifest_records)
+    signal_qc_summary = summarize_signal_qc(session_population, records=required_manifest_records)
 
     policy_results: dict[str, dict[str, Any]] = {}
     for policy in requested_policies:
@@ -1045,7 +1108,7 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
     metrics_table = _concat("metrics_table")
     all_metrics_table = _concat("all_metrics_table")
     sensitivity_fit_summary = _concat("fit_summary")
-    fit_metadata = session_population[["day", "session_index", "session_id", "acquisition_date", "elapsed_days"]].drop_duplicates("day")
+    fit_metadata = fit_summary[["day", "session_index", "session_id", "acquisition_date", "elapsed_days"]].drop_duplicates("day")
     sensitivity_fit_summary = sensitivity_fit_summary.merge(
         fit_metadata, on="day", how="left", validate="many_to_one"
     )
@@ -1107,7 +1170,7 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
     primary_final_strict_metrics = _canonical_metrics(primary_final_strict)
 
     residual_all_observed = pd.concat(
-        [compute_green_red_fit_residuals(policy_results[policy]["all_metrics_table"], fit_summary, baseline_day=min(required_days)) for policy in requested_policies],
+        [compute_green_red_fit_residuals(policy_results[policy]["all_metrics_table"], fit_summary, baseline_day=min(required_days), allow_missing_fits=True) for policy in requested_policies],
         ignore_index=True,
     )
     complete_ids = complete_table[["match_policy", "roi_id", "day"]].drop_duplicates()
@@ -1155,7 +1218,7 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
     primary_final_strict_metrics = _sort_if_present(primary_final_strict_metrics, ["match_policy", "roi_id", "day"])
     primary_final_residuals = _sort_if_present(primary_final_residuals, ["match_policy", "roi_id", "day", "channel"])
 
-    geometry_flags = geometry_long[["match_policy", "roi_id", "session_index", "geometry_qc_pass"]].drop_duplicates()
+    geometry_flags = geometry_long.reindex(columns=["match_policy", "roi_id", "session_index", "geometry_qc_pass"]).drop_duplicates()
     trajectory_observations = residual_all_observed.merge(
         geometry_flags, on=["match_policy", "roi_id", "session_index"], how="left", validate="one_to_one"
     )
@@ -1170,6 +1233,87 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         [str(record.session_id) for record in required_manifest_records],
     )
 
+    canonical_all_metrics = canonical_result["all_metrics_table"].copy()
+    window_selection, window_ranking, window_metrics = select_longest_supported_window(
+        canonical_all_metrics,
+        session_population,
+        required_manifest_records,
+    )
+    if not window_metrics.empty:
+        window_metrics = window_metrics.merge(
+            residual_all_observed.loc[
+                residual_all_observed["match_policy"].astype(str).eq(canonical_policy),
+                ["match_policy", "roi_id", "day", "fit_status", "fit_reason", "green_fit_residual", "green_fit_signed_distance"],
+            ],
+            on=["match_policy", "roi_id", "day"],
+            how="left",
+            validate="one_to_one",
+        )
+        window_track_uids = set(window_metrics["track_uid"].astype(str))
+        window_tracks = canonical_result["matched_tracks"].loc[
+            canonical_result["matched_tracks"]["track_uid"].astype(str).isin(window_track_uids)
+        ].copy()
+    else:
+        window_tracks = canonical_result["matched_tracks"].iloc[0:0].copy()
+    if not window_ranking.empty:
+        window_ranking["day_fit_statuses"] = window_ranking["day_fit_statuses"].map(
+            lambda value: json.dumps(value, sort_keys=True)
+        )
+
+    signal_qc_by_day = signal_qc_summary.set_index("session_index", drop=False)
+    native_fit_by_day = fit_summary.set_index("session_index", drop=False)
+    sensitivity_fit_by_day = sensitivity_fit_summary.loc[
+        sensitivity_fit_summary["match_policy"].astype(str).eq(canonical_policy)
+    ].set_index("session_index", drop=False)
+    canonical_metrics_by_day = {
+        int(day): group for day, group in canonical_all_metrics.groupby("session_index", sort=False)
+    } if not canonical_all_metrics.empty else {}
+    canonical_complete = canonical_result["complete_table"]
+    coverage_rows = []
+    for record in manifest_records:
+        day = int(record.session_index)
+        is_required = bool(record.required)
+        native_row = signal_qc_by_day.loc[day] if is_required and day in signal_qc_by_day.index else None
+        native_fit_row = native_fit_by_day.loc[day] if is_required and day in native_fit_by_day.index else None
+        sensitivity_row = sensitivity_fit_by_day.loc[day] if is_required and day in sensitivity_fit_by_day.index else None
+        day_metrics = canonical_metrics_by_day.get(day, canonical_all_metrics.iloc[0:0])
+        complete_day = canonical_complete.loc[canonical_complete["day"].eq(day)] if not canonical_complete.empty else canonical_complete
+        geometry_day = geometry_long.loc[
+            geometry_long["match_policy"].astype(str).eq(canonical_policy)
+            & geometry_long["session_index"].eq(day)
+        ] if not geometry_long.empty else geometry_long
+        geometry_pass = int(geometry_day["geometry_qc_pass"].eq(True).sum()) if "geometry_qc_pass" in geometry_day else 0
+        geometry_fail = int(geometry_day["geometry_qc_pass"].eq(False).sum()) if "geometry_qc_pass" in geometry_day else 0
+        geometry_unassessed = int(geometry_day["geometry_qc_pass"].isna().sum()) if "geometry_qc_pass" in geometry_day else int(len(geometry_day))
+        native_status = str(native_fit_row["fit_status"]) if native_fit_row is not None else "not_run"
+        native_reason = str(native_fit_row["fit_reason"] or "") if native_fit_row is not None else "session_not_required"
+        sensitivity_status = str(sensitivity_row["fit_status"]) if sensitivity_row is not None else "not_run"
+        sensitivity_reason = str(sensitivity_row["fit_reason"] or "") if sensitivity_row is not None else "session_not_required"
+        reasons = []
+        if not is_required:
+            reasons.append("session_not_required")
+        if is_required and native_status != "valid":
+            reasons.append(f"native_fit:{native_reason or native_status}")
+        if is_required and sensitivity_status != "valid":
+            reasons.append(f"sensitivity_fit:{sensitivity_reason or sensitivity_status}")
+        coverage_rows.append({
+            "session_index": day, "session_id": str(record.session_id),
+            "acquisition_date": record.acquisition_date.isoformat(),
+            "required": is_required,
+            "n_native_rois": int(native_row["n_native_rois"]) if native_row is not None else np.nan,
+            "n_native_signal_valid": int(native_row["n_ratio_valid"]) if native_row is not None else np.nan,
+            "n_native_fit_eligible": int(native_row["n_fit_population"]) if native_row is not None else np.nan,
+            "n_tracked_observed": int(day_metrics["track_uid"].nunique()) if not day_metrics.empty else 0,
+            "n_tracked_signal_valid": int(day_metrics.loc[day_metrics["ratio_qc_pass"].eq(True), "track_uid"].nunique()) if not day_metrics.empty else 0,
+            "n_complete_full_manifest": int(complete_day["roi_id"].nunique()) if not complete_day.empty else 0,
+            "native_fit_status": native_status, "native_fit_reason": native_reason,
+            "sensitivity_fit_status": sensitivity_status, "sensitivity_fit_reason": sensitivity_reason,
+            "n_geometry_qc_pass": geometry_pass, "n_geometry_qc_fail": geometry_fail,
+            "n_geometry_qc_unassessed": geometry_unassessed,
+            "reason": ";".join(reasons),
+        })
+    session_coverage_qc = pd.DataFrame(coverage_rows)
+
     raw_table.to_csv(output_dir / "matched_roi_intensity_results_raw.csv", index=False)
     corrected_table.to_csv(output_dir / "matched_roi_intensity_results_dark_corrected.csv", index=False)
     geometry_long.to_csv(output_dir / "matched_roi_geometry_qc_long.csv", index=False)
@@ -1181,6 +1325,13 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
     session_population.to_csv(output_dir / "matched_session_population_roi_metrics.csv", index=False)
     signal_qc_summary.to_csv(output_dir / "matched_session_population_signal_qc_summary.csv", index=False)
     fit_summary.to_csv(output_dir / "matched_daywise_green_red_linear_fit_summary.csv", index=False)
+    session_coverage_qc.to_csv(output_dir / "session_coverage_fit_qc.csv", index=False)
+    window_ranking.to_csv(output_dir / "longest_supported_window_ranking.csv", index=False)
+    window_tracks.to_csv(output_dir / "matched_roi_tracks_longest_supported_window.csv", index=False)
+    window_metrics.to_csv(output_dir / "matched_roi_metrics_longest_supported_window.csv", index=False)
+    (output_dir / "longest_supported_window.json").write_text(
+        json.dumps(window_selection, indent=2, sort_keys=True), encoding="utf-8",
+    )
     sensitivity_fit_summary.to_csv(output_dir / "matched_daywise_green_red_linear_fit_summary_complete_track_sensitivity.csv", index=False)
     sensitivity_residual_table.to_csv(output_dir / "matched_roi_metrics_with_complete_track_fit_residuals_sensitivity.csv", index=False)
     residual_all_observed.to_csv(output_dir / "matched_roi_metrics_with_session_normalized_residuals_all_observed.csv", index=False)
@@ -1219,6 +1370,17 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
     warnings: list[str] = []
     if not qc_config.is_configured:
         warnings.append("segmentation_qc_not_configured")
+    for _, row in session_coverage_qc.iterrows():
+        if bool(row["required"]) and row["native_fit_status"] != "valid":
+            warnings.append(
+                f"session_{int(row['session_index'])}_native_normalization_fit_unavailable:{row['native_fit_reason'] or row['native_fit_status']}"
+            )
+        if bool(row["required"]) and row["sensitivity_fit_status"] != "valid":
+            warnings.append(
+                f"session_{int(row['session_index'])}_complete_track_sensitivity_fit_unavailable:{row['sensitivity_fit_reason'] or row['sensitivity_fit_status']}"
+            )
+    if window_selection["status"] == "no_supported_window":
+        warnings.append("no_supported_contiguous_window_with_two_complete_fit_eligible_tracks")
 
     segmentation_counts = filter_counts.loc[
         filter_counts["step"].eq("segmentation_qc"), "count"
@@ -1245,6 +1407,11 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         "matched_roi_day_table_complete": str(output_dir / "matched_roi_day_table_complete.csv"),
         "matched_roi_log_ratio_metrics_complete": str(output_dir / "matched_roi_log_ratio_metrics_complete.csv"),
         "matched_daywise_green_red_linear_fit_summary": str(output_dir / "matched_daywise_green_red_linear_fit_summary.csv"),
+        "session_coverage_fit_qc": str(output_dir / "session_coverage_fit_qc.csv"),
+        "longest_supported_window": str(output_dir / "longest_supported_window.json"),
+        "longest_supported_window_ranking": str(output_dir / "longest_supported_window_ranking.csv"),
+        "matched_roi_tracks_longest_supported_window": str(output_dir / "matched_roi_tracks_longest_supported_window.csv"),
+        "matched_roi_metrics_longest_supported_window": str(output_dir / "matched_roi_metrics_longest_supported_window.csv"),
         "matched_roi_metrics_with_green_red_fit_residuals": str(output_dir / "matched_roi_metrics_with_green_red_fit_residuals.csv"),
         "matched_roi_residual_sign_change_summary": str(output_dir / "matched_roi_residual_sign_change_summary.csv"),
         "policy_status": str(output_dir / "policy_status.csv"),
@@ -1289,6 +1456,10 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         "matched_roi_log_ratio_metrics_all_observed": int(len(all_metrics_table)),
         "matched_roi_log_ratio_metrics_complete": int(len(metrics_table)),
         "matched_daywise_green_red_linear_fit_summary": int(len(fit_summary)),
+        "session_coverage_fit_qc": int(len(session_coverage_qc)),
+        "longest_supported_window_ranking": int(len(window_ranking)),
+        "matched_roi_tracks_longest_supported_window": int(len(window_tracks)),
+        "matched_roi_metrics_longest_supported_window": int(len(window_metrics)),
         "matched_daywise_green_red_linear_fit_summary_complete_track_sensitivity": int(len(sensitivity_fit_summary)),
         "matched_roi_metrics_with_green_red_fit_residuals": int(len(residual_table)),
         "matched_roi_residual_sign_change_summary": int(len(residual_summary)),
@@ -1329,8 +1500,10 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         "config": asdict(config),
         "segmentation_qc_config": asdict(qc_config),
         "segmentation_qc_status": segmentation_qc_status,
-        "normalization": {"population": "fit_clean_signal_valid_session_rois", "regression": "OLS_with_intercept", "fit_population_rule": fit_summary["fit_population_rule"].iloc[0] if not fit_summary.empty and "fit_population_rule" in fit_summary.columns else None, "signal_validity_rule": "corrected_green_gt_0_and_corrected_red_gt_0", "epsilon": config.epsilon, "green_dark": config.green_dark, "red_dark": config.red_dark},
+        "normalization": {"population": "fit_clean_signal_valid_session_rois", "regression": "OLS_with_intercept", "fit_population_rule": fit_summary["fit_population_rule"].iloc[0] if not fit_summary.empty and "fit_population_rule" in fit_summary.columns else None, "signal_validity_rule": "corrected_green_gt_0_and_corrected_red_gt_0", "epsilon": config.epsilon, "green_dark": config.green_dark, "red_dark": config.red_dark, "missing_fit_semantics": "unestimable session coefficients and normalized residuals remain NaN; status/reason are recorded in fit and coverage tables"},
         "canonical_population": {"policy": canonical_policy, "n_primary_final_tracks": int(len(primary_final)), "n_primary_final_strict_tracks": int(len(primary_final_strict))},
+        "longest_supported_window": window_selection,
+        "session_coverage_fit_qc": session_coverage_qc.to_dict("records"),
         "policy_status": policy_status.to_dict("records"),
         "trajectory_eligibility": asdict(trajectory_config),
         "pca_preparation": {"feature": "green_fit_signed_distance", "missing_values": "preserved_as_nan", "imputation": "none", "scaling": "none", "centered_complete_case": True},
@@ -1369,6 +1542,8 @@ def run_daywise_matched_roi_pipeline(config: DaywiseMatchedPipelineConfig) -> Pa
         canonical_policy=canonical_policy,
         primary_final=primary_final,
         primary_final_strict=primary_final_strict,
+        session_coverage_qc=session_coverage_qc,
+        window_selection=window_selection,
     )
 
     print(f"[{format_duration_seconds(total_duration_seconds)}] Pipeline completed", flush=True)

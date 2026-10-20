@@ -19,7 +19,7 @@ for _path in (_REPO_ROOT, _REPO_ROOT / "matching", _REPO_ROOT / "plotting", _REP
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from endpoint_evaluator import _read_csv, _read_json, _session_table, load_matcher_spacing
+from endpoint_evaluator import _read_csv, _read_json, _session_table, attach_registration_metadata, load_matcher_spacing
 from endpoint_stitcher import (
     ALGORITHM_VERSION, StitcherConfig, assign_stitches,
     benchmark_threshold_sweep, build_stitch_candidates, build_stitched_tracks,
@@ -155,6 +155,12 @@ def run_endpoint_stitching(
     sessions = _session_table(_read_csv(match_dir / "session_manifest_resolved.csv"))
     features = _read_csv(match_dir / "roi_features.csv")
     transforms = _read_csv(match_dir / "pairwise_transforms.csv")
+    transforms = attach_registration_metadata(
+        transforms,
+        _read_csv(match_dir / "pairwise_registration_qc.csv"),
+        _read_json(match_dir / "run_log.json"),
+        match_dir,
+    )
     tracks = _read_csv(match_dir / f"tracks_{policy}.csv")
     endpoints = _read_csv(evaluation_dir / "endpoint_events.csv")
     evaluator_candidates = _read_csv(evaluation_dir / "endpoint_candidates.csv")

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import date
+import hashlib
 import importlib.metadata as metadata
 import json
 from pathlib import Path
@@ -23,8 +24,10 @@ from scipy.spatial import cKDTree
 
 try:  # Works both as a package import and when the CLI is run as a script.
     from affine_overlap_matcher import RestrictedTransform, VoxelSpacing
+    from image_registration import ImageTransform, load_image_transform
 except ImportError:  # pragma: no cover - exercised by package imports
     from matching.affine_overlap_matcher import RestrictedTransform, VoxelSpacing
+    from matching.image_registration import ImageTransform, load_image_transform
 
 
 ENDPOINT_COLUMNS = [
@@ -44,7 +47,9 @@ ENDPOINT_COLUMNS = [
     "preceding_transform_method", "preceding_transform_fallback_reason",
     "geometry_qc_pass", "segmentation_qc_status", "segmentation_failure",
     "edge_heavy", "review_required", "review_reasons", "consensus_edge_fraction",
-    "has_graph_only_edge",
+    "has_graph_only_edge", "requested_registration_mode", "selected_registration_stage",
+    "registration_algorithm_version", "smoothing_um", "transform_qc_pass",
+    "transform_fallback_used", "transform_fallback_reason", "projection_transform_stage",
 ]
 
 ENDPOINT_CANDIDATE_COLUMNS = [
@@ -64,13 +69,19 @@ ENDPOINT_CANDIDATE_COLUMNS = [
     "transform_source", "transform_reliable", "transform_component_methods",
     "transform_component_fallback_reasons", "transform_component_residual_median_um_max",
     "transform_component_residual_p95_um_max", "direct_vs_composed_projection_delta_um",
+    "requested_registration_mode", "selected_registration_stage", "registration_algorithm_version",
+    "smoothing_um", "transform_qc_pass", "transform_fallback_used",
+    "transform_fallback_reason", "projection_transform_stage",
 ]
 
 CLASSIFICATION_COLUMNS = [
     "endpoint_id", "track_uid", "end_session_index", "end_session_id", "end_label",
     "classification", "candidate_count", "stitch_candidate_count", "same_track_returns", "manual_class",
     "manual_target_track_uid", "manual_target_session_index", "manual_target_label",
-    "manual_confidence", "reviewer_notes",
+    "manual_confidence", "reviewer_notes", "requested_registration_mode",
+    "selected_registration_stage", "registration_algorithm_version", "smoothing_um",
+    "transform_qc_pass", "transform_fallback_used", "transform_fallback_reason",
+    "projection_transform_stage",
 ]
 
 SYNTHETIC_COLUMNS = [
@@ -99,6 +110,91 @@ class SyntheticTrustConfig:
     require_no_cycle_conflict: bool = True
     require_no_transform_fallback: bool = True
     require_interior: bool = True
+
+
+@dataclass
+class SelectedPairTransform:
+    """One canonical selected pair transform, loaded from the production artifact."""
+
+    row: pd.Series
+    transform: ImageTransform | None = None
+
+    @property
+    def stage(self) -> str:
+        stage = _text(self.row.get("selected_registration_stage"))
+        if stage in {"", "nan", "<NA>"}:
+            stage = _text(self.row.get("method", "legacy"))
+        return stage if stage in {"legacy", "image_affine", "image_affine_local"} else "legacy"
+
+    @property
+    def requested_mode(self) -> str:
+        return _text(self.row.get("requested_registration_mode"), self.stage)
+
+    @property
+    def fallback_reason(self) -> str:
+        return _text(self.row.get("registration_fallback_reason", self.row.get("fallback_reason", self.row.get("transform_fallback_reason", ""))))
+
+    @property
+    def qc_pass(self) -> bool:
+        field = {"image_affine_local": "local_qc_pass", "image_affine": "affine_qc_pass"}.get(self.stage)
+        value = self.row.get(field, self.row.get("transform_qc_pass", True)) if field else True
+        return _bool(value, True)
+
+    @property
+    def fallback_used(self) -> bool:
+        return _bool(self.row.get("fallback_used", self.row.get("transform_fallback_used", bool(self.fallback_reason))))
+
+    @property
+    def reliable(self) -> bool:
+        return self.qc_pass and not self.fallback_used and not self.fallback_reason
+
+    def _image(self) -> ImageTransform:
+        if self.stage == "legacy":
+            raise ValueError("legacy transforms do not have an image transform artifact")
+        if self.transform is None:
+            raw_path = _text(self.row.get("transform_path"))
+            path = Path(raw_path) if raw_path else None
+            if path is None or not path.is_file():
+                raise ValueError(f"selected {self.stage} transform artifact is missing")
+            image = load_image_transform(path)
+            if image.method != self.stage:
+                raise ValueError(f"selected stage {self.stage} does not match saved transform method {image.method}")
+            if (self.stage == "image_affine_local") != (image.flow is not None):
+                raise ValueError(f"selected stage {self.stage} has an incompatible saved displacement field")
+            self.transform = image
+        return self.transform
+
+    def project_forward(self, points: np.ndarray) -> np.ndarray:
+        """Map earlier-session coordinates into the later session."""
+        if self.stage != "legacy":
+            values = np.asarray(points, dtype=float)
+            scalar = values.ndim == 1
+            output = self._image().inverse(values[None, :] if scalar else values)
+            return output[0] if scalar else output
+        return apply_transform_b_to_a(points, invert_restricted_transform(self.row))
+
+    def project_backward(self, points: np.ndarray) -> np.ndarray:
+        """Map later-session coordinates into the earlier session."""
+        if self.stage != "legacy":
+            values = np.asarray(points, dtype=float)
+            scalar = values.ndim == 1
+            output = self._image().apply(values[None, :] if scalar else values)
+            return output[0] if scalar else output
+        return apply_transform_b_to_a(points, self.row)
+
+
+@dataclass
+class ForwardProjection:
+    """A point projection through one direct or several adjacent selected transforms."""
+
+    components: list[SelectedPairTransform]
+    source: str
+
+    def apply(self, points: np.ndarray) -> np.ndarray:
+        result = np.asarray(points, dtype=float)
+        for component in self.components:
+            result = component.project_forward(result)
+        return result
 
 
 def _value(source: Mapping[str, Any] | pd.Series | object, key: str, default: Any = None) -> Any:
@@ -299,7 +395,7 @@ def discover_evaluator_inputs(match_dir: str | Path, policy: str = "graph") -> d
         "pairwise_candidates.csv", "pairwise_matches_high.csv", "pairwise_matches_balanced.csv",
         "pairwise_matches_graph.csv", f"track_edges_{policy}.csv", f"pairwise_summary_{policy}.csv",
         "pairwise_summary.csv", f"cycle_consistency_{policy}.csv",
-        f"cycle_edge_checks_{policy}.csv", "graph_match_changes.csv",
+        f"cycle_edge_checks_{policy}.csv", "graph_match_changes.csv", "pairwise_registration_qc.csv",
         "pairwise_matches_graph_agreement.csv", "accepted_graph_edges_with_agreement.csv",
         "tracks_graph_agreement.csv", "graph_affine_agreement_track_summary.csv", "run_log.json",
     ]
@@ -332,6 +428,50 @@ def load_matcher_spacing(match_dir: str | Path) -> tuple[VoxelSpacing, str]:
         else:
             return spacing, "run_log.json"
     return VoxelSpacing(), "repository_default"
+
+
+def attach_registration_metadata(
+    transforms: pd.DataFrame,
+    registration_qc: pd.DataFrame,
+    run_log: Mapping[str, Any],
+    match_dir: str | Path,
+) -> pd.DataFrame:
+    """Join each CSV transform to its selected production stage and saved artifact."""
+    output = transforms.copy()
+    if output.empty:
+        return output
+    if not registration_qc.empty:
+        if registration_qc.duplicated(["day_a", "day_b"]).any():
+            raise ValueError("pairwise_registration_qc.csv contains duplicate session pairs")
+        metadata_fields = [
+            "day_a", "day_b", "requested_registration_mode", "selected_registration_stage",
+            "smoothing_um", "affine_qc_pass", "local_qc_pass", "fallback_used",
+            "transform_path",
+        ]
+        available = [field for field in metadata_fields if field in registration_qc.columns]
+        output = output.merge(registration_qc[available], on=["day_a", "day_b"], how="left", validate="one_to_one")
+        if "fallback_reason" in registration_qc.columns:
+            reasons = registration_qc[["day_a", "day_b", "fallback_reason"]].rename(
+                columns={"fallback_reason": "registration_fallback_reason"}
+            )
+            output = output.merge(reasons, on=["day_a", "day_b"], how="left", validate="one_to_one")
+    else:
+        output["selected_registration_stage"] = output.get("method", "legacy")
+    registration = run_log.get("registration", {}) if isinstance(run_log, Mapping) else {}
+    algorithm_version = (
+        run_log.get("image_registration_algorithm_version")
+        or (registration.get("algorithm_version") if isinstance(registration, Mapping) else None)
+        or ""
+    )
+    output["registration_algorithm_version"] = str(algorithm_version)
+    if "transform_path" in output:
+        root = Path(match_dir).resolve()
+        output["transform_path"] = output["transform_path"].map(
+            lambda value: str((root / str(value)).resolve())
+            if pd.notna(value) and str(value).strip() and not Path(str(value)).is_absolute()
+            else (str(value) if pd.notna(value) else "")
+        )
+    return output
 
 
 def _session_table(manifest: pd.DataFrame) -> pd.DataFrame:
@@ -636,20 +776,69 @@ def enrich_endpoint_preceding_evidence(
     return output
 
 
-def _transform_row_map(transforms: pd.DataFrame) -> dict[tuple[str, str], pd.Series]:
+def enrich_endpoint_transform_provenance(
+    endpoints: pd.DataFrame,
+    sessions: pd.DataFrame,
+    transforms: pd.DataFrame,
+) -> pd.DataFrame:
+    """Attach the next-session pair's selected production transform to each endpoint."""
+    if endpoints.empty:
+        return endpoints.copy()
+    output = endpoints.copy()
+    transform_map = _transform_row_map(transforms)
+    fields = (
+        "requested_registration_mode", "selected_registration_stage",
+        "registration_algorithm_version", "smoothing_um", "transform_qc_pass",
+        "transform_fallback_used", "transform_fallback_reason", "projection_transform_stage",
+    )
+    for field in fields:
+        if field not in output:
+            output[field] = "" if field not in {"transform_qc_pass", "transform_fallback_used"} else False
+        else:
+            # Endpoint detection can create these columns as all-NaN float
+            # columns. Pair QC may later supply strings or booleans.
+            output[field] = output[field].astype(object)
+    for index, endpoint in output.iterrows():
+        positions = sessions.index[sessions["session_index"].astype(int).eq(int(endpoint["end_session_index"]))]
+        if len(positions) != 1 or int(positions[0]) + 1 >= len(sessions):
+            continue
+        position = int(positions[0])
+        key = (str(sessions.iloc[position]["session_id"]), str(sessions.iloc[position + 1]["session_id"]))
+        component = transform_map.get(key)
+        if component is None:
+            continue
+        qc = _component_transform_qc([component])
+        output.at[index, "requested_registration_mode"] = qc["requested_registration_mode"]
+        output.at[index, "selected_registration_stage"] = qc["selected_registration_stage"]
+        output.at[index, "registration_algorithm_version"] = qc["registration_algorithm_version"]
+        output.at[index, "smoothing_um"] = qc["smoothing_um"]
+        output.at[index, "transform_qc_pass"] = bool(qc["qc_pass"])
+        output.at[index, "transform_fallback_used"] = bool(qc["fallback_used"])
+        output.at[index, "transform_fallback_reason"] = qc["fallback_reason"]
+        output.at[index, "projection_transform_stage"] = qc["selected_registration_stage"]
+    return output
+
+
+def _transform_row_map(transforms: pd.DataFrame) -> dict[tuple[str, str], SelectedPairTransform]:
     if transforms.empty:
         return {}
     required = {"day_a", "day_b"}
     if not required.issubset(transforms.columns):
         raise ValueError("pairwise_transforms.csv must contain day_a and day_b columns")
-    return {(str(row.day_a), str(row.day_b)): row for _, row in transforms.iterrows()}
+    if transforms.duplicated(["day_a", "day_b"]).any():
+        raise ValueError("pairwise_transforms.csv contains duplicate session pairs")
+    return {
+        (str(row.day_a), str(row.day_b)): SelectedPairTransform(row)
+        for _, row in transforms.iterrows()
+    }
 
 
-def _component_transform_qc(components: list[pd.Series]) -> dict[str, Any]:
-    methods = [_text(component.get("method")) for component in components]
-    fallbacks = [_text(component.get("fallback_reason")) for component in components if _text(component.get("fallback_reason")).strip()]
-    median_values = [_float(component.get("residual_median_um")) for component in components]
-    p95_values = [_float(component.get("residual_p95_um")) for component in components]
+def _component_transform_qc(components: list[SelectedPairTransform]) -> dict[str, Any]:
+    methods = [_text(component.row.get("method"), component.stage) for component in components]
+    stages = [component.stage for component in components]
+    fallbacks = [component.fallback_reason for component in components if component.fallback_reason.strip()]
+    median_values = [_float(component.row.get("residual_median_um")) for component in components]
+    p95_values = [_float(component.row.get("residual_p95_um")) for component in components]
     finite_median = [value for value in median_values if np.isfinite(value)]
     finite_p95 = [value for value in p95_values if np.isfinite(value)]
     return {
@@ -657,7 +846,20 @@ def _component_transform_qc(components: list[pd.Series]) -> dict[str, Any]:
         "fallback_reasons": ";".join(fallbacks),
         "residual_median_um_max": max(finite_median) if finite_median else np.nan,
         "residual_p95_um_max": max(finite_p95) if finite_p95 else np.nan,
-        "reliable": not fallbacks,
+        "requested_registration_mode": ";".join(dict.fromkeys(component.requested_mode for component in components)),
+        "selected_registration_stage": ";".join(stages),
+        "registration_algorithm_version": ";".join(dict.fromkeys(
+            _text(component.row.get("registration_algorithm_version")) for component in components
+            if _text(component.row.get("registration_algorithm_version"))
+        )),
+        "smoothing_um": ";".join(dict.fromkeys(
+            _text(component.row.get("smoothing_um")) for component in components
+            if _text(component.row.get("smoothing_um"))
+        )),
+        "qc_pass": all(component.qc_pass for component in components),
+        "fallback_used": any(component.fallback_used for component in components),
+        "fallback_reason": ";".join(fallbacks),
+        "reliable": all(component.reliable for component in components),
     }
 
 
@@ -665,8 +867,8 @@ def _forward_transform(
     source_position: int,
     target_position: int,
     sessions: pd.DataFrame,
-    transform_map: dict[tuple[str, str], pd.Series],
-) -> tuple[RestrictedTransform, str, bool, dict[str, Any]] | None:
+    transform_map: dict[tuple[str, str], SelectedPairTransform],
+) -> tuple[ForwardProjection, str, bool, dict[str, Any]] | None:
     gap = target_position - source_position
     if gap < 1:
         return None
@@ -675,45 +877,53 @@ def _forward_transform(
     if gap <= 2:
         stored = transform_map.get((source_id, target_id))
         if stored is not None:
-            try:
-                inverse = invert_restricted_transform(stored)
-            except ValueError:
-                return None
             qc = _component_transform_qc([stored])
-            return inverse, "direct_stored", bool(qc["reliable"]), qc
+            return ForwardProjection([stored], "direct_stored"), "direct_stored", bool(qc["reliable"]), qc
         if gap == 1:
             return None
-        components: list[pd.Series] = []
+        components: list[SelectedPairTransform] = []
         for position in range(source_position, target_position):
             pair = (str(sessions.iloc[position]["session_id"]), str(sessions.iloc[position + 1]["session_id"]))
             component = transform_map.get(pair)
             if component is None:
                 return None
             components.append(component)
-        composed = compose_transforms(components[0], components[1])
-        try:
-            inverse = invert_restricted_transform(composed)
-        except ValueError:
-            return None
         qc = _component_transform_qc(components)
-        return inverse, "composed_adjacent_fallback", bool(qc["reliable"]), qc
+        return ForwardProjection(components, "composed_adjacent_fallback"), "composed_adjacent_fallback", bool(qc["reliable"]), qc
     if gap != 3:
         return None
-    components: list[pd.Series] = []
+    components: list[SelectedPairTransform] = []
     for position in range(source_position, target_position):
         pair = (str(sessions.iloc[position]["session_id"]), str(sessions.iloc[position + 1]["session_id"]))
         stored = transform_map.get(pair)
         if stored is None:
             return None
         components.append(stored)
-    composed = compose_transforms(components[0], components[1])
-    composed = compose_transforms(composed, components[2])
-    try:
-        inverse = invert_restricted_transform(composed)
-    except ValueError:
-        return None
     qc = _component_transform_qc(components)
-    return inverse, "composed_adjacent", bool(qc["reliable"]), qc
+    return ForwardProjection(components, "composed_adjacent"), "composed_adjacent", bool(qc["reliable"]), qc
+
+
+def project_selected_between(
+    coordinates: np.ndarray,
+    source_position: int,
+    target_position: int,
+    sessions: pd.DataFrame,
+    transform_map: dict[tuple[str, str], SelectedPairTransform],
+) -> np.ndarray | None:
+    """Project coordinates using the selected canonical transform for every pair."""
+    if source_position == target_position:
+        return np.asarray(coordinates, dtype=float).copy()
+    if source_position < target_position:
+        result = _forward_transform(source_position, target_position, sessions, transform_map)
+        return None if result is None else result[0].apply(coordinates)
+    output = np.asarray(coordinates, dtype=float)
+    for position in range(source_position - 1, target_position - 1, -1):
+        key = (str(sessions.iloc[position]["session_id"]), str(sessions.iloc[position + 1]["session_id"]))
+        component = transform_map.get(key)
+        if component is None:
+            return None
+        output = component.project_backward(output)
+    return output
 
 
 def _evidence_maps(
@@ -792,7 +1002,7 @@ def _direct_vs_composed_delta_um(
     target_position: int,
     source_coords: np.ndarray,
     sessions: pd.DataFrame,
-    transform_map: dict[tuple[str, str], pd.Series],
+    transform_map: dict[tuple[str, str], SelectedPairTransform],
     spacing: VoxelSpacing,
 ) -> float:
     """Compare direct t→t+2 projection against adjacent composition when possible."""
@@ -807,10 +1017,9 @@ def _direct_vs_composed_delta_um(
     if direct is None or first is None or second is None:
         return np.nan
     try:
-        direct_prediction = project_centroid_forward(source_coords, direct)
-        composed = compose_transforms(first, second)
-        composed_prediction = apply_transform_b_to_a(source_coords, invert_restricted_transform(composed))
-    except ValueError:
+        direct_prediction = direct.project_forward(source_coords)
+        composed_prediction = second.project_forward(first.project_forward(source_coords))
+    except (OSError, ValueError):
         return np.nan
     return float(np.linalg.norm((direct_prediction - composed_prediction) * spacing.as_zyx_array()))
 
@@ -826,7 +1035,7 @@ def _search_candidates_for_pair(
     tracks: pd.DataFrame,
     features: pd.DataFrame,
     sessions: pd.DataFrame,
-    transform_map: dict[tuple[str, str], pd.Series],
+    transform_map: dict[tuple[str, str], SelectedPairTransform],
     candidate_map: dict[tuple[str, str, int, int], pd.Series],
     high_keys: set[tuple[str, str, int, int]],
     balanced_keys: set[tuple[str, str, int, int]],
@@ -850,7 +1059,10 @@ def _search_candidates_for_pair(
     ])
     if not np.isfinite(source_coords).all():
         return [], "insufficient_input"
-    predicted = apply_transform_b_to_a(source_coords, forward)
+    try:
+        predicted = forward.apply(source_coords)
+    except (OSError, ValueError):
+        return [], "transform_unreliable"
     target_id = str(sessions.iloc[target_position]["session_id"])
     out_of_fov = False
     shape: tuple[int, ...] | None = None
@@ -961,6 +1173,14 @@ def _search_candidates_for_pair(
             "transform_component_residual_median_um_max": _float(transform_qc.get("residual_median_um_max")),
             "transform_component_residual_p95_um_max": _float(transform_qc.get("residual_p95_um_max")),
             "direct_vs_composed_projection_delta_um": direct_vs_composed_delta,
+            "requested_registration_mode": _text(transform_qc.get("requested_registration_mode")),
+            "selected_registration_stage": _text(transform_qc.get("selected_registration_stage")),
+            "registration_algorithm_version": _text(transform_qc.get("registration_algorithm_version")),
+            "smoothing_um": _text(transform_qc.get("smoothing_um")),
+            "transform_qc_pass": _bool(transform_qc.get("qc_pass")),
+            "transform_fallback_used": _bool(transform_qc.get("fallback_used")),
+            "transform_fallback_reason": _text(transform_qc.get("fallback_reason")),
+            "projection_transform_stage": _text(transform_qc.get("selected_registration_stage")),
         })
     if not reliable:
         return rows, "transform_unreliable"
@@ -1085,8 +1305,234 @@ def classify_endpoint_events(
             "same_track_returns": _bool(endpoint.get("same_track_returns")),
             "manual_class": "", "manual_target_track_uid": "", "manual_target_session_index": "",
             "manual_target_label": "", "manual_confidence": "", "reviewer_notes": "",
+            "requested_registration_mode": _text(endpoint.get("requested_registration_mode")),
+            "selected_registration_stage": _text(endpoint.get("selected_registration_stage")),
+            "registration_algorithm_version": _text(endpoint.get("registration_algorithm_version")),
+            "smoothing_um": _text(endpoint.get("smoothing_um")),
+            "transform_qc_pass": _bool(endpoint.get("transform_qc_pass")),
+            "transform_fallback_used": _bool(endpoint.get("transform_fallback_used")),
+            "transform_fallback_reason": _text(endpoint.get("transform_fallback_reason")),
+            "projection_transform_stage": _text(endpoint.get("projection_transform_stage")),
         })
     return pd.DataFrame(rows, columns=CLASSIFICATION_COLUMNS)
+
+
+def _load_compatible_dropout_audit(audit_dir: str | Path, match_dir: str | Path) -> pd.DataFrame:
+    """Read existing mask/Red audit evidence only when it matches this run's inputs."""
+    root = Path(audit_dir).resolve()
+    manifest = _read_json(root / "audit_manifest.json")
+    recorded = manifest.get("input_sha256", {})
+    if not isinstance(recorded, Mapping):
+        raise ValueError("dropout audit manifest has no input hash map")
+    names = ["pairwise_transforms.csv", "roi_features.csv", "tracks_graph.csv", "track_edges_graph.csv"]
+    qc_path = Path(match_dir) / "pairwise_registration_qc.csv"
+    if qc_path.is_file():
+        names.append("pairwise_registration_qc.csv")
+    for name in names:
+        path = Path(match_dir) / name
+        if not path.is_file():
+            raise FileNotFoundError(f"current matching input required for audit join is missing: {path}")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        recorded_values = [str(value) for source, value in recorded.items() if Path(str(source)).name == name]
+        if digest not in recorded_values:
+            raise ValueError(f"dropout audit is stale or from another run: {name} hash does not match")
+    table = _read_csv(root / "roi_outcome_audit.csv")
+    required = {"source_session_id", "source_label", "next_primary_outcome", "next_assessable"}
+    if not required.issubset(table.columns):
+        raise ValueError("dropout audit is missing source identity or next-session outcome fields")
+    if table.duplicated(["source_session_id", "source_label"]).any():
+        raise ValueError("dropout audit has duplicate source session/ROI rows")
+    return table
+
+
+def build_endpoint_observability_tables(
+    endpoints: pd.DataFrame,
+    candidates: pd.DataFrame,
+    classifications: pd.DataFrame,
+    *,
+    match_dir: str | Path,
+    dropout_audit_dir: str | Path | None = None,
+    policy: str = "graph",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Consolidate existing evaluator evidence without making identity or fate calls."""
+    hash_paths = (
+        "session_manifest_resolved.csv", "roi_features.csv", "pairwise_transforms.csv",
+        "pairwise_registration_qc.csv", "tracks_graph.csv", "track_edges_graph.csv",
+    )
+    digest = hashlib.sha256()
+    root = Path(match_dir)
+    for name in hash_paths:
+        path = root / name
+        if path.is_file():
+            digest.update(name.encode("utf-8"))
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+    source_hash = digest.hexdigest()
+
+    candidate_groups = {
+        str(key): group.sort_values(["session_gap", "target_rank_by_distance", "target_label"])
+        for key, group in candidates.groupby("endpoint_id", sort=False)
+    } if not candidates.empty else {}
+    class_lookup = {
+        str(row.endpoint_id): row
+        for row in classifications.itertuples(index=False)
+    } if not classifications.empty else {}
+    rows: list[dict[str, Any]] = []
+    for _, endpoint in endpoints.iterrows():
+        endpoint_id = _text(endpoint.get("endpoint_id"))
+        classification = class_lookup.get(endpoint_id)
+        candidate_group = candidate_groups.get(endpoint_id, pd.DataFrame())
+        next_candidates = candidate_group.loc[candidate_group.get("session_gap", pd.Series(dtype=float)).eq(1)] if not candidate_group.empty else pd.DataFrame()
+        best = candidate_group.iloc[0] if not candidate_group.empty else None
+        n_next_candidates = int(len(next_candidates))
+        same_track = _bool(endpoint.get("same_track_returns"))
+        target_present = bool(n_next_candidates)
+        top = _text(getattr(classification, "classification", "not_assessable")) if classification is not None else "not_assessable"
+        ownership = "unknown"
+        graph_identity_failure = False
+        if best is not None:
+            if _bool(best.get("target_is_singleton")):
+                ownership = "singleton"
+            elif _bool(best.get("target_track_starts_here")):
+                ownership = "later_start_of_another_track"
+            elif _text(best.get("target_track_uid")):
+                ownership = "already_established_other_track"
+            else:
+                ownership = "unowned_candidate"
+        if n_next_candidates:
+            graph_identity_failure = not bool(next_candidates["existing_graph_match"].map(_bool).any())
+
+        if same_track:
+            category = "same_track_gap_return"
+        elif top in {"edge_or_out_of_fov", "transform_unreliable"}:
+            category = "registration_or_fov_unreliable"
+        elif top == "insufficient_input":
+            category = "not_assessable"
+        elif n_next_candidates > 1:
+            category = "fragmentation_or_merge_ambiguity"
+        elif top == "nearby_singleton_candidate":
+            category = "nearby_singleton"
+        elif top == "nearby_new_track_candidate":
+            category = "nearby_new_track"
+        elif top == "multiple_nearby_candidates":
+            category = "nearby_owned_or_competing_candidate"
+        else:
+            category = "not_assessable"
+
+        rows.append({
+            "endpoint_id": endpoint_id,
+            "mouse_id": _text(endpoint.get("mouse_id")),
+            "policy": str(policy),
+            "source_track_uid": _text(endpoint.get("track_uid")),
+            "endpoint_session_index": _int(endpoint.get("end_session_index")),
+            "endpoint_session_id": _text(endpoint.get("end_session_id")),
+            "endpoint_acquisition_date": _text(endpoint.get("end_acquisition_date")),
+            "endpoint_roi_label": _int(endpoint.get("end_label")),
+            "next_session_exists": not _bool(endpoint.get("right_censored")),
+            "right_censored": _bool(endpoint.get("right_censored")),
+            "session_gap_to_next": 1,
+            "day_gap_to_next": np.nan,
+            "same_track_returns": same_track,
+            "first_same_track_return_session": _int(endpoint.get("same_track_return_session_index")),
+            "n_source_observations": _int(endpoint.get("n_days_present")),
+            "source_x_um": _float(endpoint.get("centroid_x_um")),
+            "source_y_um": _float(endpoint.get("centroid_y_um")),
+            "source_z_um": _float(endpoint.get("centroid_z_um")),
+            "source_volume_um3": _float(endpoint.get("volume_um3")),
+            "fov_qc": not (_bool(endpoint.get("touches_z_edge")) or _bool(endpoint.get("touches_xy_edge"))),
+            "n_future_candidates": int(len(candidate_group)),
+            "n_start_candidates": int(candidate_group.get("target_track_starts_here", pd.Series(dtype=bool)).map(_bool).sum()) if not candidate_group.empty else 0,
+            "n_singleton_candidates": int(candidate_group.get("target_is_singleton", pd.Series(dtype=bool)).map(_bool).sum()) if not candidate_group.empty else 0,
+            "n_owned_candidates": int(candidate_group.get("target_track_uid", pd.Series(dtype=str)).fillna("").astype(str).str.strip().ne("").sum()) if not candidate_group.empty else 0,
+            "best_candidate_track_uid": _text(best.get("target_track_uid")) if best is not None else "",
+            "best_candidate_session_index": _int(best.get("target_session_index")) if best is not None else None,
+            "best_candidate_distance_um": _float(best.get("projected_distance_um")) if best is not None else np.nan,
+            "best_candidate_rank": _int(best.get("target_rank_by_distance")) if best is not None else None,
+            "candidate_ownership_class": ownership,
+            "canonical_candidate_near_prediction": target_present,
+            "canonical_target_present": pd.NA,
+            "candidate_not_in_graph_flag": graph_identity_failure,
+            "unfiltered_target_present": pd.NA,
+            "unfiltered_target_voxel_count": np.nan,
+            "raw_red_evidence_class": "",
+            "conservative_v1_decision": top,
+            "conservative_v1_reason_codes": _text(classification.classification) if classification is not None else "not_assessable",
+            "operational_observability_category": category,
+            "needs_manual_review": category in {
+                "fragmentation_or_merge_ambiguity",
+                "nearby_owned_or_competing_candidate", "registration_or_fov_unreliable", "not_assessable",
+            } or category in {"nearby_new_track", "nearby_singleton"},
+            "requested_registration_mode": _text(endpoint.get("requested_registration_mode")),
+            "selected_registration_stage": _text(endpoint.get("selected_registration_stage")),
+            "registration_algorithm_version": _text(endpoint.get("registration_algorithm_version")),
+            "smoothing_um": _text(endpoint.get("smoothing_um")),
+            "transform_qc_pass": _bool(endpoint.get("transform_qc_pass")),
+            "transform_fallback_used": _bool(endpoint.get("transform_fallback_used")),
+            "transform_fallback_reason": _text(endpoint.get("transform_fallback_reason")),
+            "projection_transform_stage": _text(endpoint.get("projection_transform_stage")),
+            "algorithm_version": "daywise_endpoint_evaluator_v2",
+            "source_match_dir_hash": source_hash,
+        })
+    audit = pd.DataFrame(rows)
+    if audit.empty:
+        return audit, pd.DataFrame(columns=["operational_observability_category", "n_endpoints", "denominator", "fraction"])
+    if dropout_audit_dir is not None:
+        mechanism = _load_compatible_dropout_audit(dropout_audit_dir, match_dir)
+        mechanism["_source_key"] = list(zip(
+            mechanism["source_session_id"].astype(str),
+            pd.to_numeric(mechanism["source_label"], errors="coerce").astype("Int64"),
+        ))
+        mechanism = mechanism.set_index("_source_key")
+        for index, row in audit.iterrows():
+            key = (str(row["endpoint_session_id"]), _int(row["endpoint_roi_label"], -1))
+            if key not in mechanism.index:
+                continue
+            evidence = mechanism.loc[key]
+            outcome = _text(evidence.get("next_primary_outcome"))
+            assessable = _bool(evidence.get("next_assessable"))
+            audit.at[index, "canonical_target_present"] = _bool(evidence.get("next_canonical_plausible"))
+            audit.at[index, "unfiltered_target_present"] = _bool(evidence.get("next_unfiltered_plausible"))
+            audit.at[index, "unfiltered_target_voxel_count"] = _float(evidence.get("next_unfiltered_best_target_voxels"))
+            audit.at[index, "raw_red_evidence_class"] = (
+                "NO_MASK_BUT_RED_SIGNAL_REMAINS" if _bool(evidence.get("next_red_signal_remains"))
+                else "NO_CORRESPONDING_MASK_OR_SIGNAL" if assessable and not _bool(evidence.get("next_canonical_plausible")) and not _bool(evidence.get("next_unfiltered_plausible"))
+                else "NOT_ASSESSABLE" if not assessable else ""
+            )
+            audit.at[index, "next_assessable"] = assessable
+            audit.at[index, "next_primary_outcome"] = outcome
+            if _bool(row["same_track_returns"]):
+                # Record the intermediate-session evidence separately; a later return
+                # does not resolve the missing session.
+                audit.at[index, "intermediate_session_mechanism_category"] = outcome
+                continue
+            outcome_category = {
+                "TRACKED_OK": "target_present_same_identity",
+                "TARGET_PRESENT_GRAPH_IDENTITY_FAILURE": "target_present_graph_identity_failure",
+                "MIN_SIZE_FILTER_DROPOUT": "min_size_filter_dropout",
+                "FRAGMENTATION_OR_MERGE_AMBIGUITY": "fragmentation_or_merge_ambiguity",
+                "NO_MASK_BUT_RED_SIGNAL_REMAINS": "no_mask_but_red_signal_remains",
+                "REPORTER_OBJECT_DISAPPEARANCE": "no_corresponding_mask_or_signal",
+                "NOT_ASSESSABLE": "not_assessable",
+            }
+            audit.at[index, "operational_observability_category"] = outcome_category.get(
+                outcome, "not_assessable"
+            ) if assessable or outcome == "TRACKED_OK" else "not_assessable"
+            audit.at[index, "intermediate_session_mechanism_category"] = outcome
+            if audit.at[index, "operational_observability_category"] in {
+                "target_present_graph_identity_failure", "min_size_filter_dropout",
+                "fragmentation_or_merge_ambiguity", "no_mask_but_red_signal_remains",
+                "no_corresponding_mask_or_signal", "not_assessable",
+            }:
+                audit.at[index, "needs_manual_review"] = True
+    counts = audit["operational_observability_category"].value_counts().sort_index()
+    summary = pd.DataFrame({
+        "operational_observability_category": counts.index.astype(str),
+        "n_endpoints": counts.to_numpy(dtype=int),
+        "denominator": int(len(audit)),
+    })
+    summary["fraction"] = summary["n_endpoints"] / summary["denominator"]
+    return audit, summary
 
 
 def _synthetic_trusted(track: pd.Series, gap: int, config: SyntheticTrustConfig) -> bool:
@@ -1193,9 +1639,12 @@ def build_synthetic_gap_benchmark(
                 if projected is not None:
                     forward, _, _, _ = projected
                     source_coords = source_feature[["centroid_z", "centroid_y", "centroid_x"]].to_numpy(dtype=float)
-                    prediction = apply_transform_b_to_a(source_coords, forward) * spacing.as_zyx_array()
+                    try:
+                        prediction = forward.apply(source_coords) * spacing.as_zyx_array()
+                    except (OSError, ValueError):
+                        prediction = None
                     target_table, target_physical, target_tree = target_indices[target_id]
-                    all_distances = np.linalg.norm(target_physical - prediction, axis=1)
+                    all_distances = np.linalg.norm(target_physical - prediction, axis=1) if prediction is not None else np.asarray([])
                     if len(all_distances):
                         labels = target_labels.get(target_id)
                         if labels is None:
@@ -1791,6 +2240,7 @@ def _prepare_output_directory(output_dir: Path, *, overwrite: bool) -> pd.DataFr
     if overwrite:
         generated_files = {
             "endpoint_events.csv", "endpoint_candidates.csv", "endpoint_classification.csv",
+            "endpoint_observability_audit.csv", "endpoint_observability_summary.csv",
             "synthetic_gap_benchmark.csv", "manual_review_manifest.csv", "dropout_summary.csv",
             "matching_runtime_summary.csv", "matcher_evaluation_summary.json", "evaluation_run_log.json",
             "matching_runtime_by_pair.png", "matching_runtime_vs_candidate_count.png", "matching_runtime_by_gap.png",
@@ -1944,6 +2394,7 @@ def evaluate_daywise_tracking(
     z_radius: int = 1,
     extraction_dir: str | Path | None = None,
     state_csv: str | Path | None = None,
+    dropout_audit_dir: str | Path | None = None,
     max_review_panels: int | None = 100,
     random_seed: int = 0,
     overwrite: bool = False,
@@ -1969,6 +2420,11 @@ def evaluate_daywise_tracking(
         raise ValueError("lookahead must be between 1 and 3 for this evaluator")
     if search_radius_um <= 0 or crop_radius_um <= 0 or z_radius < 0:
         raise ValueError("search/crop radii must be positive and z_radius must be nonnegative")
+    if dropout_audit_dir is not None:
+        audit_root = Path(dropout_audit_dir).resolve()
+        required_audit = (audit_root / "audit_manifest.json", audit_root / "roi_outcome_audit.csv")
+        if any(not path.is_file() for path in required_audit):
+            raise FileNotFoundError(f"dropout audit needs audit_manifest.json and roi_outcome_audit.csv: {audit_root}")
 
     previous_classifications = _prepare_output_directory(output_dir, overwrite=overwrite)
     discovered = discover_evaluator_inputs(match_dir, policy)
@@ -1978,6 +2434,10 @@ def evaluate_daywise_tracking(
     manifest = _session_table(_read_csv(match_dir / "session_manifest_resolved.csv"))
     features = _read_csv(match_dir / "roi_features.csv")
     transforms = _read_csv(match_dir / "pairwise_transforms.csv")
+    registration_qc = _read_csv(match_dir / "pairwise_registration_qc.csv")
+    transforms = attach_registration_metadata(
+        transforms, registration_qc, _read_json(match_dir / "run_log.json"), match_dir
+    )
     tracks = _read_csv(match_dir / f"tracks_{policy}.csv")
     track_edges = _read_csv(match_dir / f"track_edges_{policy}.csv")
     pair_candidates = _read_csv(match_dir / "pairwise_candidates.csv")
@@ -2000,6 +2460,7 @@ def evaluate_daywise_tracking(
     endpoints = detect_endpoint_events(
         tracks, features, manifest, policy=policy, lookahead=lookahead, state=state
     )
+    endpoints = enrich_endpoint_transform_provenance(endpoints, manifest, transforms)
     endpoints = add_endpoint_local_density(
         endpoints, features, spacing=spacing, radius_um=search_radius_um
     )
@@ -2023,6 +2484,10 @@ def evaluate_daywise_tracking(
     )
     classifications = classify_endpoint_events(endpoints, endpoint_candidates, candidate_status)
     classifications = _restore_manual_columns(classifications, previous_classifications)
+    observability_audit, observability_summary = build_endpoint_observability_tables(
+        endpoints, endpoint_candidates, classifications, match_dir=match_dir,
+        dropout_audit_dir=dropout_audit_dir, policy=policy,
+    )
 
     trust_config = SyntheticTrustConfig(
         min_score=float(synthetic_min_score),
@@ -2086,6 +2551,8 @@ def evaluate_daywise_tracking(
     _write_csv(output_dir / "endpoint_events.csv", endpoints, ENDPOINT_COLUMNS)
     _write_csv(output_dir / "endpoint_candidates.csv", endpoint_candidates, ENDPOINT_CANDIDATE_COLUMNS)
     _write_csv(output_dir / "endpoint_classification.csv", classifications, CLASSIFICATION_COLUMNS)
+    observability_audit.to_csv(output_dir / "endpoint_observability_audit.csv", index=False)
+    observability_summary.to_csv(output_dir / "endpoint_observability_summary.csv", index=False)
     _write_csv(output_dir / "synthetic_gap_benchmark.csv", synthetic, SYNTHETIC_COLUMNS)
     review_columns = list(review_manifest.columns) if not review_manifest.empty else [
         "endpoint_id", "sample_type", "sampling_stratum", "spatial_stratum", "state_stratum",
@@ -2148,6 +2615,10 @@ def evaluate_daywise_tracking(
         "n_endpoints": int(len(endpoints)),
         "n_endpoint_candidates": int(len(endpoint_candidates)),
         "classification_counts": {str(k): int(v) for k, v in classification_counts.items()},
+        "observability_category_counts": {
+            str(row.operational_observability_category): int(row.n_endpoints)
+            for row in observability_summary.itertuples(index=False)
+        },
         "tracking": tracking_metrics,
         "synthetic_gap_benchmark": synthetic_metrics,
         "synthetic_trust_config": asdict(trust_config),
@@ -2165,6 +2636,7 @@ def evaluate_daywise_tracking(
         "optional_inputs": {
             "extraction_dir": str(Path(extraction_dir).resolve()) if extraction_dir else None,
             "state_csv": str(Path(state_csv).resolve()) if state_csv else None,
+            "dropout_audit_dir": str(Path(dropout_audit_dir).resolve()) if dropout_audit_dir else None,
         },
         "canonical_matcher_modified": False,
         "canonical_matcher_outputs_written": False,
@@ -2192,6 +2664,7 @@ def evaluate_daywise_tracking(
         "input_files_missing": discovered["missing_required"] + discovered["missing_optional"],
         "optional_state_used": bool(not state.empty),
         "optional_extraction_dir": str(Path(extraction_dir).resolve()) if extraction_dir else None,
+        "optional_dropout_audit_dir": str(Path(dropout_audit_dir).resolve()) if dropout_audit_dir else None,
         "python_package_versions": _package_versions(),
         "evaluator_repo_git_commit": _git_commit(Path(__file__).resolve().parent.parent),
         "source_matcher_git_commit": matcher_run_log.get("git_commit"),
@@ -2202,6 +2675,8 @@ def evaluate_daywise_tracking(
             "endpoint_events": len(endpoints),
             "endpoint_candidates": len(endpoint_candidates),
             "endpoint_classification": len(classifications),
+            "endpoint_observability_audit": len(observability_audit),
+            "endpoint_observability_summary": len(observability_summary),
             "synthetic_gap_benchmark": len(synthetic),
             "manual_review_manifest": len(review_manifest),
             "dropout_summary": len(dropout),

@@ -25,6 +25,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--z-radius", type=int, default=1)
     parser.add_argument("--extraction-dir", default=None)
     parser.add_argument("--state-csv", default=None)
+    parser.add_argument(
+        "--dropout-audit-dir", default=None,
+        help="Optional current-mapper dropout audit directory to join subthreshold and fixed-region Red evidence.",
+    )
     parser.add_argument("--max-review-panels", type=int, default=100)
     parser.add_argument("--random-seed", type=int, default=0)
     parser.add_argument("--synthetic-min-score", type=float, default=0.35)
@@ -62,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
         args.match_dir, args.output_dir, policy=args.policy, lookahead=args.lookahead,
         search_radius_um=args.search_radius_um, crop_radius_um=args.crop_radius_um,
         z_radius=args.z_radius, extraction_dir=args.extraction_dir, state_csv=args.state_csv,
+        dropout_audit_dir=args.dropout_audit_dir,
         max_review_panels=args.max_review_panels, random_seed=args.random_seed, overwrite=args.overwrite,
         synthetic_min_score=args.synthetic_min_score, synthetic_min_dice=args.synthetic_min_dice,
         synthetic_max_distance_um=args.synthetic_max_distance_um,

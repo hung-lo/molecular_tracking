@@ -28,9 +28,9 @@ from image_registration import (
     DEFAULT_LOCAL_SMOOTHING_UM,
     DEFAULT_REGISTRATION_MODE,
     REGISTRATION_MODES,
-    ImageTransform,
     classify_identity_conflicts,
     identity_conflicts,
+    load_image_transform as _image_transform_from_path,
 )
 from daywise_roi_matcher_qc_plots import DaywiseQCPlotConfig, generate_matching_qc
 from match_policy_registry import DEFAULT_ANALYSIS_POLICIES, SUPPORTED_MATCH_POLICIES, resolve_requested_policies
@@ -146,30 +146,6 @@ def _restricted_transform_from_row(row: pd.Series) -> RestrictedTransform:
         residual_median_um=row.get("residual_median_um", None),
         residual_p95_um=row.get("residual_p95_um", None),
     )
-
-
-def _image_transform_from_path(path: Path) -> ImageTransform:
-    """Load a selected production image transform without object deserialization."""
-
-    with np.load(path, allow_pickle=False) as payload:
-        flow = payload["flow"] if bool(payload["has_flow"].item()) else None
-        flow_step = payload["flow_step"] if flow is not None else None
-        method = str(payload["method"].item())
-        fallback = str(payload["fallback_reason"].item()) or None
-        residual_median = float(payload["residual_median_um"].item())
-        residual_p95 = float(payload["residual_p95_um"].item())
-        return ImageTransform(
-            matrix=payload["matrix"],
-            offset=payload["offset"],
-            flow=flow,
-            flow_step=flow_step,
-            method=method,
-            fallback_reason=fallback,
-            n_seed=int(payload["n_seed"].item()),
-            n_inlier=int(payload["n_inlier"].item()),
-            residual_median_um=None if not np.isfinite(residual_median) else residual_median,
-            residual_p95_um=None if not np.isfinite(residual_p95) else residual_p95,
-        )
 
 
 def _pair_result_from_outputs(

@@ -8,6 +8,8 @@ import pandas as pd
 from affine_overlap_matcher import RestrictedTransform, VoxelSpacing
 from endpoint_evaluator import (
     SyntheticTrustConfig,
+    _transform_row_map,
+    attach_registration_metadata,
     apply_transform_b_to_a,
     build_manual_review_manifest,
     build_runtime_summary,
@@ -64,6 +66,40 @@ def _identity_transforms(n: int = 4, include_gap2: bool = True) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _save_image_transform(path: Path, *, method: str, offset=(0.0, 0.0, 0.0), local: bool = False) -> None:
+    flow = np.zeros((3, 2, 2, 2), dtype=np.float32) if local else np.empty((0,), dtype=np.float32)
+    if local:
+        flow[1] = 0.25
+    flow_step = np.asarray([1.0, 2.0, 2.0]) if local else np.empty((0,), dtype=float)
+    np.savez_compressed(
+        path, matrix=np.eye(3), offset=np.asarray(offset, dtype=float), flow=flow,
+        flow_step=flow_step, has_flow=np.asarray(local), method=np.asarray(method),
+        fallback_reason=np.asarray(""), n_seed=np.asarray(0), n_inlier=np.asarray(0),
+        residual_median_um=np.asarray(np.nan), residual_p95_um=np.asarray(np.nan),
+    )
+
+
+def _selected_projection(tmp_path: Path, stage: str, *, saved_stage: str | None = None) -> tuple[np.ndarray, object]:
+    path = tmp_path / "selected_transform.npz"
+    actual = saved_stage or stage
+    _save_image_transform(path, method=actual, offset=(0.0, 1.0, 0.0), local=actual == "image_affine_local")
+    transforms = pd.DataFrame([{
+        "day_a": "s0", "day_b": "s1", "z_intercept": 0.0, "z_scale": 1.0,
+        "y_intercept": 0.0, "y_from_y": 1.0, "y_from_x": 0.0,
+        "x_intercept": 0.0, "x_from_y": 0.0, "x_from_x": 1.0,
+        "method": stage, "fallback_reason": "",
+    }])
+    qc = pd.DataFrame([{
+        "day_a": "s0", "day_b": "s1", "requested_registration_mode": "image_affine_local",
+        "selected_registration_stage": stage, "smoothing_um": 15.0,
+        "affine_qc_pass": True, "local_qc_pass": True, "fallback_used": False,
+        "fallback_reason": "", "transform_path": str(path),
+    }])
+    table = attach_registration_metadata(transforms, qc, {"image_registration_algorithm_version": "test"}, tmp_path)
+    selected = _transform_row_map(table)[("s0", "s1")]
+    return selected.project_forward(np.array([1.0, 5.0, 5.0])), selected
+
+
 def _features(rows: list[tuple[int, int, float, float, bool]]) -> pd.DataFrame:
     output = []
     for session_index, label, y, x, edge in rows:
@@ -102,6 +138,61 @@ def test_near_singular_transform_is_rejected() -> None:
         assert "singular" in str(exc)
     else:
         raise AssertionError("near-singular transform was accepted")
+
+
+def test_selected_image_affine_local_projection_uses_saved_local_field(tmp_path: Path) -> None:
+    projected, selected = _selected_projection(tmp_path, "image_affine_local")
+    assert np.allclose(projected, [1.0, 4.5, 5.0])
+    assert selected.stage == "image_affine_local"
+
+
+def test_selected_image_affine_projection_uses_saved_affine(tmp_path: Path) -> None:
+    projected, selected = _selected_projection(tmp_path, "image_affine")
+    assert np.allclose(projected, [1.0, 4.0, 5.0])
+    assert selected.stage == "image_affine"
+
+
+def test_legacy_projection_uses_csv_legacy_transform() -> None:
+    transforms = _identity_transforms(2, include_gap2=False)
+    transforms.loc[0, "method"] = "legacy"
+    transforms.loc[0, "y_intercept"] = 1.0
+    selected = _transform_row_map(transforms)[("s0", "s1")]
+    assert np.allclose(selected.project_forward(np.array([1.0, 5.0, 5.0])), [1.0, 4.0, 5.0])
+
+
+def test_selected_transform_unavailable_fails_explicitly(tmp_path: Path) -> None:
+    transforms = _identity_transforms(2, include_gap2=False)
+    qc = pd.DataFrame([{
+        "day_a": "s0", "day_b": "s1", "requested_registration_mode": "image_affine_local",
+        "selected_registration_stage": "image_affine_local", "transform_path": str(tmp_path / "missing.npz"),
+        "local_qc_pass": True, "fallback_used": False,
+    }])
+    table = attach_registration_metadata(transforms, qc, {}, tmp_path)
+    selected = _transform_row_map(table)[("s0", "s1")]
+    try:
+        selected.project_forward(np.array([1.0, 5.0, 5.0]))
+    except ValueError as exc:
+        assert "artifact is missing" in str(exc)
+    else:
+        raise AssertionError("unavailable selected transform silently fell back to the affine CSV")
+
+
+def test_selected_stage_must_match_saved_transform(tmp_path: Path) -> None:
+    transforms = _identity_transforms(2, include_gap2=False)
+    qc = pd.DataFrame([{
+        "day_a": "s0", "day_b": "s1", "requested_registration_mode": "image_affine_local",
+        "selected_registration_stage": "image_affine", "transform_path": str(tmp_path / "wrong.npz"),
+        "affine_qc_pass": True, "fallback_used": False,
+    }])
+    _save_image_transform(tmp_path / "wrong.npz", method="image_affine_local", local=True)
+    table = attach_registration_metadata(transforms, qc, {}, tmp_path)
+    selected = _transform_row_map(table)[("s0", "s1")]
+    try:
+        selected.project_forward(np.array([1.0, 5.0, 5.0]))
+    except ValueError as exc:
+        assert "does not match saved transform method" in str(exc)
+    else:
+        raise AssertionError("mismatched selected and saved transform stages were accepted")
 
 
 def test_endpoint_detection_excludes_right_censored_final_session_and_finds_gap_return() -> None:

@@ -23,8 +23,7 @@ try:
         ENDPOINT_CANDIDATE_COLUMNS,
         _bool, _feature_row, _float, _forward_transform, _int,
         _prepare_tracks, _present, _roi_column, _text,
-        _transform_row_map, apply_transform_b_to_a, compose_transforms,
-        invert_restricted_transform,
+        _transform_row_map, project_selected_between,
     )
     from affine_overlap_matcher import VoxelSpacing
 except ImportError:  # pragma: no cover - package imports
@@ -32,8 +31,7 @@ except ImportError:  # pragma: no cover - package imports
         ENDPOINT_CANDIDATE_COLUMNS,
         _bool, _feature_row, _float, _forward_transform, _int,
         _prepare_tracks, _present, _roi_column, _text,
-        _transform_row_map, apply_transform_b_to_a, compose_transforms,
-        invert_restricted_transform,
+        _transform_row_map, project_selected_between,
     )
     from matching.affine_overlap_matcher import VoxelSpacing
 
@@ -175,41 +173,12 @@ def _project(
     source_position: int,
     target_position: int,
     sessions: pd.DataFrame,
-    transform_map: dict[tuple[str, str], pd.Series],
+    transform_map,
 ) -> np.ndarray | None:
-    if source_position == target_position:
-        return coordinates.copy()
-    if source_position < target_position:
-        result = _forward_transform(source_position, target_position, sessions, transform_map)
-        if result is not None:
-            return apply_transform_b_to_a(coordinates, result[0])
-        stored = _adjacent_composition(source_position, target_position, sessions, transform_map)
-        if stored is None:
-            return None
-        try:
-            return apply_transform_b_to_a(coordinates, invert_restricted_transform(stored))
-        except ValueError:
-            return None
-    stored = _adjacent_composition(target_position, source_position, sessions, transform_map)
-    return None if stored is None else apply_transform_b_to_a(coordinates, stored)
-
-
-def _adjacent_composition(
-    earlier_position: int,
-    later_position: int,
-    sessions: pd.DataFrame,
-    transform_map: dict[tuple[str, str], pd.Series],
-):
-    components = [
-        transform_map.get((str(sessions.iloc[position]["session_id"]), str(sessions.iloc[position + 1]["session_id"])))
-        for position in range(earlier_position, later_position)
-    ]
-    if not components or any(component is None for component in components):
+    try:
+        return project_selected_between(coordinates, source_position, target_position, sessions, transform_map)
+    except (OSError, ValueError):
         return None
-    composed = components[0]
-    for component in components[1:]:
-        composed = compose_transforms(composed, component)
-    return composed
 
 
 def local_anchor_geometry(
@@ -335,6 +304,10 @@ def _transform_provenance(
             "transform_component_residual_median_um_max": np.nan,
             "transform_component_residual_p95_um_max": np.nan,
             "direct_vs_composed_projection_delta_um": np.nan,
+            "requested_registration_mode": "", "selected_registration_stage": "",
+            "registration_algorithm_version": "", "smoothing_um": "",
+            "transform_qc_pass": False, "transform_fallback_used": False,
+            "transform_fallback_reason": "", "projection_transform_stage": "",
         }
     _, transform_source, reliable, qc = projected
     delta = np.nan
@@ -347,11 +320,10 @@ def _transform_provenance(
         second = transform_map.get((middle_id, target_id))
         if direct is not None and first is not None and second is not None:
             try:
-                direct_prediction = apply_transform_b_to_a(source_coords, invert_restricted_transform(direct))
-                composed = compose_transforms(first, second)
-                composed_prediction = apply_transform_b_to_a(source_coords, invert_restricted_transform(composed))
+                direct_prediction = direct.project_forward(source_coords)
+                composed_prediction = second.project_forward(first.project_forward(source_coords))
                 delta = float(np.linalg.norm((direct_prediction - composed_prediction) * spacing.as_zyx_array()))
-            except ValueError:
+            except (OSError, ValueError):
                 pass
     return {
         "transform_source": transform_source,
@@ -361,6 +333,14 @@ def _transform_provenance(
         "transform_component_residual_median_um_max": _float(qc.get("residual_median_um_max")),
         "transform_component_residual_p95_um_max": _float(qc.get("residual_p95_um_max")),
         "direct_vs_composed_projection_delta_um": delta,
+        "requested_registration_mode": _text(qc.get("requested_registration_mode")),
+        "selected_registration_stage": _text(qc.get("selected_registration_stage")),
+        "registration_algorithm_version": _text(qc.get("registration_algorithm_version")),
+        "smoothing_um": _text(qc.get("smoothing_um")),
+        "transform_qc_pass": _bool(qc.get("qc_pass")),
+        "transform_fallback_used": _bool(qc.get("fallback_used")),
+        "transform_fallback_reason": _text(qc.get("fallback_reason")),
+        "projection_transform_stage": _text(qc.get("selected_registration_stage")),
     }
 
 

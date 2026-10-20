@@ -7,6 +7,7 @@ are used only to estimate geometry, never to change the original measurements.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -81,6 +82,25 @@ class ImageTransform:
                 break
             result = updated
         return result
+
+
+def load_image_transform(path: str | Path) -> ImageTransform:
+    """Load a production-saved transform without pickle deserialization."""
+
+    with np.load(Path(path), allow_pickle=False) as payload:
+        flow = payload["flow"] if bool(payload["has_flow"].item()) else None
+        flow_step = payload["flow_step"] if flow is not None else None
+        method = str(payload["method"].item())
+        fallback = str(payload["fallback_reason"].item()) or None
+        residual_median = float(payload["residual_median_um"].item())
+        residual_p95 = float(payload["residual_p95_um"].item())
+        return ImageTransform(
+            matrix=payload["matrix"], offset=payload["offset"], flow=flow,
+            flow_step=flow_step, method=method, fallback_reason=fallback,
+            n_seed=int(payload["n_seed"].item()), n_inlier=int(payload["n_inlier"].item()),
+            residual_median_um=residual_median if np.isfinite(residual_median) else None,
+            residual_p95_um=residual_p95 if np.isfinite(residual_p95) else None,
+        )
 
 
 def restricted_transform(row):

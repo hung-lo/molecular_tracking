@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+import endpoint_evaluator
 from affine_overlap_matcher import RestrictedTransform, VoxelSpacing
 from endpoint_evaluator import (
     SyntheticTrustConfig,
     _transform_row_map,
+    _load_compatible_dropout_audit,
     attach_registration_metadata,
     apply_transform_b_to_a,
     build_manual_review_manifest,
+    build_endpoint_observability_tables,
     build_runtime_summary,
     build_state_dropout_stratification,
     build_synthetic_gap_benchmark,
@@ -193,6 +198,71 @@ def test_selected_stage_must_match_saved_transform(tmp_path: Path) -> None:
         assert "does not match saved transform method" in str(exc)
     else:
         raise AssertionError("mismatched selected and saved transform stages were accepted")
+
+
+def test_dropout_join_uses_composite_key_and_preserves_endpoint_order(tmp_path: Path, monkeypatch) -> None:
+    endpoints = pd.DataFrame([
+        {"endpoint_id": "missing", "end_session_id": "s9", "end_session_index": 9,
+         "end_label": 7, "track_uid": "t9", "same_track_returns": False},
+        {"endpoint_id": "session1", "end_session_id": "s1", "end_session_index": 1,
+         "end_label": 7, "track_uid": "t1", "same_track_returns": False},
+        {"endpoint_id": "session0", "end_session_id": "s0", "end_session_index": 0,
+         "end_label": 7, "track_uid": "t0", "same_track_returns": False},
+    ])
+    classifications = pd.DataFrame([
+        {"endpoint_id": endpoint_id, "classification": "no_mask_near_prediction"}
+        for endpoint_id in endpoints["endpoint_id"]
+    ])
+    # Deliberately reverse the evidence rows. The same ROI label in two sessions
+    # must resolve by the full composite key, independent of input row order.
+    mechanism = pd.DataFrame([
+        {"source_session_id": "s0", "source_label": 7,
+         "next_primary_outcome": "MIN_SIZE_FILTER_DROPOUT", "next_assessable": True,
+         "next_canonical_plausible": False, "next_unfiltered_plausible": True,
+         "next_unfiltered_best_target_voxels": 93, "next_red_signal_remains": False},
+        {"source_session_id": "s1", "source_label": 7,
+         "next_primary_outcome": "TARGET_PRESENT_GRAPH_IDENTITY_FAILURE", "next_assessable": True,
+         "next_canonical_plausible": True, "next_unfiltered_plausible": True,
+         "next_unfiltered_best_target_voxels": 150, "next_red_signal_remains": False},
+    ])
+    monkeypatch.setattr(endpoint_evaluator, "_load_compatible_dropout_audit", lambda *_args: mechanism)
+    audit, _summary = build_endpoint_observability_tables(
+        endpoints, pd.DataFrame(), classifications, match_dir=tmp_path,
+        dropout_audit_dir=tmp_path / "dropout",
+    )
+    assert audit["endpoint_id"].tolist() == ["missing", "session1", "session0"]
+    assert pd.isna(audit.loc[0, "next_primary_outcome"])
+    assert audit.loc[1, "next_primary_outcome"] == "TARGET_PRESENT_GRAPH_IDENTITY_FAILURE"
+    assert audit.loc[2, "next_primary_outcome"] == "MIN_SIZE_FILTER_DROPOUT"
+    assert audit.loc[2, "operational_observability_category"] == "min_size_filter_dropout"
+
+
+def test_dropout_audit_rejects_duplicate_composite_keys(tmp_path: Path) -> None:
+    match_dir = tmp_path / "matching"
+    audit_dir = tmp_path / "dropout"
+    match_dir.mkdir()
+    audit_dir.mkdir()
+    input_hashes = {}
+    for name in ["pairwise_transforms.csv", "roi_features.csv", "tracks_graph.csv", "track_edges_graph.csv"]:
+        path = match_dir / name
+        path.write_text("header\n", encoding="utf-8")
+        input_hashes[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+    (audit_dir / "audit_manifest.json").write_text(
+        json.dumps({"input_sha256": input_hashes}), encoding="utf-8"
+    )
+    pd.DataFrame([
+        {"source_session_id": "s0", "source_label": 7,
+         "next_primary_outcome": "TRACKED_OK", "next_assessable": True},
+        {"source_session_id": "s0", "source_label": 7,
+         "next_primary_outcome": "MIN_SIZE_FILTER_DROPOUT", "next_assessable": True},
+    ]).to_csv(audit_dir / "roi_outcome_audit.csv", index=False)
+
+    try:
+        _load_compatible_dropout_audit(audit_dir, match_dir)
+    except ValueError as exc:
+        assert "duplicate source session/ROI" in str(exc)
+    else:
+        raise AssertionError("duplicate endpoint evidence key was accepted")
 
 
 def test_endpoint_detection_excludes_right_censored_final_session_and_finds_gap_return() -> None:

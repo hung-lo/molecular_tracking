@@ -561,7 +561,10 @@ def _load_transform(transforms: pd.DataFrame, source_session_id: str,
                 self.image = image
 
             def apply(self, points):
-                return self.image.inverse(points)
+                values = np.asarray(points, dtype=float)
+                scalar = values.ndim == 1
+                mapped = self.image.inverse(values[None, :] if scalar else values)
+                return mapped[0] if scalar else mapped
 
         return stored, _ForwardImageTransform(image_transform), image_transform
     source_to_target_row = invert_restricted_transform(stored)

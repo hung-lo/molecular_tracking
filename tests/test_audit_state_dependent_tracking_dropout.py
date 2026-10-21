@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -159,6 +160,56 @@ def test_dropout_audit_propagates_with_selected_local_field(tmp_path: Path):
     _stored, source_to_target, _target_to_source = _load_transform(
         transforms, "s0", "s1", registration_qc
     )
+    point = np.asarray([1.0, 5.0, 5.0])
+    batch = np.asarray([point, [2.0, 4.0, 6.0]])
+    scalar_result = source_to_target.apply(point)
+    batch_result = source_to_target.apply(batch)
+    assert scalar_result.shape == (3,)
+    assert batch_result.shape == (2, 3)
+    assert np.allclose(scalar_result, [1.0, 5.5, 5.0])
+    assert np.allclose(scalar_result, batch_result[0])
     mapped, coverage = propagate_source_roi(np.asarray([[1, 5, 5]], dtype=np.int32), source_to_target, (8, 8, 8))
     assert np.array_equal(mapped, [[1, 6, 5]])
     assert coverage == 1.0
+
+
+@pytest.mark.parametrize("stage", ["image_affine_local", "image_affine", "legacy"])
+def test_transform_loader_scalar_centroid_matches_batch_for_each_stage(tmp_path: Path, stage: str):
+    transform_path = tmp_path / f"{stage}.npz"
+    if stage != "legacy":
+        flow = np.zeros((3, 2, 2, 2), dtype=np.float32)
+        if stage == "image_affine_local":
+            flow[1] = 0.25
+        np.savez_compressed(
+            transform_path, matrix=np.eye(3), offset=np.asarray([0.0, 1.0, 0.0]),
+            flow=flow if stage == "image_affine_local" else np.empty((0,), dtype=np.float32),
+            flow_step=np.asarray([1.0, 2.0, 2.0]) if stage == "image_affine_local" else np.empty((0,)),
+            has_flow=np.asarray(stage == "image_affine_local"), method=np.asarray(stage),
+            fallback_reason=np.asarray(""), n_seed=np.asarray(0), n_inlier=np.asarray(0),
+            residual_median_um=np.asarray(np.nan), residual_p95_um=np.asarray(np.nan),
+        )
+
+    transforms = pd.DataFrame([{
+        "day_a": "s0", "day_b": "s1", "z_intercept": 0, "z_scale": 1,
+        "y_intercept": 1, "y_from_y": 1, "y_from_x": 0,
+        "x_intercept": 0, "x_from_y": 0, "x_from_x": 1,
+        "method": stage, "fallback_reason": "",
+    }])
+    registration_qc = pd.DataFrame([{
+        "day_a": "s0", "day_b": "s1", "selected_registration_stage": stage,
+        "transform_path": str(transform_path) if stage != "legacy" else "",
+        "local_qc_pass": True, "affine_qc_pass": True,
+    }])
+    _stored, source_to_target, _target_to_source = _load_transform(
+        transforms, "s0", "s1", registration_qc
+    )
+
+    point = np.asarray([1.0, 5.0, 5.0])
+    batch = np.asarray([point, [2.0, 4.0, 6.0]])
+    scalar_result = source_to_target.apply(point)
+    batch_result = source_to_target.apply(batch)
+
+    assert scalar_result.shape == (3,)
+    assert batch_result.shape == (2, 3)
+    assert np.allclose(scalar_result, batch_result[0])
+    assert np.allclose(source_to_target.apply(batch[1:]), batch_result[1:])

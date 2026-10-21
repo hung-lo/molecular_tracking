@@ -1479,16 +1479,15 @@ def build_endpoint_observability_tables(
         return audit, pd.DataFrame(columns=["operational_observability_category", "n_endpoints", "denominator", "fraction"])
     if dropout_audit_dir is not None:
         mechanism = _load_compatible_dropout_audit(dropout_audit_dir, match_dir)
-        mechanism["_source_key"] = list(zip(
-            mechanism["source_session_id"].astype(str),
-            pd.to_numeric(mechanism["source_label"], errors="coerce").astype("Int64"),
-        ))
-        mechanism = mechanism.set_index("_source_key")
+        mechanism_by_source = {
+            (str(evidence["source_session_id"]), _int(evidence["source_label"], -1)): evidence
+            for _, evidence in mechanism.iterrows()
+        }
         for index, row in audit.iterrows():
             key = (str(row["endpoint_session_id"]), _int(row["endpoint_roi_label"], -1))
-            if key not in mechanism.index:
+            evidence = mechanism_by_source.get(key)
+            if evidence is None:
                 continue
-            evidence = mechanism.loc[key]
             outcome = _text(evidence.get("next_primary_outcome"))
             assessable = _bool(evidence.get("next_assessable"))
             audit.at[index, "canonical_target_present"] = _bool(evidence.get("next_canonical_plausible"))

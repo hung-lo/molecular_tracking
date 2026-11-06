@@ -581,6 +581,17 @@ def _generate_spatial_pair_qc(
         return []
     accepted_by_policy = [_accepted_keys(t) for t in accepted_tables]
     accepted_high, accepted_balanced, accepted_graph = accepted_by_policy
+    accepted_source_index_started = time.perf_counter()
+    accepted_sources_by_pair: dict[tuple[str, str], set[str]] = {}
+    for session_a, session_b, label_a, _ in accepted_graph:
+        accepted_sources_by_pair.setdefault((session_a, session_b), set()).add(label_a)
+    if profile is not None:
+        profile["accepted_source_index_seconds"] = (
+            profile.get("accepted_source_index_seconds", 0.0)
+            + time.perf_counter()
+            - accepted_source_index_started
+        )
+
     rows = candidates.copy()
     if rows.empty:
         rows = pd.DataFrame(columns=["day_a", "day_b", "label_a", "label_b", "score", "dice", "distance_um", "ambiguity", "high_rule"])
@@ -628,7 +639,15 @@ def _generate_spatial_pair_qc(
         enriched["rejection_reason"] = enriched.apply(lambda r: "" if bool(r.accepted_graph) else _candidate_rejection_reason(r), axis=1)
         source_features = features_by_session[sa].copy()
         source_base = source_features.rename(columns={"label": "label_a", "centroid_x": "source_x", "centroid_y": "source_y"})
-        source_base["accepted_for_track"] = source_base["label_a"].map(lambda label: any(k[0] == sa and k[1] == sb and k[2] == str(label) for k in accepted_graph))
+        source_lookup_started = time.perf_counter()
+        accepted_labels = accepted_sources_by_pair.get((sa, sb), set())
+        source_base["accepted_for_track"] = source_base["label_a"].map(str).isin(accepted_labels)
+        if profile is not None:
+            profile["accepted_source_annotation_seconds"] = (
+                profile.get("accepted_source_annotation_seconds", 0.0)
+                + time.perf_counter()
+                - source_lookup_started
+            )
         source_base["long_axis_position_normalized"] = np.clip((source_base["source_x"] / max(shape[1]-1, 1)) if detect_long_axis(shape) == "x" else (source_base["source_y"] / max(shape[0]-1, 1)), 0, 1)
         source_base["bin"] = np.minimum((source_base["long_axis_position_normalized"] * 5).astype(int), 4)
         source_base["spatial_grid_row"] = np.minimum((source_base["source_y"] / max(shape[0], 1) * 3).astype(int), 2)
@@ -714,6 +733,8 @@ def generate_matching_qc(config: MatchingQCConfig) -> dict[str, Path]:
         "geometry_fallbacks": 0,
         "raw_load_seconds": 0.0,
         "pair_render_seconds": 0.0,
+        "accepted_source_index_seconds": 0.0,
+        "accepted_source_annotation_seconds": 0.0,
     }
     if config.generate_visual_examples:
         for subdir in (output_dir / "pair_examples", output_dir / "axial_shift", output_dir / "tables"):

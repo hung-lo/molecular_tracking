@@ -5,6 +5,7 @@ import json
 
 import numpy as np
 import pandas as pd
+import pytest
 import tifffile
 import matplotlib.pyplot as plt
 
@@ -390,3 +391,102 @@ def test_exported_qc_flags_use_candidate_key_for_accepted_and_rejected(
     assert rejected_flagged[key_columns].to_dict("records") == [
         {"session_a": "a", "session_b": "b", "label_a": 3, "label_b": 13}
     ]
+
+
+def test_pairwise_source_acceptance_uses_pair_scoped_index_and_unique_rois(
+    tmp_path: Path, monkeypatch
+) -> None:
+    match_dir = tmp_path / "match"
+    output_dir = tmp_path / "qc"
+    match_dir.mkdir()
+    for directory in (output_dir / "pair_examples", output_dir / "axial_shift", output_dir / "tables"):
+        directory.mkdir(parents=True)
+
+    sessions = ["a", "b", "c"]
+    pd.DataFrame(
+        {
+            "session_index": [0, 1, 2],
+            "session_id": sessions,
+            "acquisition_date": ["2026-01-01", "2026-01-02", "2026-01-03"],
+            "mask_path": [f"/missing/{session}_mask.tif" for session in sessions],
+            "red_image_path": [f"/missing/{session}_red.tif" for session in sessions],
+        }
+    ).to_csv(match_dir / "session_manifest_resolved.csv", index=False)
+    feature_rows = []
+    for session, labels in (("a", [1, 2, 3]), ("b", [10, 11, 12]), ("c", [20, 21, 22])):
+        for index, label in enumerate(labels):
+            feature_rows.append(
+                {
+                    "session_id": session,
+                    "label": label,
+                    "centroid_x": [1, 5, 9][index],
+                    "centroid_y": 5,
+                    "centroid_z": 1,
+                }
+            )
+    pd.DataFrame(feature_rows).to_csv(match_dir / "roi_features.csv", index=False)
+    (match_dir / "run_log.json").write_text("{}", encoding="utf-8")
+
+    candidates = pd.DataFrame(
+        {
+            "day_a": ["a"] * 6,
+            "day_b": ["b", "b", "b", "c", "c", "c"],
+            "label_a": [1, 1, 2, 1, 2, 3],
+            "label_b": [10, 11, 12, 21, 20, 22],
+            "score": [.9, .88, .7, .6, .95, .5],
+            "dice": [.9, .88, .7, .6, .95, .5],
+            "distance_um": [1., 1., 2., 3., 1., 4.],
+            "ambiguity": [.1, .1, .2, .3, .05, .4],
+            "high_rule": [True, True, False, False, True, False],
+            "balanced_rule": [True, True, False, False, True, False],
+            "pair_gap": [1, 1, 1, 2, 2, 2],
+        }
+    )
+    graph_matches = pd.DataFrame(
+        {
+            "day_a": ["a", "a", "a"],
+            "day_b": ["b", "b", "c"],
+            # String table labels must match numeric feature labels after str normalization.
+            "label_a": ["1", "1", "2"],
+            "label_b": ["10", "11", "20"],
+        }
+    )
+
+    monkeypatch.setattr(qc, "_tiff_stack_shape", lambda path: (1, 10, 10))
+    monkeypatch.setattr(qc, "_render_match_contact_sheet", lambda table, manifest, path, **kwargs: path)
+    monkeypatch.setattr(qc, "_render_large_z_examples", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        qc,
+        "_save_figure",
+        lambda path, figure, *, dpi: (plt.close(figure) or path),
+    )
+    profile: dict[str, float] = {}
+
+    qc._generate_spatial_pair_qc(
+        match_dir,
+        output_dir,
+        candidates,
+        [pd.DataFrame(), pd.DataFrame(), graph_matches],
+        dpi=20,
+        include_skip_pairs=True,
+        profile=profile,
+    )
+
+    pair_summary = pd.read_csv(output_dir / "tables" / "matching_qc_pair_summary.csv").set_index(
+        ["session_a", "session_b"]
+    )
+    assert pair_summary.loc[("a", "b"), "n_source_rois"] == 3
+    assert pair_summary.loc[("a", "b"), "n_accepted_source_rois"] == 1
+    assert pair_summary.loc[("a", "b"), "accepted_fraction"] == pytest.approx(1 / 3)
+    assert pair_summary.loc[("a", "c"), "n_source_rois"] == 3
+    assert pair_summary.loc[("a", "c"), "n_accepted_source_rois"] == 1
+    assert pair_summary.loc[("a", "c"), "accepted_fraction"] == pytest.approx(1 / 3)
+
+    ab_fractions = pd.read_csv(output_dir / "tables" / "a_b_match_fraction_by_long_axis.csv")
+    ac_fractions = pd.read_csv(output_dir / "tables" / "a_c_match_fraction_by_long_axis.csv")
+    assert ab_fractions["n_source_rois"].tolist() == [1, 1, 1]
+    assert ab_fractions["n_accepted_source_rois"].tolist() == [1, 0, 0]
+    assert ac_fractions["n_source_rois"].tolist() == [1, 1, 1]
+    assert ac_fractions["n_accepted_source_rois"].tolist() == [0, 1, 0]
+    assert profile["accepted_source_index_seconds"] >= 0
+    assert profile["accepted_source_annotation_seconds"] >= 0

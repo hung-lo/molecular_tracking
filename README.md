@@ -349,6 +349,8 @@ The QC bundle is designed to surface:
 
 By default, QC findings can be inspected without deleting the matching output. Runs that must fail when the QC stage fails can enable the corresponding strict QC requirement.
 
+For high-ROI datasets, QC indexes accepted graph-source labels once per session pair rather than rescanning all accepted graph edges for each source ROI. In standalone reruns, QC time changed from 447 s to 196 s for Fucci-Tri_4 (2.29× faster) and from 5,208 s to 205 s for Fucci-Tri_7 (25.44× faster). These are observed timings; filesystem cache and system load were not controlled, and the full master pipeline was not rerun. See [the performance report](docs/performance/matching_qc_high_roi_optimization_20261106.md) for methodology, output comparisons, and reproduction steps.
+
 The master pipeline also exposes segmentation/trajectory gates, including configurable volume limits, z-depth limits, edge exclusion, track-relative volume checks, minimum usable-session requirements, and internal-gap/coverage rules.
 
 For interpretation of the matching QC bundle, see:
